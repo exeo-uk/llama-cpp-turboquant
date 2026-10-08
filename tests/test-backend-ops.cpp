@@ -16064,6 +16064,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // [TAG_UPSTREAM_29948] Fused gate/up + GLU on the MMQ path (GGML_CUDA_MMQ_GLU_FUSION=2 runs the fused kernel on these
+    // small shapes): one and two MMA tiles per warp (17/33 and 65/128 columns), 256 rows fused, 129/257 rows stay unfused.
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS }) {
+        for (int64_t m : { 17, 33, 65 }) {
+            for (int64_t n : { 129, 256 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, n, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 128, 256, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+    }
+    for (ggml_glu_op glu_op : { GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP }) {
+        for (int64_t m : { 17, 65 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, glu_op, m, 256, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, glu_op, 17, 129, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+    }
+    for (int64_t n : { 256, 257 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 33, n, 512, false, 1, 1, false, false, true, false, { 2, 3 }));
+    }
+    // 27B FFN shape (5120 -> 17408 Q5_K) at a full 1024-token ubatch: unfused MMQ tiles all of K here on a 170-SM GPU, so GGML_CUDA_MMQ_GLU_FUSION=1 fuses it.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K, GGML_GLU_OP_SWIGLU, 1024, 17408, 5120, false, 1, 1, false, false, true, false, { 1, 1 }));
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
