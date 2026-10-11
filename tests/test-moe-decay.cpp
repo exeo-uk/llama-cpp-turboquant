@@ -157,6 +157,77 @@ static void test_seed() {
     TCHECK(!L.resident(6), "a seed under the admit threshold is not");
 }
 
+// [TAG_FN_L17_START_PRE] the prompt-end pass of llama_moe_hot_turn_start: the last answer's experts hold steady counts; a
+// new prompt of 30 tokens routes experts 32..39 with every token. With the plain seed (x 0.03) none of them gets in; after
+// the counts fade (x td) and the prompt comes in as sn decode steps of its mix, the pass swaps them in, best gain first,
+// as many as the byte budget holds
+static void test_turn_start() {
+    llama_moe_decay_params p;
+    p.ratio = 1.5f;
+    p.hyst  = 1.0f;
+    const int n_exp = 64, n_slots = 8;
+    auto make = [&]() {
+        sim_layer L(n_exp, n_slots);
+        for (int s = 0; s < n_slots; ++s) {
+            L.slot_expert[s] = s;
+            L.expert_slot[s] = s;
+            L.cnt[s] = 20.0f - (float) s; // the old topic: 20 .. 13
+        }
+        for (int t = 0; t < 30; ++t) {
+            for (int32_t e = 32; e < 40; ++e) {
+                llama_moe_decay_count(L.seed, &e, 1);
+            }
+            const int32_t o = 40 + t % 2; // two experts of the old answer's kind, each with every other token
+            llama_moe_decay_count(L.seed, &o, 1);
+        }
+        return L;
+    };
+    auto pass = [&](sim_layer & L, size_t budget_experts) {
+        std::vector<llama_moe_decay_swap> swaps;
+        std::vector<uint8_t> slot_busy(n_slots, 0), expert_busy(n_exp, 0);
+        for (int e = 0; e < n_exp; ++e) {
+            expert_busy[e] = L.resident(e) ? 1 : 0;
+        }
+        llama_moe_decay_pairs(0, L.cnt, L.slot_expert, slot_busy, expert_busy, p, swaps, budget_experts + 1);
+        llama_moe_decay_order(swaps);
+        size_t n = 0;
+        for (const auto & w : swaps) {
+            if (n + 1 > budget_experts) {
+                break;
+            }
+            if (w.victim >= 0) {
+                L.expert_slot[w.victim] = -1;
+            }
+            L.slot_expert[w.slot]   = w.expert;
+            L.expert_slot[w.expert] = w.slot;
+            n++;
+        }
+        return n;
+    };
+    {
+        sim_layer L = make();
+        llama_moe_decay_fold_seed(L.cnt, L.seed, p.seed); // the default: x 0.03
+        TCHECK(pass(L, 8) == 0, "the plain seed admits nothing over an old topic");
+    }
+    {
+        sim_layer L = make();
+        llama_moe_decay_apply(L.cnt, 0.5f);                     // td: old counts 10 .. 6.5
+        llama_moe_decay_fold_seed(L.cnt, L.seed, 32.0f / 30.0f); // sn 32 over 30 tokens: 32..39 count 32, 40 / 41 count 16
+        TCHECK(std::fabs(L.cnt[32] - 32.0f) < 1e-3f && std::fabs(L.cnt[40] - 16.0f) < 1e-3f, "fold x sn/tokens");
+        TCHECK(L.seed[32] == 0.0f, "seed cleared");
+        const size_t n = pass(L, 6);
+        TCHECK(n == 6, "the budget of 6 experts is used (%zu)", n);
+        int in = 0;
+        for (int32_t e = 32; e < 40; ++e) {
+            in += L.resident(e) ? 1 : 0;
+        }
+        TCHECK(in == 6, "the prompt's strongest experts come in first (%d of 8)", in);
+        TCHECK(!L.resident(40) && !L.resident(41), "weaker prompt experts wait while stronger ones remain");
+        TCHECK(L.resident(0) && L.resident(1), "the old topic's strongest residents stay");
+        TCHECK(!L.resident(7) && !L.resident(6), "the weakest residents go first");
+    }
+}
+
 // steady experts, each routed every other step, against bursts of a new expert for 5 steps every 40
 static void test_steady_vs_bursts() {
     llama_moe_decay_params p; // the defaults: 0.92 every 2 steps, admit 2, ratio 1.2, hyst 0.5
@@ -582,6 +653,7 @@ int main() {
     test_select();
     test_max_pairs();
     test_pool_timing();
+    test_turn_start();
     printf("test-moe-decay: %d checks, %d errors%s\n", g_checks, g_fail, g_fail ? "" : " - PASSED");
     return g_fail == 0 ? 0 : 1;
 }
