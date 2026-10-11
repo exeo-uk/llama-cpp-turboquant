@@ -348,6 +348,10 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
+    // [TAG_FN_L18_KEEPCTX] the per-seq host state carried into the next request (default: the state above)
+    virtual bool get_carry(llama_seq_id seq_id, std::vector<uint8_t> & data) const { return get_state(seq_id, data); }
+    virtual void set_carry(llama_seq_id seq_id, const std::vector<uint8_t> & data) { set_state(seq_id, data); }
+
     // (optional) more statistics at the end of a generation, from common_speculative_print_stats()
     virtual void print_stats_extra() {}
 };
@@ -3915,6 +3919,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.clear();
     }
 
+    // [TAG_FN_L18_KEEPCTX] the stashed h the next request's first row pairs with
+    bool get_carry(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        const auto & h = pending_h[seq_id];
+        data.resize(h.size() * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+        return true;
+    }
+
+    void set_carry(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != pending_h[seq_id].size() * sizeof(float)) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
@@ -6341,6 +6363,66 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+// [TAG_FN_L18_KEEPCTX] per implementation, in order: u64 size (UINT64_MAX = none), then the bytes
+void common_speculative_get_carry(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
+    if (spec == nullptr) {
+        return;
+    }
+
+    std::vector<uint8_t> cur;
+    for (auto & impl : spec->impls) {
+        cur.clear();
+        const uint64_t n = impl->get_carry(seq_id, cur) ? (uint64_t) cur.size() : UINT64_MAX;
+        const size_t   o = data.size();
+        data.resize(o + sizeof(n) + (n == UINT64_MAX ? 0 : cur.size()));
+        std::memcpy(data.data() + o, &n, sizeof(n));
+        if (n != UINT64_MAX && n > 0) {
+            std::memcpy(data.data() + o + sizeof(n), cur.data(), cur.size());
+        }
+    }
+}
+
+bool common_speculative_set_carry(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (spec == nullptr) {
+        return data.empty();
+    }
+
+    // check the whole layout first, so a mismatch changes nothing
+    size_t o = 0;
+    for (size_t i = 0; i < spec->impls.size(); ++i) {
+        uint64_t n = 0;
+        if (o + sizeof(n) > data.size()) {
+            return false;
+        }
+        std::memcpy(&n, data.data() + o, sizeof(n));
+        o += sizeof(n);
+        if (n != UINT64_MAX) {
+            if (n > data.size() - o) {
+                return false;
+            }
+            o += n;
+        }
+    }
+    if (o != data.size()) {
+        return false;
+    }
+
+    o = 0;
+    std::vector<uint8_t> cur;
+    for (auto & impl : spec->impls) {
+        uint64_t n = 0;
+        std::memcpy(&n, data.data() + o, sizeof(n));
+        o += sizeof(n);
+        if (n != UINT64_MAX) {
+            cur.assign(data.begin() + o, data.begin() + o + n);
+            impl->set_carry(seq_id, cur);
+            o += n;
+        }
+    }
+    return true;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
