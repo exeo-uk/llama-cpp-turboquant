@@ -6211,7 +6211,13 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
     if (L.host_buf) {
         L.host = (uint8_t *) ggml_backend_buffer_get_base(L.host_buf.get());
     } else {
-        L.host_vec.resize(n);
+        try {
+            L.host_vec.resize(n);
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: [TAG_FN_L17_VISION_LEND] no host memory for the weights (%s): not parked\n", __func__, e.what());
+            L.offs.clear();
+            return 0;
+        }
         L.host = L.host_vec.data();
     }
     const int64_t t0 = ggml_time_us();
