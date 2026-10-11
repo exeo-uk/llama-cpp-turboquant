@@ -12,7 +12,9 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -668,9 +670,32 @@ static void moe_pool_stats_flush(ggml_cpu_moe_pool * p) {
     }
 }
 
+// [TAG_FN_L18_FIRSTANS_STALL] diagnostics (LLAMA_FN_L18_STALL): the workers carry a thread name for the stall probe's dumps
+static void moe_pool_name_thread(int ith) {
+#if defined(_WIN32)
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FN_L18_STALL");
+        return e != nullptr && atoi(e) > 0;
+    }();
+    if (!on) {
+        return;
+    }
+    using set_desc_t = HRESULT (WINAPI *)(HANDLE, PCWSTR);
+    static const set_desc_t set_desc = (set_desc_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+    if (set_desc) {
+        wchar_t w[32];
+        swprintf(w, 32, L"moe-pool %d", ith);
+        set_desc(GetCurrentThread(), w);
+    }
+#else
+    GGML_UNUSED(ith);
+#endif
+}
+
 static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
     pin_current_thread(p->cpus[ith]);
     set_current_thread_prio(p->prio);
+    moe_pool_name_thread(ith); // [TAG_FN_L18_FIRSTANS_STALL]
 
     uint32_t last = 0;
     for (;;) {

@@ -14,6 +14,7 @@
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
 #include "llama-moecache.h" // [TAG_FN_R1_PFS_LEND]
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-arena.h"  // [TAG_FN_L14_ARENA]
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 
@@ -182,6 +183,7 @@ size_t align_up(size_t x, size_t a) {
 
 // the streamer thread
 void pfs_run(pfs_state * s) {
+    llama_fn_thread_name("prefill-stream"); // [TAG_FN_L18_FIRSTANS_STALL]
     struct item { int slot; const uint8_t * src; size_t dst; size_t n; };
     std::vector<item> staged;
     int next_slot = 0;

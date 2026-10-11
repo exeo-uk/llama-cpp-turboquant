@@ -1,6 +1,7 @@
 // [TAG_FN_PLE_DIRECT_IO] unbuffered on-demand row reads, see llama-ple-dio.h
 
 #include "llama-ple-dio.h"
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include <algorithm>
 #include <atomic>
@@ -235,7 +236,7 @@ struct dio_pool {
     void start(int n_extra) {
         n = n_extra;
         for (int i = 0; i < n; ++i) {
-            th.emplace_back([this, i] { loop(i + 1); });
+            th.emplace_back([this, i] { llama_fn_thread_name("ple-dio", i + 1); loop(i + 1); }); // [TAG_FN_L18_FIRSTANS_STALL] name
         }
     }
 

@@ -15,6 +15,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 
 struct llama_model;
 struct llama_model_loader;
@@ -43,6 +45,14 @@ bool llama_fn_warm_running();
 
 // [TAG_FN_L15_WARMYIELD] a decode of small ubatches (answer steps, bridged) begins / ends: the warm pass waits meanwhile
 void llama_fn_warm_small_decode(bool begin);
+
+// [TAG_FN_L18_FIRSTANS_STALL] diagnostics: 0 when no warm pass runs, 1 while it reads, 2 while it waits for answer steps;
+// *mark = the 64 MiB pieces it has completed in order
+int llama_fn_warm_state(size_t * mark);
+
+// [TAG_FN_L18_FIRSTANS_STATE] asks the OS to read these mapped ranges in (asynchronous, PrefetchVirtualMemory); a no-op
+// elsewhere. Nothing is locked or copied.
+void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges);
 
 // [TAG_FN_L16_PLEGATE] the calling thread at THREAD_PRIORITY_HIGHEST (the MoE pool's level with --prio 2); a no-op elsewhere
 void llama_fn_thread_priority_highest();

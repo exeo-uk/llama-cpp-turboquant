@@ -6,6 +6,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -61,7 +62,10 @@ struct llama_context::step_worker {
     bool                    stop = false;
 
     step_worker() {
-        th = std::thread([this]() { run(); });
+        th = std::thread([this]() {
+            llama_fn_thread_name("hot-step"); // [TAG_FN_L18_FIRSTANS_STALL]
+            run();
+        });
     }
 
     ~step_worker() {
@@ -3620,6 +3624,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     } warm_go { cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP, false };
+    // [TAG_FN_L18_FIRSTANS_STALL] diagnostics: a mark at each end, a dump after a slow small decode
+    struct stall_on_exit {
+        int64_t t0;
+        int     n;
+        ~stall_on_exit() {
+            llama_fn_stall_decode_end(t0, n);
+        }
+    } stall_guard { llama_fn_stall_decode_begin((int) batch_inp.tokens.size(), cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0),
+                    (int) batch_inp.tokens.size() };
     // [TAG_FN_L15_WARMYIELD] answer steps (small ubatches) make the experts' warm pass wait; a prompt chunk never does (its
     // stream may be waiting for the pass)
     if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= 64 || cparams.n_ubatch <= 64)) {
@@ -5910,6 +5923,7 @@ void llama_fn_vision_give(const llama_model * model) {
 // expected MTP draft context never came), size it to the VRAM that the model, the KV caches (turbot pool, indexer
 // cache), the compute buffers (QSA temporaries grow with -ub) and the draft context left, under a device-use ceiling
 void llama_context::moe_hot_fit_try() {
+    llama_fn_stall_scope st_scope("hot set fit begins", "hot set fit ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     moe_hot_waits++;
 
     const auto & hp = model.hparams;
@@ -6256,6 +6270,7 @@ bool llama_context::cbuf_set(bool full) {
     if (cbuf_state == CBUF_OFF || cbuf_state == want) {
         return true;
     }
+    llama_fn_stall_scope st_scope(full ? "cbuf -> FULL begins" : "cbuf -> SMALL begins", "cbuf switch ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     constexpr double MiB = 1024.0*1024.0;
     const int64_t t0 = ggml_time_us();
     ggml_backend_dev_t dev = llama_moe_hot_device(model);

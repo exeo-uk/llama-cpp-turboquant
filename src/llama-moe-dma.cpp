@@ -28,6 +28,7 @@
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include "llama-impl.h"
 
@@ -282,6 +283,7 @@ void dma_issue(dma_state * s, const issue_task & t) {
 }
 
 void dma_issuer_run(dma_state * s) {
+    llama_fn_thread_name("dma-issuer"); // [TAG_FN_L18_FIRSTANS_STALL]
     for (;;) {
         issue_task t;
         {

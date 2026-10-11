@@ -3,6 +3,7 @@
 #include "llama-fn-tier.h"
 
 #include "llama-fn-auto.h"
+#include "llama-fn-stall.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
@@ -694,8 +695,10 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     g_warm_layer_end = layer_end;
     g_warm_mark.store(0);
     g_warm_running.store(true, std::memory_order_release);
+    std::atomic<int> n_named{0};
     auto run = [&]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); // [TAG_FN_L15_WARMYIELD]
+        llama_fn_thread_name("warm", n_named.fetch_add(1)); // [TAG_FN_L18_FIRSTANS_STALL]
         for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
             if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) {
                 return;
@@ -727,6 +730,7 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
         }
     };
     const auto t0 = std::chrono::steady_clock::now();
+    llama_fn_stall_mark("warm pass begins (pieces, MiB)", (int64_t) n_use, (int64_t) (bytes >> 20)); // [TAG_FN_L18_FIRSTANS_STALL]
     std::vector<std::thread> ths;
     for (int k = 1; k < n_thr; ++k) {
         ths.emplace_back(run);
@@ -736,6 +740,7 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
         th.join();
     }
     g_warm_running.store(false, std::memory_order_release);
+    llama_fn_stall_mark("warm pass ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     PROCESS_MEMORY_COUNTERS pm1 = {};
     GetProcessMemoryInfo(GetCurrentProcess(), &pm1, sizeof(pm1));
@@ -901,6 +906,47 @@ bool llama_fn_warm_running() {
     return g_warm_running.load(std::memory_order_acquire);
 #else
     return false;
+#endif
+}
+
+// [TAG_FN_L18_FIRSTANS_STATE] see llama-fn-tier.h
+void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges) {
+#ifdef _WIN32
+    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (pf == nullptr || ranges.empty()) {
+        return;
+    }
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
+    e.reserve(std::min<size_t>(ranges.size(), 4096));
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        e.push_back({ (PVOID) ranges[i].first, (SIZE_T) ranges[i].second });
+        if (e.size() == 4096 || i + 1 == ranges.size()) {
+            pf(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
+            e.clear();
+        }
+    }
+#else
+    GGML_UNUSED(ranges);
+#endif
+}
+
+// [TAG_FN_L18_FIRSTANS_STALL] see llama-fn-tier.h
+int llama_fn_warm_state(size_t * mark) {
+#ifdef _WIN32
+    if (mark) {
+        *mark = g_warm_mark.load(std::memory_order_relaxed);
+    }
+    if (!g_warm_running.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    return g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
+           fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000 ? 2 : 1;
+#else
+    if (mark) {
+        *mark = 0;
+    }
+    return 0;
 #endif
 }
 

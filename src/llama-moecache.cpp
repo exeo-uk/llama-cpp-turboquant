@@ -1,6 +1,8 @@
 #include "llama-moecache.h"
 
 #include "llama-fn-auto.h" // [TAG_FN_AUTO]
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
+#include "llama-fn-tier.h"  // [TAG_FN_L18_FIRSTANS_STATE] llama_fn_prefetch_ranges
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
 #include "llama-impl.h"
@@ -1192,6 +1194,7 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
 
 // uploads the queued slices: mmap -> pinned staging -> the upload backend's own stream, then marks them done
 void hot_adapt_worker(moe_cache * mc) {
+    llama_fn_thread_name("hot-upload"); // [TAG_FN_L18_FIRSTANS_STALL]
     std::vector<upload_job> batch;
     for (;;) {
         {
@@ -1239,7 +1242,9 @@ void hot_adapt_worker(moe_cache * mc) {
             mc->todo.erase(mc->todo.begin(), mc->todo.begin() + (std::ptrdiff_t) n);
             mc->worker_busy = true; // [TAG_FN_R1_PFS_LEND]
         }
+        llama_fn_stall_mark("hot upload batch begins (jobs)", (int64_t) batch.size()); // [TAG_FN_L18_FIRSTANS_STALL]
         const size_t n_done = mc->up_pipe ? hot_upload_pipe(mc, batch) : hot_upload_staged(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
+        llama_fn_stall_mark("hot upload batch ends (done)", (int64_t) n_done);
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (size_t i = 0; i < batch.size(); ++i) {
             upload_job j = batch[i];
@@ -3453,6 +3458,7 @@ struct refill_job {
 // the hot set has an upload stream, else one synchronous copy per slice. Returns the bytes uploaded.
 // [TAG_FN_L3_VRAM_CBUF] n_threads: the copy threads (the stream's unlend keeps REFILL_THREADS)
 size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads = REFILL_THREADS) {
+    llama_fn_stall_scope st_scope("hot refill begins (jobs, threads)", "hot refill ends", (int64_t) jobs.size(), n_threads); // [TAG_FN_L18_FIRSTANS_STALL]
     n_threads = std::max(1, std::min(64, n_threads));
     size_t bytes = 0;
     ggml_backend_dev_t dev = mc->up_backend ? ggml_backend_get_device(mc->up_backend) : nullptr;
@@ -3507,6 +3513,7 @@ size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_th
         std::vector<std::thread> th;
         for (int t = 0; t < n_threads; ++t) {
             th.emplace_back([&, t]() {
+                llama_fn_thread_name("hot-refill", t); // [TAG_FN_L18_FIRSTANS_STALL]
                 for (size_t k = (size_t) t; k < n; k += (size_t) n_threads) {
                     hot_copy(mc, base + stage_off[k], jobs[i + k].src, jobs[i + k].size); // [TAG_FN_L17_START_NT]
                 }

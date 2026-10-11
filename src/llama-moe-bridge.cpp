@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-moecache.h"
 #include "llama-fn-auto.h" // [TAG_FN_L3_HOST] llama_fn_l3_flag
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-moe-gen5.h" // [TAG_FN_R4_BRIDGE_DMA]
 #include "llama-moe-gen5-impl.h" // [TAG_FN_R4_BRIDGE_DMA] gen5::dma_requested
 
@@ -598,6 +599,9 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
 // spin mode: poll the posts in order, spin for spin_us after the last job, then sleep in 1 ms slices (so a post that
 // comes without a wake is still served) until the owning context wakes it
 static void br_exec_main(llama_moe_bridge * br) {
+    llama_fn_thread_name("bridge-exec"); // [TAG_FN_L18_FIRSTANS_STALL]
+    const bool st_on = llama_fn_stall_on();
+    bool st_slept = false;
     ggml_cpu_moe_pool_params pp = br->pool_params;
     pp.pin_caller = true;
     ggml_cpu_moe_pool * pool = br->pool_new(&pp);
@@ -622,12 +626,21 @@ static void br_exec_main(llama_moe_bridge * br) {
         ggml_moe_bridge_job job;
         if (br->fn_poll(br->gb, &job)) {
             const int64_t t_seen = br->probe ? br_now_ns() : 0; // [TAG_FN_L14_PROBE]
+            if (st_on) { // [TAG_FN_L18_FIRSTANS_STALL]
+                st_slept = false;
+                llama_fn_stall_mark("bridge job taken (layer, seq)",
+                        job.chan >= 0 && job.chan < (int) br->chans.size() ? br->chans[job.chan].il : -1, job.seq);
+            }
             if (br->diag && br->dg_first.exchange(false, std::memory_order_acq_rel)) { // [TAG_FN_L3_HOST_DIAG]
                 br->dg_first_sum.fetch_add(br_now_ns() - br->dg_t_begin.load(std::memory_order_acquire), std::memory_order_relaxed);
                 br->dg_first_n.fetch_add(1, std::memory_order_relaxed);
             }
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
+            if (st_on) { // [TAG_FN_L18_FIRSTANS_STALL]
+                llama_fn_stall_mark("bridge job done (layer, ok)",
+                        job.chan >= 0 && job.chan < (int) br->chans.size() ? br->chans[job.chan].il : -1, ok ? 1 : 0);
+            }
             if (br->probe && job.chan >= 0 && job.chan < (int) br->chans.size()) { // [TAG_FN_L14_PROBE]
                 auto & pc = br->chans[job.chan];
                 pc.p_seen = t_seen;
@@ -669,6 +682,10 @@ static void br_exec_main(llama_moe_bridge * br) {
         }
         if (!br->parked.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() - last < spin) {
             continue;
+        }
+        if (st_on && !st_slept) { // [TAG_FN_L18_FIRSTANS_STALL] the first sleep after work
+            st_slept = true;
+            llama_fn_stall_mark("bridge executor sleeps (parked)", br->parked.load(std::memory_order_relaxed) ? 1 : 0);
         }
         std::unique_lock<std::mutex> lk(br->mtx);
         const uint32_t wg_sleep = br->wake_gen.load(std::memory_order_seq_cst);
@@ -1442,6 +1459,7 @@ void llama_moe_bridge_begin(llama_moe_bridge * br, bool used) {
     if (br == nullptr) {
         return;
     }
+    llama_fn_stall_mark(used ? "bridge graph begins" : "bridge parked for CPU splits"); // [TAG_FN_L18_FIRSTANS_STALL]
     if (used) {
         if (br->diag) { // [TAG_FN_L3_HOST_DIAG] before in_graph: no job of this graph can be taken earlier
             const int64_t t = br_now_ns();
@@ -1504,6 +1522,7 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     }
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
+    llama_fn_stall_mark("bridge graph ends (err)", err); // [TAG_FN_L18_FIRSTANS_STALL]
     if (br->trk_on) {
         std::lock_guard<std::mutex> lk(br->graph_mtx);
         br->last_ok     = trk_ok && err == GGML_MOE_BRIDGE_ERR_NONE;
@@ -1753,6 +1772,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     ggml_moe_bridge_stats s;
     br->fn_get_stats(br->gb, &s);
     const int il = s.error_chan >= 0 && s.error_chan < (int) br->chans.size() ? br->chans[s.error_chan].il : -1;
+    if (llama_fn_stall_on()) { // [TAG_FN_L18_FIRSTANS_STALL]
+        char why[128];
+        snprintf(why, sizeof(why), "MoE bridge %d: %s at layer %d", br->bid,
+                err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il);
+        llama_fn_stall_dump(why);
+    }
     if (br->ple_chan >= 0 && s.error_chan == br->ple_chan) { // [TAG_FN_L16_PLEGATE] the layer below reads -1
         LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L16_PLEGATE] the error is the PLE gate's (its rows came late or their read "
                 "failed)\n", __func__, br->bid);

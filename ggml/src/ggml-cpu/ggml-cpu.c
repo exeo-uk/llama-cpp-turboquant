@@ -4868,11 +4868,35 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
     return state->pending;
 }
 
+// [TAG_FN_L18_FIRSTANS_STALL] diagnostics (LLAMA_FN_L18_STALL): the workers carry a thread name for the stall probe's dumps
+static void ggml_cpu_name_thread(int ith) {
+#if defined(_WIN32)
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("LLAMA_FN_L18_STALL");
+        on = e != NULL && atoi(e) > 0 ? 1 : 0;
+    }
+    if (!on) {
+        return;
+    }
+    typedef HRESULT (WINAPI * set_desc_t)(HANDLE, PCWSTR);
+    set_desc_t set_desc = (set_desc_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+    if (set_desc) {
+        wchar_t w[32];
+        swprintf(w, 32, L"ggml-cpu %d", ith);
+        set_desc(GetCurrentThread(), w);
+    }
+#else
+    (void) ith;
+#endif
+}
+
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool * threadpool = state->threadpool;
 
     ggml_thread_apply_priority(threadpool->prio);
+    ggml_cpu_name_thread(state->ith); // [TAG_FN_L18_FIRSTANS_STALL]
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
