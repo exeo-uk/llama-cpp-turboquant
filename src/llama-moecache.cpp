@@ -4103,8 +4103,7 @@ bool llama_moe_hot_turn_pending() {
     if (!mc || !mc->adapt || !mc->dc_on || mc->l17_pre == 0) {
         return false;
     }
-    std::lock_guard<std::mutex> slk(mc->step_mtx);
-    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
+    std::lock_guard<std::mutex> slk(mc->step_mtx); // the pass's copies touch none of this: no join
     for (const auto & ls : mc->layers) {
         if (ls.dseed_any) {
             return true;

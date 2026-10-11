@@ -3834,6 +3834,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (llama_moe_hot_turn_pending()) {
             llama_fn_stall_scope st_scope("prompt-end pass before a short last part begins (tokens)", "prompt-end pass ends", n_tokens_all); // [TAG_FN_L18_FIRSTANS_STALL]
             llama_moe_hot_turn_start(this);
+            if (fa18_ovl) {
+                llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] this batch's own graphs come next (2: no wait)
+            }
         }
     }
 
