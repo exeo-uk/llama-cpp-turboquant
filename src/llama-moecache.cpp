@@ -276,6 +276,11 @@ struct moe_cache {
     std::vector<size_t>   sl_grp_bytes;
     std::vector<size_t>   sl_given;        // per group: bytes given to the KV cache now (0: mapped)
     ggml_tensor *         sl_raw = nullptr; // I8 over [0, cb_lo): the clear of a segment mapped again
+    // [TAG_FN_L17_VISION_LEND] the projector's share of the KV lend: its bytes, what it holds out now, statistics
+    size_t                vis_bytes = 0;
+    size_t                vis_out   = 0;
+    uint64_t              vis_n     = 0;
+    double                vis_take_ms = 0.0, vis_give_ms = 0.0;
     // [TAG_FN_L4_MEM_UPLOAD] LLAMA_FN_L4_UPLOAD=1 (qwen4exp): the tail's refill first (no swap is queued behind it for up to
     // l4_hold_ms after a restore), and the pinned halves (LLAMA_MOE_HOT_UP_PIPE) unless the environment says otherwise
     bool                  l4_upload  = false;
@@ -4200,6 +4205,66 @@ size_t llama_moe_hot_kv_restore(const void * owner, size_t keep) {
                 "still out)\n", n_res, bytes/1073741824.0, ms, mc->kv_out/1048576.0);
     }
     return mc->kv_out;
+}
+
+// [TAG_FN_L17_VISION_LEND] -------------------------------------------------------------------------------------------
+// The KV cache takes groups (layers) from the top and gives back the lowest first, so the projector's share is the
+// range just below the KV cache's: its give maps exactly what its take unmapped (an encode runs between two graphs,
+// no KV growth in between).
+
+void llama_moe_hot_vis_set(size_t bytes) {
+    if (moe_cache * mc = g_cache) {
+        mc->vis_bytes = bytes;
+    }
+}
+
+size_t llama_moe_hot_vis_bytes() {
+    const moe_cache * mc = g_cache;
+    return mc ? mc->vis_bytes : 0;
+}
+
+size_t llama_moe_hot_vis_take(size_t bytes) {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->vis_bytes == 0 || mc->vis_out > 0 || bytes == 0) {
+        return 0;
+    }
+    const int64_t t0     = ggml_time_us();
+    const size_t  before = mc->kv_out;
+    const size_t  after  = llama_moe_hot_kv_release(mc->owner, before + bytes);
+    mc->vis_out = after > before ? after - before : 0;
+    mc->vis_n++;
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->vis_take_ms += ms;
+    if (mc->vis_out < bytes) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L17_VISION_LEND] the projector asked for %.0f MiB and got %.0f MiB (KV cache %.0f of %.0f "
+                "MiB out): the rest comes from free VRAM\n", bytes/1048576.0, mc->vis_out/1048576.0, before/1048576.0,
+                mc->kv_bytes/1048576.0);
+    }
+    LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_VISION_LEND] encode %" PRIu64 ": the hot set gave %.0f MiB to the projector in %.1f ms\n",
+            mc->vis_n, mc->vis_out/1048576.0, ms);
+    return mc->vis_out;
+}
+
+void llama_moe_hot_vis_give() {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->vis_out == 0) {
+        return;
+    }
+    const int64_t t0    = ggml_time_us();
+    const size_t  keep  = mc->kv_out > mc->vis_out ? mc->kv_out - mc->vis_out : 0;
+    const size_t  after = llama_moe_hot_kv_restore(mc->owner, keep);
+    const double  ms    = (ggml_time_us() - t0)/1000.0;
+    const size_t  left  = after > keep ? after - keep : 0;
+    mc->vis_give_ms += ms;
+    if (left > 0) {
+        // still out: the KV cache's next release counts it, its next restore maps it
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L17_VISION_LEND] %.0f MiB of the projector's share could not be mapped again\n",
+                left/1048576.0);
+    }
+    LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_VISION_LEND] encode %" PRIu64 ": %.0f MiB back in the hot set in %.1f ms (take %.1f, give "
+            "%.1f ms on average)\n", mc->vis_n, (mc->vis_out > left ? mc->vis_out - left : 0)/1048576.0, ms,
+            mc->vis_take_ms/(double) mc->vis_n, mc->vis_give_ms/(double) mc->vis_n);
+    mc->vis_out = 0;
 }
 
 // [TAG_FN_L4_EXIT] ---------------------------------------------------------------------------------------------------

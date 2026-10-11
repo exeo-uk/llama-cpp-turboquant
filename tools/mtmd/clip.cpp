@@ -188,6 +188,32 @@ struct clip_ctx {
     bool cpu_only = false;
     bool backend_abandoned = false;
 
+    // [TAG_FN_L17_VISION_LEND] parked: the weights wait in host (pinned if possible) memory, the device weight buffer and
+    // the scheduler's compute buffers are freed. clip_encode takes the VRAM back, uploads, encodes and parks again.
+    struct lend_state {
+        bool on     = false;
+        bool parked = false;
+        ggml_backend_buffer_type_t buft = nullptr; // the weights' device buffer type
+        ggml_backend_buffer_ptr host_buf;
+        std::vector<uint8_t> host_vec;              // when no pinned buffer could be had
+        uint8_t * host = nullptr;
+        std::vector<std::pair<ggml_tensor *, size_t>> offs; // tensor, its offset in host
+        size_t bytes = 0; // device bytes freed at park: weights + compute
+        clip_lend_take_fn take = nullptr;
+        clip_lend_give_fn give = nullptr;
+        void * ud = nullptr;
+        uint64_t n = 0;
+    } lend;
+
+    void make_sched() {
+        sched.reset(
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+        );
+        if (init_params.cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), init_params.cb_eval, init_params.cb_eval_user_data);
+        }
+    }
+
     clip_ctx(clip_context_params & ctx_params) {
         init_params = ctx_params;
         flash_attn_type = ctx_params.flash_attn_type;
@@ -6119,7 +6145,164 @@ static bool clip_encode_on_cpu_twin(const clip_ctx * ctx, clip_ctx * twin, struc
     return clip_encode_impl(twin, params, &st);
 }
 
+// [TAG_FN_L17_VISION_LEND] ------------------------------------------------------------------------------------------------
+
+// frees the device weight buffer (the tensors keep their shapes, no data) and the compute buffers (a new scheduler)
+static void clip_lend_free_device(clip_ctx * ctx) {
+    ggml_backend_synchronize(ctx->backend);
+    ctx->buf.reset();
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+    ctx->make_sched();
+    ctx->lend.parked = true;
+}
+
+// a new device weight buffer (the same allocation as at load), the weights uploaded from host
+static bool clip_lend_unpark(clip_ctx * ctx) {
+    ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), ctx->lend.buft);
+    if (b == nullptr) {
+        // tensors placed before the failure point into the freed buffer: no data again
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        return false;
+    }
+    ctx->buf.reset(b);
+    ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (const auto & [t, off] : ctx->lend.offs) {
+        ggml_backend_tensor_set_async(ctx->backend, t, ctx->lend.host + off, 0, ggml_nbytes(t));
+    }
+    ggml_backend_synchronize(ctx->backend);
+    ctx->lend.parked = false;
+    return true;
+}
+
+size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_give_fn give, void * ud) {
+    if (ctx == nullptr || ctx->lend.on || ctx->no_alloc || ctx->cpu_only || !ctx->buf || !ctx->sched ||
+        ctx->backend == nullptr || ctx->backend == ctx->backend_cpu) {
+        return 0;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctx->buf.get());
+    if (ggml_backend_buft_is_host(buft)) {
+        return 0;
+    }
+    auto & L = ctx->lend;
+    size_t n = 0;
+    L.offs.clear();
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
+        if (t->view_src != nullptr || t->data == nullptr) {
+            continue;
+        }
+        const size_t off = GGML_PAD(n, 64);
+        L.offs.push_back({ t, off });
+        n = off + ggml_nbytes(t);
+    }
+    if (n == 0) {
+        return 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbt != nullptr) {
+        L.host_buf.reset(ggml_backend_buft_alloc_buffer(hbt, n));
+    }
+    if (L.host_buf) {
+        L.host = (uint8_t *) ggml_backend_buffer_get_base(L.host_buf.get());
+    } else {
+        try {
+            L.host_vec.resize(n);
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: [TAG_FN_L17_VISION_LEND] no host memory for the weights (%s): not parked\n", __func__, e.what());
+            L.offs.clear();
+            return 0;
+        }
+        L.host = L.host_vec.data();
+    }
+    const int64_t t0 = ggml_time_us();
+    for (const auto & [t, off] : L.offs) {
+        ggml_backend_tensor_get(t, L.host + off, 0, ggml_nbytes(t));
+    }
+    const size_t w = ggml_backend_buffer_get_size(ctx->buf.get());
+    const size_t c = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend);
+    L.buft  = buft;
+    L.take  = take;
+    L.give  = give;
+    L.ud    = ud;
+    L.bytes = w + c;
+    L.on    = true;
+    clip_lend_free_device(ctx);
+    LOG_INF("%s: [TAG_FN_L17_VISION_LEND] weights (%.1f MiB, %zu tensors) wait in %s host memory, %.1f MiB of %s freed until "
+            "an encode (%.1f ms)\n", __func__, n/1048576.0, L.offs.size(), L.host_buf ? "pinned" : "pageable", L.bytes/1048576.0,
+            ggml_backend_name(ctx->backend), (ggml_time_us() - t0)/1000.0);
+    return L.bytes;
+}
+
+ggml_backend_dev_t clip_get_device(const struct clip_ctx * ctx) {
+    if (ctx == nullptr || ctx->backend == nullptr || ctx->backend == ctx->backend_cpu) {
+        return nullptr;
+    }
+    return ggml_backend_get_device(ctx->backend);
+}
+
+// around one encode of a parked context: VRAM back, weights up; at scope exit both freed again and the VRAM returned
+struct clip_lend_scope {
+    clip_ctx * ctx;
+    bool active = false;
+    bool ok     = true;
+    int64_t t0 = 0, t_take = 0, t_up = 0;
+    size_t got = 0;
+
+    explicit clip_lend_scope(clip_ctx * c) : ctx(c) {
+        if (!ctx->lend.on || !ctx->lend.parked || ctx->cpu_only) {
+            return;
+        }
+        active = true;
+        t0  = ggml_time_us();
+        got = ctx->lend.take ? ctx->lend.take(ctx->lend.ud, ctx->lend.bytes) : 0;
+        t_take = ggml_time_us();
+        ok = clip_lend_unpark(ctx);
+        t_up = ggml_time_us();
+        if (!ok) {
+            LOG_ERR("%s: [TAG_FN_L17_VISION_LEND] the weight buffer (%.1f MiB) could not be allocated: this encode fails\n", __func__,
+                    ctx->lend.bytes/1048576.0);
+        }
+    }
+
+    ~clip_lend_scope() {
+        if (!active) {
+            return;
+        }
+        const int64_t t_enc = ggml_time_us();
+        if (!ctx->lend.parked && !ctx->cpu_only) {
+            clip_lend_free_device(ctx);
+        }
+        const int64_t t_free = ggml_time_us();
+        if (ctx->lend.give) {
+            ctx->lend.give(ctx->lend.ud);
+        }
+        const int64_t t_end = ggml_time_us();
+        ctx->lend.n++;
+        size_t w = 0;
+        for (const auto & to : ctx->lend.offs) {
+            w += ggml_nbytes(to.first);
+        }
+        LOG_INF("%s: [TAG_FN_L17_VISION_LEND] encode %" PRIu64 ": VRAM back %.0f MiB in %.1f ms, weights up in %.1f ms (%.1f GiB/s), "
+                "encode %.1f ms, freed in %.1f ms, returned in %.1f ms\n", "clip_encode", ctx->lend.n, got/1048576.0,
+                (t_take - t0)/1000.0, (t_up - t_take)/1000.0, t_up > t_take ? w/1073741824.0/((t_up - t_take)/1e6) : 0.0,
+                (t_enc - t_up)/1000.0, (t_free - t_enc)/1000.0, (t_end - t_free)/1000.0);
+    }
+
+    clip_lend_scope(const clip_lend_scope &) = delete;
+    clip_lend_scope & operator=(const clip_lend_scope &) = delete;
+};
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    clip_lend_scope lend(ctx); // [TAG_FN_L17_VISION_LEND] no-op unless parked
+    if (!lend.ok) {
+        return false;
+    }
     if (!clip_device_fallback_eligible(ctx)) {
         clip_encode_status st;
         return clip_encode_impl(ctx, params, &st);

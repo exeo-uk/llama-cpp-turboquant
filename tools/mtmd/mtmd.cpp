@@ -7,6 +7,7 @@
 #include "debug/mtmd-debug.h"
 
 #include "llama.h"
+#include "../src/llama-ext.h" // [TAG_FN_L17_VISION_LEND]
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -622,6 +623,21 @@ struct mtmd_context {
         if (ctx_a) {
             init_audio();
         }
+        // [TAG_FN_L17_VISION_LEND] the projector's VRAM serves the text model's hot set between encodes
+        if (ctx_v && text_model && !no_alloc && llama_fn_vision_lend_wanted(text_model, clip_get_device(ctx_v))) {
+            const size_t b = clip_lend_park(ctx_v, lend_take, lend_give, (void *) text_model);
+            if (b > 0) {
+                llama_fn_vision_lend_register(text_model, b);
+            }
+        }
+    }
+
+    static size_t lend_take(void * ud, size_t bytes) {
+        return llama_fn_vision_take((const llama_model *) ud, bytes);
+    }
+
+    static void lend_give(void * ud) {
+        llama_fn_vision_give((const llama_model *) ud);
     }
 
     void init_vision() {
