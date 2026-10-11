@@ -5852,6 +5852,52 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+// [TAG_FN_L17_VISION_LEND] ---------------------------------------------------------------------------------------------
+// LLAMA_FN_L17_VISION=1 (qwen4exp): a projector on the hot set's device parks its weights in host memory and frees its
+// device buffers between encodes (tools/mtmd/clip.cpp); the fit lends that VRAM to the hot set, which gives it back for
+// each encode. The projector registers its bytes before the fit (the first decode after every context exists).
+
+namespace {
+std::atomic<size_t>        g_vis_parked{0};
+const llama_model *        g_vis_model = nullptr;
+}
+
+static size_t vis_lend_parked_bytes(const llama_model & model) {
+    return g_vis_model == &model ? g_vis_parked.load() : 0;
+}
+
+bool llama_fn_vision_lend_wanted(const llama_model * model, ggml_backend_dev_t dev) {
+    if (!model || !dev || !llama_fn_l3_flag(*model, "LLAMA_FN_L17_VISION") || !llama_moe_hot_fit_wanted(*model)) {
+        return false;
+    }
+    if (llama_moe_hot_device(*model) != dev || llama_moe_hot_vmm_granularity(*model) == 0) {
+        return false; // another device, or no virtual memory to give back
+    }
+    // a hot set sized already holds the projector's VRAM only when it carries the lend
+    return llama_moe_hot_max_t() == 0 || llama_moe_hot_vis_bytes() > 0;
+}
+
+void llama_fn_vision_lend_register(const llama_model * model, size_t bytes) {
+    g_vis_model = model;
+    g_vis_parked.store(bytes);
+}
+
+size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
+    if (!model || model != g_vis_model || llama_moe_hot_vis_bytes() == 0) {
+        return 0;
+    }
+    for (const auto & c : llama_fn_ctx_list(*model)) {
+        c.first->synchronize(); // no graph of the model reads a slot while its VRAM goes
+    }
+    return llama_moe_hot_vis_take(bytes);
+}
+
+void llama_fn_vision_give(const llama_model * model) {
+    if (model && model == g_vis_model) {
+        llama_moe_hot_vis_give();
+    }
+}
+
 // [TAG_FN_VRAM_FIT] the deferred hot set: once every context of the model exists (or at the second decode, when an
 // expected MTP draft context never came), size it to the VRAM that the model, the KV caches (turbot pool, indexer
 // cache), the compute buffers (QSA temporaries grow with -ub) and the draft context left, under a device-use ceiling
@@ -5981,22 +6027,43 @@ void llama_context::moe_hot_fit_try() {
     // [TAG_FN_L8_KVLEND] the KV cache's unmapped cells are free VRAM in the fit above: the hot set holds them in layers that
     // give them back as the context grows (none: the hot set fails, the KV cache maps whole and the fit runs again)
     const size_t kv_want = cbuf_tail > 0 ? llama_kv_lend_unmapped_bytes() : 0;
-    if (kv_want > 0) {
-        llama_moe_hot_set_kv_lend(kv_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
+    // [TAG_FN_L17_VISION_LEND] the parked projector's VRAM is free in the fit above too: it rides on the same lend (the hot
+    // set gives it back for each encode); with no lend to carry it, the budget leaves it free (the projector's own VRAM)
+    const size_t vis      = vis_lend_parked_bytes(model);
+    const size_t vis_want = cbuf_tail > 0 ? vis : 0;
+    auto vis_cut = [vis](size_t b) { return b > vis ? b - vis : 0; };
+    if (vis_want == 0) {
+        budget = vis_cut(budget);
     }
-    bool hot_ok = llama_moe_hot_init(model, this, budget, cbuf_tail);
-    if (kv_want > 0) {
+    const size_t lend_want = kv_want + vis_want;
+    if (lend_want > 0) {
+        llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
+    }
+    bool hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
+    if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(0, 0, 0);
         if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
-            llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);
-            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L8_KVLEND] %.0f MiB of unused KV cells lent to the hot set (%.0f MiB of KV layers)\n",
-                    kv_want/MiB, llama_moe_hot_kv_bytes()/MiB);
-        } else if (!hot_ok && llama_kv_lend_map_all()) {
+            if (kv_want > 0) {
+                llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L8_KVLEND] %.0f MiB of unused KV cells lent to the hot set (%.0f MiB of KV layers)\n",
+                        kv_want/MiB, llama_moe_hot_kv_bytes()/MiB);
+            }
+            if (vis_want > 0 && llama_moe_hot_kv_bytes() >= lend_want) {
+                llama_moe_hot_vis_set(vis_want);
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_VISION_LEND] the parked projector's %.0f MiB are hot slots between encodes "
+                        "(lend %.0f MiB = KV %.0f + projector %.0f wanted)\n", vis_want/MiB, llama_moe_hot_kv_bytes()/MiB,
+                        kv_want/MiB, vis_want/MiB);
+            } else if (vis_want > 0) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L17_VISION_LEND] the hot set holds %.0f of %.0f MiB of lend: no projector share, "
+                        "an encode takes its %.0f MiB from free VRAM\n", llama_moe_hot_kv_bytes()/MiB, lend_want/MiB, vis_want/MiB);
+            }
+        } else if (!hot_ok && (kv_want == 0 || llama_kv_lend_map_all())) {
             ggml_backend_dev_memory(dev, &mem_free, &mem_total);
             budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
             if (cbuf_tail > 0 && budget > 0) {
                 budget = llama_fn_cbuf_budget(budget, cbuf_pool_mib << 20, mem_free, budget_max);
             }
+            budget = vis_cut(budget); // [TAG_FN_L17_VISION_LEND] no lend now
             hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
         }
     }
@@ -6006,7 +6073,7 @@ void llama_context::moe_hot_fit_try() {
         cbuf_off();
         cbuf_tail = 0;
         ggml_backend_dev_memory(dev, &mem_free, &mem_total);
-        budget = std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin));
+        budget = vis_cut(std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin)));
         hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, 0);
     }
     if (hot_ok) {

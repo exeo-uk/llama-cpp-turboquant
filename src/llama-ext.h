@@ -287,6 +287,15 @@ LLAMA_API int llama_fn_l4_int(const struct llama_model * model, const char * nam
 LLAMA_API void llama_ple_prefetch_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks,
         int32_t n, int32_t i_first);
 
+// [TAG_FN_L17_VISION_LEND] LLAMA_FN_L17_VISION=1 (qwen4exp, a hot set fitted to VRAM on dev with virtual memory): the
+// projector may park its device buffers between encodes. _register: the device bytes it freed (before the fit, which
+// lends them to the hot set). Around each encode (the owner's thread): _take(bytes) gives VRAM back from the hot set
+// (returns the bytes, 0: none lent), _give returns it.
+LLAMA_API bool   llama_fn_vision_lend_wanted(const struct llama_model * model, ggml_backend_dev_t dev);
+LLAMA_API void   llama_fn_vision_lend_register(const struct llama_model * model, size_t bytes);
+LLAMA_API size_t llama_fn_vision_take(const struct llama_model * model, size_t bytes);
+LLAMA_API void   llama_fn_vision_give(const struct llama_model * model);
+
 // RAII: switch to seg, back to the previous segment at scope exit
 struct llama_hp_scope {
     int prev;
