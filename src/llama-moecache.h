@@ -235,6 +235,13 @@ void llama_moe_hot_state_save(const void * owner);
 // its queue until the owner's next step, so nothing of the hot set runs on the device. Returns after that batch.
 void llama_moe_hot_idle(const void * owner);
 
+// [TAG_FN_L17_START_PRE] LLAMA_FN_L17_START_PRE=<MiB> (qwen4exp, decayed adaptive set): the owner calls turn_start after a
+// prompt batch (no graph of it runs). If the batch's routing was counted (prompts below the stream's size), the decayed
+// counts fade (x LLAMA_FN_L17_START_TD), the prompt's routing comes in as LLAMA_FN_L17_START_SN decode steps of its mix,
+// and one pass of the decay rules swaps up to <MiB> of experts, landed before it returns. Returns true if it ran a pass.
+bool llama_moe_hot_turn_start_on();
+bool llama_moe_hot_turn_start(const void * owner);
+
 // [TAG_FN_L4_EXIT] the owner goes away: the upload worker stops after its chunk in flight and is joined, the upload stream
 // is synchronized; the hot set stays static from then on
 void llama_moe_hot_stop(const void * owner);

@@ -4278,6 +4278,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cbuf_set(false);
     }
 
+    // [TAG_FN_L17_START_PRE] a prompt batch ends: the experts its routing names land before the answer's first decode step
+    // (prompt time); after the tail came back above, so its layers take part. One sequence only: with more, a prompt batch
+    // can carry another answer's decode tokens, which would wait for the pass
+    if (hot_owner && cparams.n_seq_max == 1 && (int) n_tokens_all > llama_moe_hot_max_t() && llama_moe_hot_turn_start_on()) {
+        step_join();
+        llama_moe_hot_turn_start(this);
+    }
+
     if (cbuf_short) { // [TAG_FN_L4_MEM_PROMPT] host time of the batch (its last graph may still run on the device)
         cbuf_ms_short += (ggml_time_us() - t_short0)/1000.0;
         if (cbuf_n_short <= 3 || cbuf_n_short % 32 == 0) {

@@ -27,6 +27,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h> // [TAG_FN_L17_START_NT]
+#endif
+
 namespace {
 
 struct layer_state {
@@ -283,6 +287,27 @@ struct moe_cache {
     double                cb_rel_ms = 0.0;
     double                cb_res_ms = 0.0;
     size_t                cb_res_b  = 0;
+    // [TAG_FN_L17_START_PRE] LLAMA_FN_L17_START_PRE=<MiB> (qwen4exp): at the end of a prompt the old topic's counts fade
+    // (x l17_td), the prompt's routing comes in as l17_sn decode steps of its mix, and one pass of the decay rules swaps
+    // up to that many bytes; they land before the answer's first decode step (prompt time)
+    size_t                l17_pre     = 0;
+    float                 l17_td      = 0.5f;
+    float                 l17_sn      = 32.0f;
+    int                   l17_threads = 16;
+    uint64_t              l17_n       = 0;
+    uint64_t              l17_swaps   = 0;
+    size_t                l17_bytes   = 0;
+    double                l17_ms      = 0.0;
+    // [TAG_FN_L17_START_NT] LLAMA_FN_L17_START_NT=1: the staging copies of uploads and refills with non-temporal stores
+    bool                  l17_nt      = false;
+    // [TAG_FN_L17_START_BURST] LLAMA_FN_L17_START_BURST=1: the burst window opens at the set's start only (a CBUF restore or
+    // the stream's unlend does not open it again)
+    bool                  l17_burst_start = false;
+    // [TAG_FN_L17_START_STATE] LLAMA_FN_L17_START_STATE=<s>: the learned set (LLAMA_MOE_HOT_STATE) saved when the owner goes
+    // idle, at most every <s> seconds and after >= 64 new decode steps, so a hard stop keeps a recent one
+    int64_t               l17_st_every_us = 0;
+    int64_t               l17_st_last_us  = 0;
+    uint64_t              l17_st_steps    = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -985,6 +1010,39 @@ bool hot_slice_ok(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
     return true;
 }
 
+// [TAG_FN_L17_START_NT] a copy into staging that only the DMA reads: non-temporal stores, so no destination line is read
+// first and the staging does not push the CPU experts' lines out of the caches (the CRT memcpy streams only from ~1.5 MiB,
+// above an expert slice). Same bytes as memcpy. For the large staging buffers only: the small pinned halves of
+// LLAMA_MOE_HOT_UP_PIPE are meant to stay in the caches.
+void hot_copy(const moe_cache * mc, void * dst, const void * src, size_t n) {
+#if defined(_M_X64) || defined(__x86_64__)
+    if (mc->l17_nt) {
+        uint8_t *       d = (uint8_t *) dst;
+        const uint8_t * s = (const uint8_t *) src;
+        size_t i = std::min(n, (size_t) ((16 - ((uintptr_t) d & 15)) & 15));
+        if (i > 0) {
+            memcpy(d, s, i);
+        }
+        for (; i + 64 <= n; i += 64) {
+            const __m128i a = _mm_loadu_si128((const __m128i *) (s + i));
+            const __m128i b = _mm_loadu_si128((const __m128i *) (s + i + 16));
+            const __m128i c = _mm_loadu_si128((const __m128i *) (s + i + 32));
+            const __m128i e = _mm_loadu_si128((const __m128i *) (s + i + 48));
+            _mm_stream_si128((__m128i *) (d + i),      a);
+            _mm_stream_si128((__m128i *) (d + i + 16), b);
+            _mm_stream_si128((__m128i *) (d + i + 32), c);
+            _mm_stream_si128((__m128i *) (d + i + 48), e);
+        }
+        if (i < n) {
+            memcpy(d + i, s + i, n - i);
+        }
+        _mm_sfence(); // the streamed lines are in memory before the DMA is queued
+        return;
+    }
+#endif
+    memcpy(dst, src, n);
+}
+
 // [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_PIPE: the batch through two small pinned halves - the copy threads fill one
 // while the upload stream reads the other (an event per half orders the reuse) - so the staging stays cache resident and
 // the memcpy overlaps the DMA. Returns after every copy of the batch has landed.
@@ -1115,7 +1173,7 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
             if (used + sz > mc->stage_size) {
                 flush();
             }
-            memcpy(mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
+            hot_copy(mc, mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz); // [TAG_FN_L17_START_NT]
             st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
             used += sz;
         }
@@ -1287,7 +1345,14 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
         if (!ls.dseed_any) {
             continue;
         }
-        if (mc->sd_norm > 0.0f) {
+        if (mc->l17_pre > 0) {
+            // [TAG_FN_L17_START_PRE] llama_moe_hot_turn_start folds the prompt at its end; a prompt it did not see folds here
+            // at the first decode step, with the same weight
+            if (!decode_step) {
+                continue;
+            }
+            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, ls.dseed_tok > 0.0f ? mc->l17_sn/ls.dseed_tok : 0.0f);
+        } else if (mc->sd_norm > 0.0f) {
             // [TAG_FN_L3_POLICY_SEED] LLAMA_MOE_HOT_SEED_NORM: the whole prompt (all its ubatches) at its first decode step,
             // as sd_norm decode steps of the share of its tokens that route to each expert, whatever its length
             if (!decode_step) {
@@ -1869,6 +1934,32 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_STATE_LOAD")) {
                 mc->st_load = atoi(v) != 0;
             }
+        }
+    }
+    // [TAG_FN_L17_START_*] the answer-start levers of round 17 (qwen4exp only; every one off by default)
+    if (l3 && mc->dc_on) {
+        if (const char * e = llama_fn_env(model, "LLAMA_FN_L17_START_PRE"); e && atoi(e) > 0) {
+            if (mc->dc.seed > 0.0f) { // the observer (or the seed node) counts the prompt's routing only with a seed
+                mc->l17_pre = (size_t) std::min(65536, atoi(e)) << 20;
+                if (const char * v = llama_fn_env(model, "LLAMA_FN_L17_START_TD")) { mc->l17_td = std::max(0.0f, std::min(1.0f, (float) atof(v))); }
+                if (const char * v = llama_fn_env(model, "LLAMA_FN_L17_START_SN")) { mc->l17_sn = std::max(0.0f, (float) atof(v)); }
+                if (const char * v = llama_fn_env(model, "LLAMA_FN_L17_START_THREADS")) { mc->l17_threads = std::max(1, std::min(64, atoi(v))); }
+            } else {
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L17_START_PRE] needs LLAMA_MOE_HOT_SEED > 0 (the prompt's routing) - off\n");
+            }
+        }
+        mc->l17_nt          = llama_fn_l3_flag(model, "LLAMA_FN_L17_START_NT");
+        mc->l17_burst_start = llama_fn_l3_flag(model, "LLAMA_FN_L17_START_BURST");
+        if (!mc->st_path.empty()) {
+            mc->l17_st_every_us = (int64_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L17_START_STATE", 0))*1000000;
+        }
+        if (mc->l17_pre > 0 || mc->l17_nt || mc->l17_burst_start || mc->l17_st_every_us > 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_START] prompt-end pass: %s; non-temporal staging copies: %s; burst window at the "
+                    "start only: %s; state saved when idle: %s\n",
+                    mc->l17_pre > 0 ? format("<= %zu MiB, counts x %.2f, the prompt as %.0f decode steps, %d copy threads",
+                            mc->l17_pre >> 20, mc->l17_td, mc->l17_sn, mc->l17_threads).c_str() : "off",
+                    mc->l17_nt ? "on" : "off", mc->l17_burst_start ? format("on (%d passes)", mc->dc_burst_passes).c_str() : "off",
+                    mc->l17_st_every_us > 0 ? format("every >= %lld s", (long long) (mc->l17_st_every_us/1000000)).c_str() : "off");
         }
     }
 
@@ -3408,7 +3499,7 @@ size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_th
         for (int t = 0; t < n_threads; ++t) {
             th.emplace_back([&, t]() {
                 for (size_t k = (size_t) t; k < n; k += (size_t) n_threads) {
-                    memcpy(base + stage_off[k], jobs[i + k].src, jobs[i + k].size);
+                    hot_copy(mc, base + stage_off[k], jobs[i + k].src, jobs[i + k].size); // [TAG_FN_L17_START_NT]
                 }
             });
         }
@@ -3526,7 +3617,9 @@ void llama_moe_hot_unlend(const void * owner) {
         return;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
-    mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
+    if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
+        mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
+    }
     if (!mc->lent_any) {
         return;
     }
@@ -3775,6 +3868,146 @@ void llama_moe_hot_state_save(const void * owner) {
     }
 }
 
+// [TAG_FN_L17_START_PRE] -------------------------------------------------------------------------------------------------
+
+bool llama_moe_hot_turn_start_on() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->adapt && mc->dc_on && mc->l17_pre > 0;
+}
+
+bool llama_moe_hot_turn_start(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || !mc->dc_on || mc->l17_pre == 0 || owner != mc->owner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    bool seeded = false;
+    for (const auto & ls : mc->layers) {
+        seeded = seeded || ls.dseed_any;
+    }
+    if (!seeded) {
+        return false; // a streamed prompt (no observer) or a decode batch
+    }
+    const int64_t t0 = ggml_time_us();
+    // the worker takes no new batch and puts its running one down: its slots in flight stay busy below, and the refill
+    // uses its upload stream alone
+    {
+        std::unique_lock<std::mutex> lk(mc->wmtx);
+        mc->paused = true;
+        hot_set_yield(mc);
+        mc->wcv.notify_all();
+        mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy; });
+    }
+    const int64_t t_idle = ggml_time_us();
+    hot_adapt_publish(mc);
+
+    // the counts: the last answer's fade, the prompt comes in as l17_sn decode steps of its mix
+    for (auto & ls : mc->layers) {
+        if (ls.dcnt.empty()) {
+            continue;
+        }
+        if (mc->l17_td < 1.0f) {
+            llama_moe_decay_apply(ls.dcnt, mc->l17_td);
+        }
+        if (ls.dseed_any) {
+            llama_moe_decay_fold_seed(ls.dcnt, ls.dseed, ls.dseed_tok > 0.0f ? mc->l17_sn/ls.dseed_tok : 0.0f);
+        }
+        ls.dseed_any = false;
+        ls.dseed_tok = 0.0f;
+    }
+
+    // one pass of the decay rules over the layers outside a pool (as hot_adapt_decay), best gain first, under the budget
+    std::vector<llama_moe_decay_swap> swaps;
+    std::vector<uint8_t> slot_busy;
+    std::vector<uint8_t> expert_busy;
+    const llama_moe_host_ready_fn ready = g_host_ready.load(); // [TAG_FN_L15_TIER]
+    void * ready_ud = g_host_ready_ud.load();
+    for (int li = 0; li < (int) mc->layers.size(); ++li) {
+        const layer_state & ls = mc->layers[li];
+        if (ls.pub.n_slots == 0 || ls.dcnt.empty() || ls.out() || ls.pool >= 0) {
+            continue;
+        }
+        slot_busy.assign(ls.pub.n_slots, 0);
+        for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+            slot_busy[s] = ls.slot_in_flight[s] || (!ls.slot_out.empty() && ls.slot_out[s]) ? 1 : 0;
+            if (!slot_busy[s] && ready && ls.slot_expert[s] >= 0 && !ready(ls.pub.up_src, ls.slot_expert[s], ready_ud)) {
+                slot_busy[s] = 1;
+            }
+        }
+        expert_busy.assign(ls.dcnt.size(), 0);
+        for (size_t e = 0; e < ls.dcnt.size(); ++e) {
+            expert_busy[e] = ls.expert_slot[e] >= 0 || ls.expert_in_flight[e] ? 1 : 0;
+        }
+        const size_t lb = hot_layer_bytes(ls);
+        llama_moe_decay_pairs(li, ls.dcnt, ls.slot_expert, slot_busy, expert_busy, mc->dc, swaps, mc->l17_pre/std::max<size_t>(1, lb) + 1);
+    }
+    llama_moe_decay_order(swaps);
+
+    // evict, then the new expert owns the slot in the bookkeeping; the tables name it only after its bytes landed
+    std::vector<refill_job>           jobs;
+    std::vector<llama_moe_decay_swap> taken;
+    size_t used = 0;
+    for (const auto & w : swaps) {
+        layer_state & ls = mc->layers[w.layer];
+        const size_t b = hot_layer_bytes(ls);
+        if (used + b > mc->l17_pre) {
+            break;
+        }
+        ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+        const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        bool ok = true;
+        for (int k = 0; k < 3 && ok; ++k) {
+            ok = hot_slice_ok(dsts[k], srcs[k], w.expert, w.slot);
+        }
+        if (!ok) {
+            continue;
+        }
+        if (w.victim >= 0) {
+            ls.expert_slot[w.victim] = -1;
+            hot_adapt_set_entry(mc, ls, w.victim, ls.pub.n_slots);
+        }
+        ls.slot_expert[w.slot]   = w.expert;
+        ls.expert_slot[w.expert] = w.slot;
+        for (int k = 0; k < 3; ++k) {
+            const size_t sz = srcs[k]->nb[2];
+            jobs.push_back({ dsts[k], (size_t) w.slot*dsts[k]->nb[2], (const char *) srcs[k]->data + (size_t) w.expert*sz, sz });
+        }
+        taken.push_back(w);
+        used += b;
+    }
+    // the victims leave the device table before any slot is overwritten (no graph runs now; the next one reads the new table)
+    if (mc->tbl_dirty) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    const size_t bytes = jobs.empty() ? 0 : hot_refill(mc, jobs, mc->l17_threads);
+    for (const auto & w : taken) {
+        hot_adapt_set_entry(mc, mc->layers[w.layer], w.expert, w.slot);
+    }
+    if (mc->tbl_dirty) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->paused = false;
+        hot_set_yield(mc);
+        mc->wcv.notify_all();
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->l17_n++;
+    mc->l17_swaps += taken.size();
+    mc->l17_bytes += bytes;
+    mc->l17_ms    += ms;
+    if (mc->l17_n <= 3 || mc->l17_n % 32 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_START_PRE] prompt end %" PRIu64 ": %zu experts (%.0f MiB) swapped in from the prompt's "
+                "routing in %.1f ms (worker idle after %.1f ms; %.1f GiB/s); %.1f ms and %.0f MiB per prompt so far\n", mc->l17_n,
+                taken.size(), bytes/1048576.0, ms, (t_idle - t0)/1000.0, ms > 0 ? bytes/1073741824.0/(ms/1000.0) : 0.0,
+                mc->l17_ms/mc->l17_n, mc->l17_bytes/1048576.0/mc->l17_n);
+    }
+    return true;
+}
+
 // [TAG_FN_L3_VRAM_CBUF] ---------------------------------------------------------------------------------------------
 
 size_t llama_moe_hot_cbuf_tail_bytes() {
@@ -3979,6 +4212,20 @@ void llama_moe_hot_idle(const void * owner) {
     mc->wcv.notify_all(); // a bucket wait gives up
     // the batch in flight holds at most UP_INFLIGHT_MAX bytes; the bound only guards against a stuck copy
     mc->wcv_idle.wait_for(lk, std::chrono::seconds(10), [mc]() { return !mc->worker_busy; });
+    lk.unlock();
+    // [TAG_FN_L17_START_STATE] the learned set to its file now and then, so a stop without the owner's end keeps it
+    if (mc->l17_st_every_us > 0 && mc->ad_steps >= mc->l17_st_steps + 64) {
+        const int64_t now = ggml_time_us();
+        if (mc->l17_st_last_us == 0 || now - mc->l17_st_last_us >= mc->l17_st_every_us) {
+            hot_state_save(mc);
+            mc->l17_st_last_us = now;
+            mc->l17_st_steps   = mc->ad_steps;
+            if (mc->st_saves <= 3) {
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_START_STATE] state saved at idle in %.1f ms (%llu decode steps)\n",
+                        (ggml_time_us() - now)/1000.0, (unsigned long long) mc->ad_steps);
+            }
+        }
+    }
 }
 
 void llama_moe_hot_stop(const void * owner) {
@@ -4008,7 +4255,9 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
-    mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
+    if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
+        mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
+    }
     const int64_t t0 = ggml_time_us();
     const size_t  n  = mc->cb_hi - mc->cb_lo;
     // a failed release may have left a part mapped, and map() refuses a mapped range: give that back first (nothing
