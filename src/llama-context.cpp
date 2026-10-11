@@ -1732,6 +1732,7 @@ llama_context::llama_context(
             fa18_once = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_ONCE");
             fa18_fit  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_FIT");
             fa18_ovl  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_OVERLAP");
+            fa18_warm = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_WARM");
             if (llama_moe_hot_fit_wanted(model) && llama_moe_hot_device(model) != nullptr) {
                 moe_hot_pending = true;
                 LLAMA_LOG_INFO("%s: moe-hot: the VRAM fit sizes the hot set at the first decode after every context of the "
@@ -1974,6 +1975,7 @@ void llama_context::sched_reserve() {
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    llama_fn_stall_scope st_scope("sched_reserve begins", "sched_reserve ends"); // [TAG_FN_L18_FIRSTANS_STALL]
 
     synchronize();
     step_join(); // [TAG_FN_L3_HOST_STEP] the moe-cache / DMA step is done before the banks or the hot set move
@@ -3669,7 +3671,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     (int) batch_inp.tokens.size() };
     // [TAG_FN_L15_WARMYIELD] answer steps (small ubatches) make the experts' warm pass wait; a prompt chunk never does (its
     // stream may be waiting for the pass)
-    if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= 64 || cparams.n_ubatch <= 64)) {
+    // [TAG_FN_L18_FIRSTANS_WARM] LLAMA_FN_L18_FIRSTANS_WARM=1: only answer steps (no wider than the hot set's graphs) make it
+    // wait; a short prompt computes its experts on the CPU and faults them in one page at a time, so the pass reads on
+    const size_t warm_small_t = fa18_warm ? (size_t) std::max(8, llama_moe_hot_max_t()) : 64;
+    if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= warm_small_t || cparams.n_ubatch <= 64)) {
         warm_go.small = true;
         llama_fn_warm_small_decode(true);
     }

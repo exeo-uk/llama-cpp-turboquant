@@ -70,6 +70,7 @@ struct st_sample {
     int      warm = 0;      // 0 not running, 1 reading, 2 paused for an answer step
     size_t   warm_mark = 0;
     std::vector<st_thr> thr;
+    std::vector<st_thr> sys; // the System process's threads that run or are ready now
 };
 
 // NtQuerySystemInformation(SystemProcessInformation) records (x64 layout)
@@ -166,9 +167,18 @@ struct st_state {
 
     std::thread       th;
     std::atomic<bool> stop{false};
+
+    // the decode that runs now (0: none) and when the watchdog dumped it last
+    std::atomic<int64_t> dec_t0{0};
+    std::atomic<int>     dec_n{0};
+    int64_t              dec_dump_us = 0;
 };
 
 st_state * g_st = nullptr;
+
+} // namespace
+void llama_fn_stall_dump(const char * why);
+namespace {
 
 st_state * st_get() {
     static std::once_flag once;
@@ -239,6 +249,20 @@ st_state * st_get() {
                             }
                         } else if (pid == 4) {
                             smp.sys_cpu = cpu;
+                            const auto * th = (const nt_thread_info *) (p + 1);
+                            for (uint32_t i = 0; i < p->n_threads; ++i) {
+                                if (th[i].state == 2 || th[i].state == 1 || th[i].state == 7) {
+                                    st_thr x;
+                                    x.tid   = (uint32_t) (uintptr_t) th[i].tid;
+                                    x.state = (uint8_t) th[i].state;
+                                    x.wait  = 0;
+                                    x.prio  = (int8_t) th[i].prio;
+                                    x.pad   = 0;
+                                    x.cpu   = (uint64_t) th[i].kernel + (uint64_t) th[i].user;
+                                    x.csw   = th[i].csw;
+                                    smp.sys.push_back(x);
+                                }
+                            }
                         } else if (pid != 0) {
                             smp.other_cpu += cpu;
                         }
@@ -256,6 +280,14 @@ st_state * st_get() {
                     std::lock_guard<std::mutex> lk(s->mtx);
                     s->ring[s->n_samples % s->ring.size()] = std::move(smp);
                     s->n_samples++;
+                }
+                // a decode that has run longer than the window: a dump now and then while it runs
+                const int64_t d0 = s->dec_t0.load(std::memory_order_acquire);
+                if (d0 > 0 && t - d0 > (int64_t) s->win_ms*1000 && t - s->dec_dump_us > (int64_t) s->win_ms*1000) {
+                    s->dec_dump_us = t;
+                    char why[96];
+                    snprintf(why, sizeof(why), "a %d-token decode has run for %.0f ms", s->dec_n.load(), (t - d0)/1000.0);
+                    llama_fn_stall_dump(why);
                 }
                 const int64_t el = st_now_us() - t;
                 const int64_t sl = (int64_t) s->period_ms*1000 - el;
@@ -293,6 +325,38 @@ char st_letter(uint8_t state, uint8_t wait) {
         case 39: return 'Y'; // WrPhysicalFault
         default: return '?';
     }
+}
+
+// "aff <mask> ideal <cpu>" of a thread of this process ("" when it cannot be read)
+std::string st_affinity(uint32_t tid) {
+    using nt_qit_t = LONG (WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const nt_qit_t qit = (nt_qit_t) (void *) GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    struct tbi {
+        LONG      exit_status;
+        PVOID     teb;
+        PVOID     pid;
+        PVOID     tid;
+        ULONG_PTR affinity;
+        LONG      prio;
+        LONG      base_prio;
+    } b = {};
+    std::string out;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) {
+        return out;
+    }
+    char tmp[96];
+    if (qit && qit(h, 0, &b, sizeof(b), nullptr) >= 0) {
+        snprintf(tmp, sizeof(tmp), "aff %llx", (unsigned long long) b.affinity);
+        out = tmp;
+    }
+    PROCESSOR_NUMBER pn = {};
+    if (GetThreadIdealProcessorEx(h, &pn)) {
+        snprintf(tmp, sizeof(tmp), " ideal %u", (unsigned) pn.Number);
+        out += tmp;
+    }
+    CloseHandle(h);
+    return out;
 }
 
 std::string st_name(st_state * s, uint32_t tid) {
@@ -499,10 +563,36 @@ void llama_fn_stall_dump(const char * why) {
             n_quiet++;
             continue;
         }
-        LLAMA_LOG_WARN("fn_stall: %-14s %6u p%-2d |%s| %7.1f ms cpu, %u switches\n", nm.empty() ? "?" : nm.c_str(), r.tid,
-                r.prio, r.tl.c_str(), (r.cpu1 - std::min(r.cpu1, r.cpu0))/1e4, r.csw1 - r.csw0);
+        LLAMA_LOG_WARN("fn_stall: %-14s %6u p%-2d |%s| %7.1f ms cpu, %u switches, %s\n", nm.empty() ? "?" : nm.c_str(), r.tid,
+                r.prio, r.tl.c_str(), (r.cpu1 - std::min(r.cpu1, r.cpu0))/1e4, r.csw1 - r.csw0, st_affinity(r.tid).c_str());
     }
     LLAMA_LOG_WARN("fn_stall: %d unnamed threads idle in plain waits all window\n", n_quiet);
+    // the System process's threads that ran (R) or waited for a CPU (r) in the most samples of the window
+    {
+        struct sysrow { int run = 0, ready = 0, prio = 0; uint64_t c0 = 0, c1 = 0; };
+        std::unordered_map<uint32_t, sysrow> sr;
+        for (const auto & x : smp) {
+            for (const auto & t : x.sys) {
+                sysrow & r = sr[t.tid];
+                (t.state == 2 ? r.run : r.ready)++;
+                r.prio = t.prio;
+                if (r.c0 == 0) {
+                    r.c0 = t.cpu;
+                }
+                r.c1 = t.cpu;
+            }
+        }
+        std::vector<std::pair<uint32_t, sysrow>> v(sr.begin(), sr.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.run + a.second.ready > b.second.run + b.second.ready; });
+        std::string line;
+        for (size_t i = 0; i < v.size() && i < 10; ++i) {
+            char tmp[96];
+            snprintf(tmp, sizeof(tmp), "%s%u p%d R%d r%d %.0fms", line.empty() ? "" : ", ", v[i].first, v[i].second.prio,
+                    v[i].second.run, v[i].second.ready, (v[i].second.c1 - v[i].second.c0)/1e4);
+            line += tmp;
+        }
+        LLAMA_LOG_WARN("fn_stall: System threads running (R) / ready (r) in the most of %zu samples: %s\n", smp.size(), line.c_str());
+    }
     for (const auto & m : mk) {
         const std::string nm = st_name(s, std::get<1>(m));
         LLAMA_LOG_WARN("fn_stall: mark %+8.1f ms [%s %u] %s %lld %lld\n", (std::get<0>(m) - now)/1000.0,
@@ -523,7 +613,10 @@ int64_t llama_fn_stall_decode_begin(int n_tokens, int n_outputs) {
         llama_fn_thread_name("decode");
     }
     llama_fn_stall_mark("decode begin (tokens, mtp ctx)", n_tokens, n_outputs);
-    return st_now_us();
+    const int64_t t0 = st_now_us();
+    s->dec_n.store(n_tokens);
+    s->dec_t0.store(t0, std::memory_order_release);
+    return t0;
 }
 
 void llama_fn_stall_decode_end(int64_t t0_us, int n_tokens) {
@@ -532,6 +625,7 @@ void llama_fn_stall_decode_end(int64_t t0_us, int n_tokens) {
         return;
     }
     const int64_t now = st_now_us();
+    s->dec_t0.store(0, std::memory_order_release);
     llama_fn_stall_mark("decode end (tokens, us)", n_tokens, now - t0_us);
     if (n_tokens > 64 && s->prompt_ms > 0 && now - t0_us > (int64_t) s->prompt_ms*1000) {
         char why[96];

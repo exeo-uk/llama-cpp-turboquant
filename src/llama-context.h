@@ -455,6 +455,7 @@ private:
     bool     fa18_once = false; // LLAMA_FN_L18_FIRSTANS_ONCE: the prompt-end pass and the eager SMALL switch once per prompt
     bool     fa18_fit  = false; // LLAMA_FN_L18_FIRSTANS_FIT: the deferred hot set fit when the caller is ready, not in a prompt
     bool     fa18_ovl  = false; // LLAMA_FN_L18_FIRSTANS_OVERLAP: the prompt-end pass's copies overlap the host work after it
+    bool     fa18_warm = false; // LLAMA_FN_L18_FIRSTANS_WARM: only answer steps make the experts' warm pass wait
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a

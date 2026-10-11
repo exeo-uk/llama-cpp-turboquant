@@ -962,6 +962,11 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_params.pf_pull     = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFPULL", 0)); // [TAG_FN_L6_PF] 1 fine stop, 2 vector loads
     br->pool_params.pf_cap      = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFCAP", 0)); // [TAG_FN_L6_PF] experts per given list
     br->pool_params.pf_fresh    = std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L6_PFFRESH", 0)); // [TAG_FN_L6_PF] jobs
+    br->pool_params.pin_core    = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_PIN"); // [TAG_FN_L18_FIRSTANS_PIN] qwen4exp only
+    if (br->pool_params.pin_core) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L18_FIRSTANS_PIN] each pool thread may run on both logical CPUs of its core (ideal CPU as "
+                "before): a thread of a higher priority on its CPU no longer holds a job's barrier\n", __func__);
+    }
     br->hint_fused              = llama_fn_l3_flag(model, "LLAMA_FN_L9_HINTTOPK"); // [TAG_FN_L9_HINTTOPK] qwen4exp only
     if (br->pool_params.pf_fresh) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] the prefetch pulls only experts a CPU job read within the last %d jobs\n", __func__,
