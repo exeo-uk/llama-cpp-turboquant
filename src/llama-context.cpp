@@ -3692,7 +3692,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     step_join(); // [TAG_FN_L3_HOST_STEP] the last step's table changes are on the device before this graph
     if (fa18_ovl) {
-        llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] the last prompt-end pass's experts are in the tables
+        llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] the last prompt-end pass's experts are in the tables (2: once landed)
     }
 
     if (batch_inp.tokens.empty()) {
