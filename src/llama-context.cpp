@@ -3686,6 +3686,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_hp_scope hp_dec(hp_cls >= 0 ? llama_hp_dec_seg(hp_cls, LLAMA_HP_DEC_PREP) : LLAMA_HP_OTHER);
 
     step_join(); // [TAG_FN_L3_HOST_STEP] the last step's table changes are on the device before this graph
+    if (fa18_ovl) {
+        llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] the last prompt-end pass's experts are in the tables
+    }
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);

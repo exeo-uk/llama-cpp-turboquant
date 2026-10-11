@@ -112,6 +112,14 @@ struct hot_pool {
     int32_t              n_slots = 0;
 };
 
+// one slice of a synchronous refill (hot_refill)
+struct refill_job {
+    ggml_tensor * dst;
+    size_t        off;  // byte offset in dst
+    const void *  src;
+    size_t        size;
+};
+
 struct upload_job {
     size_t  layer_idx;
     int32_t expert;
@@ -325,6 +333,24 @@ struct moe_cache {
     size_t                fa18_st_n        = 0;
     size_t                fa18_st_bytes    = 0;
     int64_t               fa18_st_t0       = 0;
+    // [TAG_FN_L18_FIRSTANS_OVERLAP] LLAMA_FN_L18_FIRSTANS_OVERLAP=1: the prompt-end pass decides and evicts as before, then its
+    // copies run on a thread of their own while the caller goes on (the first token's sampling, the draft context's pass
+    // over the prompt, the context checkpoint); the owner's next call into the hot set - the next decode at the latest -
+    // joins it and publishes its experts, so every graph sees the tables it would see after the synchronous pass. The
+    // upload worker stays paused until then, and nothing else uses the refill's staging meanwhile (every user joins first).
+    bool                              fa18_ovl      = false;
+    std::thread                       fa18_th;
+    std::atomic<bool>                 fa18_busy{false};
+    std::vector<refill_job>           fa18_jobs;
+    std::vector<llama_moe_decay_swap> fa18_taken;
+    size_t                            fa18_bytes    = 0;
+    int64_t                           fa18_t0       = 0;
+    int64_t                           fa18_t_idle   = 0;
+    int64_t                           fa18_t_launch = 0;
+    int64_t                           fa18_t_done   = 0;
+    double                            fa18_wait_ms  = 0.0;
+    double                            fa18_hid_ms   = 0.0;
+    uint64_t                          fa18_n        = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -333,6 +359,7 @@ void hot_adapt_step(moe_cache * mc); // [TAG_FN_MOE_HOT_ADAPT]
 void hot_state_save(moe_cache * mc); // [TAG_FN_L3_POLICY_STATE]
 void hot_state_load(moe_cache * mc);
 std::string hot_state_cache_path(const std::string & model_path); // [TAG_FN_L18_FIRSTANS_STATE]
+void hot_turn_join(moe_cache * mc); // [TAG_FN_L18_FIRSTANS_OVERLAP]
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -1770,6 +1797,7 @@ void hot_adapt_step_impl(moe_cache * mc) {
 // [TAG_FN_L3_POLICY] LLAMA_MOE_HOT_STATS: the step's host time (it runs between two graphs, so it adds to the step)
 void hot_adapt_step(moe_cache * mc) {
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     if (!mc->ad_stats) {
         hot_adapt_step_impl(mc);
         return;
@@ -1980,6 +2008,7 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             }
         }
         mc->l17_nt          = llama_fn_l3_flag(model, "LLAMA_FN_L17_START_NT");
+        mc->fa18_ovl        = mc->l17_pre > 0 && llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_OVERLAP"); // [TAG_FN_L18_FIRSTANS_OVERLAP]
         if (const int bp = llama_fn_l3_int(model, "LLAMA_FN_L17_START_BURST", 0); bp > 0) {
             mc->l17_burst_start = true; // its value is the window (LLAMA_MOE_HOT_BURST_PASSES), opened once now
             mc->dc_burst_passes = bp;
@@ -3157,6 +3186,7 @@ void llama_moe_hot_save_now(const void * owner) {
     moe_cache * mc = g_cache;
     if (mc && mc->adapt && mc->owner == owner) {
         std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+        hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
         hot_adapt_save(mc);
     }
 }
@@ -3322,6 +3352,7 @@ size_t hot_sl_release(moe_cache * mc, const void * owner, size_t need) {
         return mc->kv_out;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
     std::vector<size_t> rel;
     size_t out = mc->kv_out;
@@ -3398,6 +3429,7 @@ size_t hot_sl_restore(moe_cache * mc, const void * owner, size_t keep) {
         return mc->kv_out;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
     size_t n_res = 0;
     size_t bytes = 0;
@@ -3470,13 +3502,6 @@ hot_lend_state g_lend;
 
 constexpr int    REFILL_THREADS = 8;
 constexpr size_t REFILL_HALF    = 128u << 20;
-
-struct refill_job {
-    ggml_tensor * dst;
-    size_t        off;  // byte offset in dst
-    const void *  src;
-    size_t        size;
-};
 
 // the resident experts of the lent layers whose bytes the stream may have overwritten: through the pinned halves when
 // the hot set has an upload stream, else one synchronous copy per slice. Returns the bytes uploaded.
@@ -3570,6 +3595,7 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t 
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     if (mc->lent_any) {
         *out_buf  = g_lend.buf;
         *out_base = g_lend.lo;
@@ -3657,6 +3683,7 @@ void llama_moe_hot_unlend(const void * owner) {
         return;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE]
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
         mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     }
@@ -3988,11 +4015,73 @@ void llama_moe_hot_state_save(const void * owner) {
     moe_cache * mc = g_cache;
     if (mc && mc->adapt && mc->owner == owner && !mc->st_path.empty()) {
         std::lock_guard<std::mutex> slk(mc->step_mtx);
+        hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
         hot_state_save(mc);
     }
 }
 
 // [TAG_FN_L17_START_PRE] -------------------------------------------------------------------------------------------------
+
+namespace {
+// [TAG_FN_L18_FIRSTANS_OVERLAP] the background copies of the last pass: wait for them, name the new experts in the tables,
+// let the worker go on. The caller holds step_mtx; a no-op when no pass is in flight.
+void hot_turn_join(moe_cache * mc) {
+    if (!mc->fa18_busy.load(std::memory_order_acquire)) {
+        return;
+    }
+    const int64_t tj = ggml_time_us();
+    if (mc->fa18_th.joinable()) {
+        mc->fa18_th.join();
+    }
+    const int64_t tw = ggml_time_us();
+    for (const auto & w : mc->fa18_taken) {
+        hot_adapt_set_entry(mc, mc->layers[w.layer], w.expert, w.slot);
+    }
+    if (mc->tbl_dirty) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        mc->paused = false;
+        hot_set_yield(mc);
+        mc->wcv.notify_all();
+    }
+    const double wait_ms = (tw - tj)/1000.0;
+    const double copy_ms = (mc->fa18_t_done - mc->fa18_t_launch)/1000.0;
+    const double hid_ms  = std::max(0.0, copy_ms - wait_ms);
+    const double ms      = (mc->fa18_t_launch - mc->fa18_t0)/1000.0 + wait_ms; // the time the callers waited for
+    mc->fa18_wait_ms += wait_ms;
+    mc->fa18_hid_ms  += hid_ms;
+    mc->fa18_n++;
+    mc->l17_n++;
+    mc->l17_swaps += mc->fa18_taken.size();
+    mc->l17_bytes += mc->fa18_bytes;
+    mc->l17_ms    += ms;
+    llama_fn_stall_mark("prompt-end pass joined (wait us, hidden us)", (int64_t) (wait_ms*1000), (int64_t) (hid_ms*1000)); // [TAG_FN_L18_FIRSTANS_STALL]
+    if (mc->l17_n <= 3 || mc->l17_n % 32 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L17_START_PRE] [TAG_FN_L18_FIRSTANS_OVERLAP] prompt end %" PRIu64 ": %zu experts (%.0f MiB) "
+                "swapped in from the prompt's routing; decision %.1f ms (worker idle after %.1f ms), copies %.1f ms (%.1f GiB/s) "
+                "behind the caller, %.1f ms of them waited for at the join; %.1f ms waited and %.1f ms hidden per pass so far\n",
+                mc->l17_n, mc->fa18_taken.size(), mc->fa18_bytes/1048576.0, (mc->fa18_t_launch - mc->fa18_t0)/1000.0,
+                (mc->fa18_t_idle - mc->fa18_t0)/1000.0, copy_ms, copy_ms > 0 ? mc->fa18_bytes/1073741824.0/(copy_ms/1000.0) : 0.0,
+                wait_ms, mc->fa18_wait_ms/mc->fa18_n, mc->fa18_hid_ms/mc->fa18_n);
+    }
+    mc->fa18_jobs.clear();
+    mc->fa18_taken.clear();
+    mc->fa18_bytes = 0;
+    mc->fa18_busy.store(false, std::memory_order_release);
+}
+} // namespace
+
+void llama_moe_hot_turn_finish(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || owner != mc->owner || !mc->fa18_busy.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc);
+}
 
 bool llama_moe_hot_turn_start_on() {
     const moe_cache * mc = g_cache;
@@ -4005,6 +4094,7 @@ bool llama_moe_hot_turn_pending() {
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     for (const auto & ls : mc->layers) {
         if (ls.dseed_any) {
             return true;
@@ -4019,6 +4109,7 @@ bool llama_moe_hot_turn_start(const void * owner) {
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP]
     bool seeded = false;
     for (const auto & ls : mc->layers) {
         seeded = seeded || ls.dseed_any;
@@ -4118,6 +4209,28 @@ bool llama_moe_hot_turn_start(const void * owner) {
         ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
         mc->tbl_dirty = false;
     }
+    if (mc->fa18_ovl && !jobs.empty()) {
+        // [TAG_FN_L18_FIRSTANS_OVERLAP] the same copies on a thread of their own; hot_turn_join names the experts
+        size_t b = 0;
+        for (const auto & j : jobs) {
+            b += j.size;
+        }
+        mc->fa18_jobs     = std::move(jobs);
+        mc->fa18_taken    = std::move(taken);
+        mc->fa18_bytes    = b;
+        mc->fa18_t0       = t0;
+        mc->fa18_t_idle   = t_idle;
+        mc->fa18_t_launch = ggml_time_us();
+        mc->fa18_t_done   = mc->fa18_t_launch;
+        mc->fa18_busy.store(true, std::memory_order_release);
+        llama_fn_stall_mark("prompt-end pass copies launched (jobs, MiB)", (int64_t) mc->fa18_jobs.size(), (int64_t) (b >> 20)); // [TAG_FN_L18_FIRSTANS_STALL]
+        mc->fa18_th = std::thread([mc]() {
+            llama_fn_thread_name("hot-pass"); // [TAG_FN_L18_FIRSTANS_STALL]
+            (void) hot_refill(mc, mc->fa18_jobs, mc->l17_threads);
+            mc->fa18_t_done = ggml_time_us();
+        });
+        return true;
+    }
     const size_t bytes = jobs.empty() ? 0 : hot_refill(mc, jobs, mc->l17_threads);
     for (const auto & w : taken) {
         hot_adapt_set_entry(mc, mc->layers[w.layer], w.expert, w.slot);
@@ -4167,6 +4280,7 @@ size_t llama_moe_hot_cbuf_release(const void * owner) {
         return 0;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
     for (auto & ls : mc->layers) {
         if (ls.cb_tail) {
@@ -4231,6 +4345,7 @@ size_t llama_moe_hot_kv_release(const void * owner, size_t need) {
         return mc->kv_out;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
     std::vector<layer_state *> rel;
     size_t out = mc->kv_out;
@@ -4284,6 +4399,7 @@ size_t llama_moe_hot_kv_restore(const void * owner, size_t keep) {
         return mc->kv_out;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
     size_t n_res = 0;
     size_t bytes = 0;
@@ -4404,6 +4520,7 @@ void llama_moe_hot_idle(const void * owner) {
         return;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     std::unique_lock<std::mutex> lk(mc->wmtx);
     mc->paused = true;
     hot_set_yield(mc);
@@ -4432,6 +4549,10 @@ void llama_moe_hot_stop(const void * owner) {
         return;
     }
     {
+        std::lock_guard<std::mutex> slk(mc->step_mtx);
+        hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP]
+    }
+    {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         mc->stop = true;
         hot_set_yield(mc);
@@ -4453,6 +4574,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         return false;
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
         mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     }

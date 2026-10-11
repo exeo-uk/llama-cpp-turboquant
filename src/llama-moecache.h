@@ -250,6 +250,9 @@ void llama_moe_hot_idle(const void * owner);
 bool llama_moe_hot_turn_start_on();
 // [TAG_FN_L18_FIRSTANS_ONCE] a prompt's routing is waiting for the pass (batches that ran without one)
 bool llama_moe_hot_turn_pending();
+// [TAG_FN_L18_FIRSTANS_OVERLAP] the owner, before its next graph: a pass whose copies run in the background lands and its
+// experts enter the tables (a no-op when none is in flight)
+void llama_moe_hot_turn_finish(const void * owner);
 bool llama_moe_hot_turn_start(const void * owner);
 
 // [TAG_FN_L4_EXIT] the owner goes away: the upload worker stops after its chunk in flight and is joined, the upload stream
