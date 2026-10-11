@@ -186,6 +186,14 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L16_SEQRM",          "1",     P_ALL }, // [TAG_FN_L16_SEQRM] seq_rm walks the sequence's own cells
     { "LLAMA_FN_L16_MTP_ASYNC",      "1",     P_ALL }, // [TAG_FN_L16_MTP_ASYNC] no tail synchronize in the MTP draft decode
     { "LLAMA_FN_L16_PLE_GATE",       "1",     P_ALL }, // [TAG_FN_L16_PLEGATE] bridged decode graphs wait for the PLE rows on the device (needs the bridge)
+    // [TAG_FN_L17_ADOPT] round 17 (l17/int, the owner's command with vision, per-answer t/s, OLD 2 rounds vs 3): the hot set
+    // is right at the start of an answer - short chats 75.2 -> 104.4, follow-ups 94.0 -> 106.2, ~20K answers 94.9 -> 106.6,
+    // 131K answers 90.8 -> 100.4; short prompts +0.1 s (the pass). Not adopted: LLAMA_MOE_HOT_STATE (+LLAMA_FN_L17_START_STATE):
+    // first answer 74 -> 96 t/s but its load runs in the first prompt (first token 6.2 -> 8.8 s on average)
+    { "LLAMA_FN_L17_START_PRE",      "2048",  P_ALL }, // [TAG_FN_L17_START_PRE]
+    { "LLAMA_FN_L17_START_NT",       "1",     P_ALL }, // [TAG_FN_L17_START_NT]
+    { "LLAMA_FN_L17_START_BURST",    "64",    P_ALL }, // [TAG_FN_L17_START_BURST]
+    { "LLAMA_FN_L17_VISION",         "1",     P_ALL }, // [TAG_FN_L17_VISION_LEND]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
