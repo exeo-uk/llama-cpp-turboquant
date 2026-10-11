@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-chat.h"
+#include "server-keepctx.h" // [TAG_FN_L18_KEEPCTX]
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -2065,6 +2066,10 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // [TAG_FN_L18_KEEPCTX] conversations a prompt with another prefix took the slot from (LLAMA_FN_L18_KEEPCTX=1)
+    std::unique_ptr<server_keepctx> keepctx;
+    int32_t keepctx_min = 512;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -2098,6 +2103,8 @@ private:
         }
         media_encoder.stop();
         media_async = false;
+
+        keepctx.reset(); // [TAG_FN_L18_KEEPCTX] its states belong to these contexts
 
         spec.reset();
         spec_init.reset();
@@ -2689,6 +2696,8 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
+
         pool_init(); // [TAG_POOL_PREEMPT]
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -3105,6 +3114,11 @@ private:
                 return ret;
             }
 
+            // [TAG_FN_L18_KEEPCTX]
+            if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
+                keepctx_switch(*ret, task.tokens);
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -3181,6 +3195,115 @@ private:
         }
 
         return ret;
+    }
+
+    // [TAG_FN_L18_KEEPCTX] LLAMA_FN_L18_KEEPCTX=1 (also from the model's automatic profile): before a prompt with another
+    // prefix replaces a slot's conversation, the conversation goes to a store on disk; a later prompt that continues a
+    // stored conversation further than the slot content gets it back (server-keepctx.h). Off beside the RAM prompt cache
+    // (--cache-ram), which keeps conversations itself.
+    //   LLAMA_FN_L18_KEEPCTX_DIR       folder of the store files (default: <temp>/llama-keepctx)
+    //   LLAMA_FN_L18_KEEPCTX_DISK_MIB  disk budget of all stored conversations (default 32768)
+    //   LLAMA_FN_L18_KEEPCTX_N         conversations kept (default 4)
+    //   LLAMA_FN_L18_KEEPCTX_MIN       tokens a conversation must lose to be stored, and gain to be restored (default 512)
+    //   LLAMA_FN_L18_KEEPCTX_VERIFY=1  tests: after a restore, compare the restored states with the stored bytes (logged)
+    void keepctx_init() {
+        keepctx.reset();
+        const char * on = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX");
+        if (!on || atoi(on) == 0) {
+            return;
+        }
+        if (prompt_cache) {
+            SRV_WRN("%s", "[TAG_FN_L18_KEEPCTX] off: the RAM prompt cache (--cache-ram) keeps the conversations\n");
+            return;
+        }
+        auto env_ll = [&](const char * name, long long def) {
+            const char * e = llama_model_fn_env(model_tgt, name);
+            return e && *e ? strtoll(e, nullptr, 10) : def;
+        };
+        server_keepctx_params kp;
+        if (const char * d = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX_DIR"); d && *d) {
+            kp.dir = d;
+        } else {
+            std::error_code ec;
+            const auto tmp = std::filesystem::temp_directory_path(ec);
+            kp.dir = ((ec ? std::filesystem::path(".") : tmp) / "llama-keepctx").string();
+        }
+        kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
+        kp.n_max    = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_N", 4));
+        kp.verify   = env_ll("LLAMA_FN_L18_KEEPCTX_VERIFY", 0) != 0;
+        keepctx_min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_MIN", 512));
+        auto kc = std::make_unique<server_keepctx>(kp);
+        if (!kc->ok()) {
+            SRV_WRN("%s", "[TAG_FN_L18_KEEPCTX] off: no store folder\n");
+            return;
+        }
+        keepctx = std::move(kc);
+        SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
+                "from %d tokens)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min);
+    }
+
+    // [TAG_FN_L18_KEEPCTX] the tokens of p that a prompt sharing lcp tokens with it can keep: all of a continuation; for a
+    // memory that cannot go back (recurrent, SWA) only up to the newest checkpoint within the shared part
+    int keepctx_usable(const server_prompt & p, int lcp) const {
+        const int n = p.n_tokens();
+        if (lcp >= n) {
+            return n;
+        }
+        const bool fixed = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                           ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0;
+        if (!fixed) {
+            return lcp;
+        }
+        int64_t best = 0;
+        for (const auto & c : p.checkpoints) {
+            if (c.n_tokens <= lcp) {
+                best = std::max(best, c.n_tokens);
+            }
+        }
+        return (int) best;
+    }
+
+    // [TAG_FN_L18_KEEPCTX] slot is idle and about to take a prompt of tokens
+    void keepctx_switch(server_slot & slot, const server_tokens & tokens) {
+        const int n_cur   = slot.prompt.n_tokens();
+        const int lcp_cur = n_cur > 0 ? (int) slot.prompt.tokens.get_common_prefix(tokens) : 0;
+        const int use_cur = n_cur > 0 ? keepctx_usable(slot.prompt, lcp_cur) : 0;
+
+        // the stored conversation this prompt continues furthest (the newest of equals)
+        auto it_best  = keepctx->entries.end();
+        int  use_best = 0;
+        for (auto it = keepctx->entries.begin(); it != keepctx->entries.end(); ++it) {
+            const int use = keepctx_usable(it->prompt, (int) it->prompt.tokens.get_common_prefix(tokens));
+            if (use > 0 && use >= use_best) {
+                use_best = use;
+                it_best  = it;
+            }
+        }
+        const bool restore = it_best != keepctx->entries.end() && use_best >= use_cur + keepctx_min;
+
+        // the slot loses most of its content and at least keepctx_min tokens
+        if (n_cur - lcp_cur >= keepctx_min && 2*lcp_cur < n_cur) {
+            std::string info;
+            if (keepctx->save(slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, restore ? &*it_best : nullptr, info)) {
+                SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] stored the outgoing conversation (the new prompt shares %d of its %d tokens): %s\n",
+                        lcp_cur, n_cur, info.c_str());
+            } else {
+                SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] the outgoing conversation (%d tokens) is not stored: %s\n", n_cur, info.c_str());
+            }
+        }
+
+        if (restore) {
+            const int   n_entry = it_best->prompt.n_tokens();
+            std::string info;
+            if (keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, info)) {
+                SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] restored a stored conversation: %d of the prompt's %zu tokens reused instead of %d: %s\n",
+                        use_best, tokens.size(), use_cur, info.c_str());
+            } else {
+                SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] restoring a stored conversation of %d tokens failed (%s), the prompt is processed in full\n",
+                        n_entry, info.c_str());
+                slot.prompt_clear();
+            }
+        }
     }
 
     // return true if at least one slot has been cleared
