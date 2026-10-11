@@ -184,6 +184,11 @@ LLAMA_API bool llama_moe_bridge_last_ext(const struct llama_context * ctx, int32
 // flight end before this returns, and the hot set's upload queue waits for the context's next graph. Outputs never change.
 LLAMA_API void llama_quiesce_ext(struct llama_context * ctx);
 
+// [TAG_FN_L18_FIRSTANS_FIT] The caller has loaded the model and every context of it (a server about to listen) and no
+// request has come yet: qwen4exp with LLAMA_FN_L18_FIRSTANS_FIT sizes its deferred VRAM hot set now instead of in the first
+// prompt. A no-op otherwise. Outputs never change.
+LLAMA_API void llama_fn_ready_ext(struct llama_context * ctx);
+
 // [TAG_FN_L3_MTP_HEADPROMPT] qwen4exp with a MTP draft vocabulary and LLAMA_MTP_HEAD_PROMPT=<cap>: the drafts also score
 // these prompt tokens where the vocabulary leaves them out (the first cap such ids in the given order replace the last
 // set). Returns how many were taken, -1 when the model has no such list. Only drafts change; verify uses the full head.

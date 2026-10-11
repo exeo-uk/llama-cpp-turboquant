@@ -248,6 +248,8 @@ void llama_moe_hot_idle(const void * owner);
 // counts fade (x LLAMA_FN_L17_START_TD), the prompt's routing comes in as LLAMA_FN_L17_START_SN decode steps of its mix,
 // and one pass of the decay rules swaps up to <MiB> of experts, landed before it returns. Returns true if it ran a pass.
 bool llama_moe_hot_turn_start_on();
+// [TAG_FN_L18_FIRSTANS_ONCE] a prompt's routing is waiting for the pass (batches that ran without one)
+bool llama_moe_hot_turn_pending();
 bool llama_moe_hot_turn_start(const void * owner);
 
 // [TAG_FN_L4_EXIT] the owner goes away: the upload worker stops after its chunk in flight and is joined, the upload stream

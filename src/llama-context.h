@@ -63,6 +63,10 @@ struct llama_context {
     // upload batch in flight end before this returns, and the hot set's queue waits for the next graph
     void quiesce();
 
+    // [TAG_FN_L18_FIRSTANS_FIT] the caller's model and contexts are loaded and no request has come yet (a server that is
+    // about to listen): with LLAMA_FN_L18_FIRSTANS_FIT the deferred hot set is sized now instead of in the first prompt
+    void fn_ready();
+
     void set_layer_inp_extract(bool enable);
 
     const llama_model   & get_model()   const;
@@ -447,6 +451,10 @@ private:
     // context is created after this one), then takes what the model, KV, compute buffers and draft context left
     bool     moe_hot_pending = false;
     uint32_t moe_hot_waits   = 0;
+    // [TAG_FN_L18_FIRSTANS_*] qwen4exp switches of the first answer after a start, read when the context starts
+    bool     fa18_once = false; // LLAMA_FN_L18_FIRSTANS_ONCE: the prompt-end pass and the eager SMALL switch once per prompt
+    bool     fa18_fit  = false; // LLAMA_FN_L18_FIRSTANS_FIT: the deferred hot set fit when the caller is ready, not in a prompt
+    bool     fa18_ovl  = false; // LLAMA_FN_L18_FIRSTANS_OVERLAP: the prompt-end pass's copies overlap the host work after it
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a

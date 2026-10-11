@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -118,6 +119,7 @@ struct upload_job {
     bool    done = false;
     bool    failed = false; // [TAG_FN_L3_POLICY_UPLOAD] not uploaded (a slice out of range): the slot comes back empty
     bool    cb   = false; // [TAG_FN_L3_VRAM_CBUF] a refill job of the tail's restore
+    bool    st   = false; // [TAG_FN_L18_FIRSTANS_STATE] a saved resident of the background state load
 };
 
 struct moe_cache {
@@ -315,6 +317,14 @@ struct moe_cache {
     int64_t               l17_st_every_us = 0;
     int64_t               l17_st_last_us  = 0;
     uint64_t              l17_st_steps    = 0;
+    // [TAG_FN_L18_FIRSTANS_STATE] LLAMA_FN_L18_FIRSTANS_STATE=1: the saved residents go into the upload worker's queue at the
+    // set's start (their pages read ahead first) instead of one synchronous refill; each lands and is published at an owner
+    // step like any admission. The counts of what is still in flight (owner's step / wmtx)
+    bool                  fa18_state       = false;
+    size_t                fa18_st_left     = 0;
+    size_t                fa18_st_n        = 0;
+    size_t                fa18_st_bytes    = 0;
+    int64_t               fa18_st_t0       = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -322,6 +332,7 @@ moe_cache * g_cache = nullptr;
 void hot_adapt_step(moe_cache * mc); // [TAG_FN_MOE_HOT_ADAPT]
 void hot_state_save(moe_cache * mc); // [TAG_FN_L3_POLICY_STATE]
 void hot_state_load(moe_cache * mc);
+std::string hot_state_cache_path(const std::string & model_path); // [TAG_FN_L18_FIRSTANS_STATE]
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -1576,6 +1587,12 @@ void hot_adapt_publish(moe_cache * mc) {
     std::lock_guard<std::mutex> lk(mc->wmtx);
     for (const auto & j : mc->done) {
         layer_state & ls = mc->layers[j.layer_idx];
+        if (j.st && mc->fa18_st_left > 0 && --mc->fa18_st_left == 0) { // [TAG_FN_L18_FIRSTANS_STATE]
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_FIRSTANS_STATE] the saved state's %zu residents (%.2f GiB) are in, the last "
+                    "published %.0f ms after its start\n", mc->fa18_st_n, mc->fa18_st_bytes/1073741824.0,
+                    (ggml_time_us() - mc->fa18_st_t0)/1000.0);
+            llama_fn_stall_mark("saved state: all residents published");
+        }
         // [TAG_FN_L10_SLOTLEND] an upload into a slot that went out meanwhile: as failed (the slot stays empty)
         if (j.failed || (!ls.slot_out.empty() && ls.slot_out[j.slot])) { // [TAG_FN_L3_POLICY_UPLOAD] nothing was copied: the slot is free again, the expert stays cold
             ls.slot_in_flight[j.slot]     = false;
@@ -1933,6 +1950,9 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0) {
             const std::string mpath = model.fn_auto ? model.fn_auto->model_path : std::string();
             mc->st_path = strcmp(e, "auto") == 0 ? (mpath.empty() ? std::string() : mpath + ".hotstate") : std::string(e);
+            if (strcmp(e, "cache") == 0) { // [TAG_FN_L18_FIRSTANS_STATE] the user's cache folder, one file per model file
+                mc->st_path = mpath.empty() ? std::string() : hot_state_cache_path(mpath);
+            }
             if (mc->st_path.empty()) {
                 LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE=auto needs the model path (the qwen4exp "
                         "profile keeps it) - no saved state; give a file name\n");
@@ -1944,6 +1964,7 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             if (const char * v = llama_fn_env(model, "LLAMA_MOE_HOT_STATE_LOAD")) {
                 mc->st_load = atoi(v) != 0;
             }
+            mc->fa18_state = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_STATE"); // [TAG_FN_L18_FIRSTANS_STATE]
         }
     }
     // [TAG_FN_L17_START_*] the answer-start levers of round 17 (qwen4exp only; every one off by default)
@@ -3240,6 +3261,9 @@ void hot_drain_out(moe_cache * mc) {
             if (ls.out() || sl_o) {
                 ls.slot_in_flight[it->slot]     = false;
                 ls.expert_in_flight[it->expert] = false;
+                if (it->st && mc->fa18_st_left > 0) { // [TAG_FN_L18_FIRSTANS_STATE] dropped here: a tail slot keeps it (below)
+                    mc->fa18_st_left--;
+                }
                 // [TAG_FN_L3_VRAM_CBUF] a tail slot keeps the expert it was getting: the next restore uploads it with the
                 // others, so prompts in quick succession do not empty the tail (a lent layer's slot comes back empty)
                 if ((ls.cb_lent || ls.kv_lent) && !sl_o) {
@@ -3708,6 +3732,42 @@ size_t hot_layer_bytes(const layer_state & ls) {
     return ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
 }
 
+// [TAG_FN_L18_FIRSTANS_STATE] LLAMA_MOE_HOT_STATE=cache: <LLAMA_CACHE, else %LOCALAPPDATA%\llama.cpp (Windows) or
+// $XDG_CACHE_HOME/llama.cpp or ~/.cache/llama.cpp>/hotstate/<model file name>.hotstate - one file per model file, nothing
+// written next to the model; the folder is made when missing ("" when there is no such folder)
+std::string hot_state_cache_path(const std::string & model_path) {
+    namespace fs = std::filesystem;
+    fs::path dir;
+    if (const char * c = getenv("LLAMA_CACHE"); c && c[0]) {
+        dir = fs::u8path(c);
+    } else {
+#ifdef _WIN32
+        const char * la = getenv("LOCALAPPDATA");
+        if (la && la[0]) {
+            dir = fs::u8path(la) / "llama.cpp";
+        }
+#else
+        if (const char * x = getenv("XDG_CACHE_HOME"); x && x[0]) {
+            dir = fs::u8path(x) / "llama.cpp";
+        } else if (const char * h = getenv("HOME"); h && h[0]) {
+            dir = fs::u8path(h) / ".cache" / "llama.cpp";
+        }
+#endif
+    }
+    if (dir.empty()) {
+        return std::string();
+    }
+    dir /= "hotstate";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L18_FIRSTANS_STATE] cannot make %s (%s) - no saved state\n", dir.u8string().c_str(),
+                ec.message().c_str());
+        return std::string();
+    }
+    return (dir / (fs::u8path(model_path).filename().u8string() + ".hotstate")).u8string();
+}
+
 // the file format is llama_moe_hotstate_format / _parse (llama-moe-decay.h, tests/test-moe-decay.cpp)
 void hot_state_save(moe_cache * mc) {
     if (mc->st_path.empty() || mc->layers.empty() || !mc->dc_on) {
@@ -3777,6 +3837,9 @@ void hot_state_load(moe_cache * mc) {
         return;
     }
     std::vector<refill_job> jobs;
+    // [TAG_FN_L18_FIRSTANS_STATE] in the background: upload jobs (marked in flight) instead of refill jobs, best count first
+    const bool async = mc->fa18_state && mc->worker.joinable();
+    std::vector<std::pair<float, upload_job>> ups;
     size_t n_layers = 0;
     size_t n_res    = 0;
     size_t n_skip   = n_bad;
@@ -3790,6 +3853,17 @@ void hot_state_load(moe_cache * mc) {
             if (!hot_slice_ok(dsts[k], srcs[k], e, s)) {
                 return false;
             }
+        }
+        if (async) { // [TAG_FN_L18_FIRSTANS_STATE] the slot and the expert are in flight until the worker's copy is published
+            upload_job u;
+            u.layer_idx = (size_t) (&ls - mc->layers.data());
+            u.expert    = e;
+            u.slot      = s;
+            u.st        = true;
+            ups.push_back({ e < (int32_t) ls.dcnt.size() ? ls.dcnt[e] : 0.0f, u });
+            ls.slot_in_flight[s]   = true;
+            ls.expert_in_flight[e] = true;
+            return true;
         }
         for (int k = 0; k < 3; ++k) {
             const size_t sz = srcs[k]->nb[2];
@@ -3856,6 +3930,40 @@ void hot_state_load(moe_cache * mc) {
             s++;
         }
     }
+    if (async) {
+        // [TAG_FN_L18_FIRSTANS_STATE] best count first over all layers (the first request may come before the last lands);
+        // the sources' pages are read ahead in the background, then the worker copies them in 64 MiB batches
+        std::stable_sort(ups.begin(), ups.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        std::vector<std::pair<const void *, size_t>> ranges;
+        size_t bytes = 0;
+        for (const auto & u : ups) {
+            const layer_state & ls = mc->layers[u.second.layer_idx];
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            for (int k = 0; k < 3; ++k) {
+                const size_t sz = srcs[k]->nb[2];
+                ranges.push_back({ (const char *) srcs[k]->data + (size_t) u.second.expert*sz, sz });
+                bytes += sz;
+            }
+        }
+        llama_fn_prefetch_ranges(ranges);
+        {
+            std::lock_guard<std::mutex> lk(mc->wmtx);
+            for (const auto & u : ups) {
+                mc->todo.push_back(u.second);
+            }
+            mc->fa18_st_left  += ups.size();
+            mc->fa18_st_n      = ups.size();
+            mc->fa18_st_bytes  = bytes;
+            mc->fa18_st_t0     = t0;
+            mc->wcv.notify_all();
+        }
+        llama_fn_stall_mark("saved state queued (residents, MiB)", (int64_t) ups.size(), (int64_t) (bytes >> 20)); // [TAG_FN_L18_FIRSTANS_STALL]
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_FIRSTANS_STATE] %s: %zu residents in %zu layers (%.2f GiB) queued for the upload "
+                "worker in %.0f ms (pages read ahead), the counts of %llu decode steps%s\n", mc->st_path.c_str(), n_res,
+                n_layers, bytes/1073741824.0, (ggml_time_us() - t0)/1000.0, (unsigned long long) steps,
+                n_skip ? format(", %zu layer lines not used", n_skip).c_str() : "");
+        return;
+    }
     const size_t bytes = hot_refill(mc, jobs);
     for (auto & ls : mc->layers) {
         for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
@@ -3889,6 +3997,20 @@ void llama_moe_hot_state_save(const void * owner) {
 bool llama_moe_hot_turn_start_on() {
     const moe_cache * mc = g_cache;
     return mc && mc->adapt && mc->dc_on && mc->l17_pre > 0;
+}
+
+bool llama_moe_hot_turn_pending() {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || !mc->dc_on || mc->l17_pre == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    for (const auto & ls : mc->layers) {
+        if (ls.dseed_any) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_moe_hot_turn_start(const void * owner) {
