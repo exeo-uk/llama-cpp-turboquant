@@ -300,8 +300,8 @@ struct moe_cache {
     double                l17_ms      = 0.0;
     // [TAG_FN_L17_START_NT] LLAMA_FN_L17_START_NT=1: the staging copies of uploads and refills with non-temporal stores
     bool                  l17_nt      = false;
-    // [TAG_FN_L17_START_BURST] LLAMA_FN_L17_START_BURST=1: the burst window opens at the set's start only (a CBUF restore or
-    // the stream's unlend does not open it again)
+    // [TAG_FN_L17_START_BURST] LLAMA_FN_L17_START_BURST=<passes>: the burst budget for that many passes after the set's start
+    // only (a CBUF restore or the stream's unlend does not open the window again)
     bool                  l17_burst_start = false;
     // [TAG_FN_L17_START_STATE] LLAMA_FN_L17_START_STATE=<s>: the learned set (LLAMA_MOE_HOT_STATE) saved when the owner goes
     // idle, at most every <s> seconds and after >= 64 new decode steps, so a hard stop keeps a recent one
@@ -1949,7 +1949,11 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             }
         }
         mc->l17_nt          = llama_fn_l3_flag(model, "LLAMA_FN_L17_START_NT");
-        mc->l17_burst_start = llama_fn_l3_flag(model, "LLAMA_FN_L17_START_BURST");
+        if (const int bp = llama_fn_l3_int(model, "LLAMA_FN_L17_START_BURST", 0); bp > 0) {
+            mc->l17_burst_start = true; // its value is the window (LLAMA_MOE_HOT_BURST_PASSES), opened once now
+            mc->dc_burst_passes = bp;
+            mc->dc_burst_left   = bp;
+        }
         if (!mc->st_path.empty()) {
             mc->l17_st_every_us = (int64_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L17_START_STATE", 0))*1000000;
         }
