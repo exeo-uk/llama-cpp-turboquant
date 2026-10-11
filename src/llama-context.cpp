@@ -6039,7 +6039,18 @@ void llama_context::moe_hot_fit_try() {
     // set gives it back for each encode); with no lend to carry it, the budget leaves it free (the projector's own VRAM)
     const size_t vis      = vis_lend_parked_bytes(model);
     const size_t vis_want = cbuf_tail > 0 ? vis : 0;
-    auto vis_cut = [vis](size_t b) { return b > vis ? b - vis : 0; };
+    // the cut keeps the projector's bytes free of the VRAM the budget may use; a budget held lower by
+    // LLAMA_FN_HOT_BUDGET_MAX_MIB keeps them free already, so it stays (the static identity check then gets the same set)
+    auto vis_cut = [&](size_t b) {
+        if (vis == 0) {
+            return b;
+        }
+        size_t f = llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin);
+        if (cbuf_tail > 0 && f > 0) {
+            f = llama_fn_cbuf_budget(f, cbuf_pool_mib << 20, mem_free, SIZE_MAX);
+        }
+        return std::min(b, f > vis ? f - vis : 0);
+    };
     if (vis_want == 0) {
         budget = vis_cut(budget);
     }
