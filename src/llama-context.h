@@ -461,6 +461,9 @@ private:
     bool     fa18_fit  = false; // LLAMA_FN_L18_FIRSTANS_FIT: the deferred hot set fit when the caller is ready, not in a prompt
     bool     fa18_ovl  = false; // LLAMA_FN_L18_FIRSTANS_OVERLAP: the prompt-end pass's copies overlap the host work after it
     bool     fa18_warm = false; // LLAMA_FN_L18_FIRSTANS_WARM: only answer steps make the experts' warm pass wait
+    // [TAG_FN_L19_TTFT_HUSH] LLAMA_FN_L19_TTFT_HUSH: bit 1 = the warm pass and the saved state's read-ahead pause while a FULL
+    // compute reserve is made, bit 2 = while a prompt batch (wider than an answer step) runs; 0 = off
+    int      l19_hush  = 0;
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a

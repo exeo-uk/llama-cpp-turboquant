@@ -61,5 +61,25 @@ void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>>
 // they are in the working set when this returns
 void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges, int n_threads, const std::atomic<bool> * abort = nullptr);
 
+// [TAG_FN_L19_TTFT_HUSH] a scope begins / ends that wants the warm pass and the saved state's read-ahead to pause (they wait
+// while one runs, unless a prompt's stream waits for the warm pass); llama_fn_hushed: one runs now
+void llama_fn_hush(bool begin);
+bool llama_fn_hushed();
+struct llama_fn_hush_scope {
+    bool on;
+    explicit llama_fn_hush_scope(bool on) : on(on) {
+        if (on) {
+            llama_fn_hush(true);
+        }
+    }
+    ~llama_fn_hush_scope() {
+        if (on) {
+            llama_fn_hush(false);
+        }
+    }
+    llama_fn_hush_scope(const llama_fn_hush_scope &) = delete;
+    llama_fn_hush_scope & operator=(const llama_fn_hush_scope &) = delete;
+};
+
 // [TAG_FN_L16_PLEGATE] the calling thread at THREAD_PRIORITY_HIGHEST (the MoE pool's level with --prio 2); a no-op elsewhere
 void llama_fn_thread_priority_highest();
