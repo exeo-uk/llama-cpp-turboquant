@@ -11,6 +11,7 @@
 #include "../src/llama-fn-auto.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -350,6 +351,68 @@ static void test_even_slots() {
     TCHECK(llama_fn_even_slots({}, b, 512) == 0, "no layers");
 }
 
+// [TAG_FN_L18_CHURN_LAYERS] slots per layer by weight, at Flash-Next UD-Q4_K_XL sizes and the owner's budget
+static void test_weighted_slots() {
+    const std::vector<size_t> bytes = flash_next_expert_bytes();
+    size_t row = 0;
+    size_t big = 0;
+    for (size_t x : bytes) {
+        row += x;
+        big  = std::max(big, x);
+    }
+    const size_t b = 120*row + row/3; // 119 even slots per layer and a part row
+    const int32_t n_even = llama_fn_even_slots(bytes, b, 512);
+    TCHECK(n_even == 119, "even count at the test budget %d", n_even);
+    auto used_of = [&](const std::vector<int32_t> & n) {
+        size_t u = 0;
+        for (size_t i = 0; i < n.size(); ++i) {
+            u += ((size_t) n[i] + 1)*bytes[i];
+        }
+        return u;
+    };
+    // equal weights: the even count in every layer, then the rest of the budget slot by slot
+    const std::vector<int32_t> eq = llama_fn_weighted_slots(bytes, b, 512, std::vector<float>(48, 1.0f));
+    bool ge = eq.size() == 48;
+    for (int32_t x : eq) {
+        ge = ge && (x == n_even || x == n_even + 1);
+    }
+    TCHECK(ge, "equal weights: the even count, some layers one more");
+    TCHECK(used_of(eq) <= b && b - used_of(eq) < big, "equal weights fill the budget (%zu of %zu)", used_of(eq), b);
+    // the l18 table shape: layer 0 heavy, layer 15 light
+    std::vector<float> w(48, 1.0f);
+    w[0] = 1.387f; w[15] = 0.723f; w[38] = 1.303f; w[39] = 0.714f;
+    const std::vector<int32_t> ws = llama_fn_weighted_slots(bytes, b, 512, w);
+    TCHECK(used_of(ws) <= b && b - used_of(ws) < big, "weighted slots fill the budget (%zu of %zu)", used_of(ws), b);
+    TCHECK(ws[0] > ws[1] && ws[1] > ws[15], "more slots for a heavier layer: %d %d %d", ws[0], ws[1], ws[15]);
+    TCHECK(std::abs(ws[0] - (int32_t) std::lround(1.387*ws[1])) <= 2, "in proportion: %d vs 1.387 x %d", ws[0], ws[1]);
+    TCHECK(ws[38] > ws[39], "a q5_1 layer by weight: %d %d", ws[38], ws[39]);
+    // the cap: a weight that would ask for more than every expert stops at n_expert, the rest goes to the others
+    std::vector<float> wc(48, 1.0f);
+    wc[3] = 40.0f;
+    const std::vector<int32_t> wcs = llama_fn_weighted_slots(bytes, b, 512, wc);
+    TCHECK(wcs[3] == 512, "capped at every expert: %d", wcs[3]);
+    TCHECK(used_of(wcs) <= b && b - used_of(wcs) < big, "the cap's rest stays in the budget");
+    // bad weights: the even count
+    std::vector<float> bad = w;
+    bad[7] = 0.0f;
+    const std::vector<int32_t> be = llama_fn_weighted_slots(bytes, b, 512, bad);
+    bool all_even = be.size() == 48;
+    for (int32_t x : be) {
+        all_even = all_even && x == n_even;
+    }
+    TCHECK(all_even, "a zero weight: even slots");
+    const std::vector<int32_t> bn = llama_fn_weighted_slots(bytes, b, 512, std::vector<float>(47, 1.0f));
+    TCHECK(bn.size() == 48 && bn[0] == n_even && bn[47] == n_even, "a weight count unlike the layers: even slots");
+    TCHECK(llama_fn_weighted_slots(bytes, row/2, 512, w) == std::vector<int32_t>(48, 0), "no room for the zero slots: 0");
+    TCHECK(llama_fn_weighted_slots({}, b, 512, {}).empty(), "no layers");
+    // the parser
+    TCHECK((llama_fn_parse_weights("1.5,0.75, 2") == std::vector<float>{ 1.5f, 0.75f, 2.0f }), "three weights");
+    TCHECK(llama_fn_parse_weights("1,0,2").empty(), "a zero weight is refused");
+    TCHECK(llama_fn_parse_weights("1,x").empty(), "not a number");
+    TCHECK(llama_fn_parse_weights("1,,2").empty(), "an empty item");
+    TCHECK(llama_fn_parse_weights("").empty() && llama_fn_parse_weights(nullptr).empty(), "nothing");
+}
+
 // [TAG_FN_L3_VRAM_CBUF] the compute-buffer lend at the r2/ab3 numbers (file A, -c 262144, -ub 8192): FULL reserve
 // 3725.44 MiB, a SMALL one of about 250 MiB, the 10312 MiB hot-set budget of today's fit, the stream's 2 x 1950 MiB banks
 static void test_cbuf() {
@@ -504,6 +567,7 @@ int main() {
     test_lookup();
     test_inject();
     test_even_slots();
+    test_weighted_slots();
     test_vram_fit();
     test_cbuf();
     test_ram_fit();

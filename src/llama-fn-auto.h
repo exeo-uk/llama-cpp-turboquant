@@ -99,6 +99,14 @@ LLAMA_API void llama_fn_state_undo  (llama_fn_auto_state & st);
 // budget / sum of the layers' bytes per expert - 1, at most n_expert
 LLAMA_API int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t budget, int32_t n_expert);
 
+// [TAG_FN_L18_CHURN_LAYERS] slots per layer in proportion to the weights (one per layer, > 0): n_l ~ lam * w_l, at most
+// n_expert, with every layer's zero slot inside the budget and the rest given out one slot at a time; wrong weights (count,
+// value) give the even count everywhere
+LLAMA_API std::vector<int32_t> llama_fn_weighted_slots(const std::vector<size_t> & bytes_per_expert, size_t budget, int32_t n_expert,
+        const std::vector<float> & weights);
+// "w0,w1,..." -> the weights; empty on any bad item (not a number, <= 0)
+LLAMA_API std::vector<float> llama_fn_parse_weights(const char * s);
+
 // [TAG_FN_VRAM_FIT] default device-use ceiling: total - max(1536 MiB, total/8), rounded down to 256 MiB;
 // 28416 MiB on a 32607 MiB card (the 5090 limit is 28500 MiB)
 LLAMA_API size_t llama_fn_vram_ceiling_default(size_t total);

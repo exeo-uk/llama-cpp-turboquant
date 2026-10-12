@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -531,6 +532,97 @@ int32_t llama_fn_even_slots(const std::vector<size_t> & bytes_per_expert, size_t
     }
     const size_t rows = budget / sum; // slot rows incl. the zero slot of every layer
     return rows > 1 ? (int32_t) std::min<size_t>((size_t) n_expert, rows - 1) : 0;
+}
+
+// [TAG_FN_L18_CHURN_LAYERS] -----------------------------------------------------------------------------------------
+
+std::vector<int32_t> llama_fn_weighted_slots(const std::vector<size_t> & bytes_per_expert, size_t budget, int32_t n_expert,
+        const std::vector<float> & weights) {
+    const size_t n = bytes_per_expert.size();
+    bool ok = weights.size() == n && n > 0 && n_expert > 0;
+    for (size_t i = 0; ok && i < n; ++i) {
+        ok = std::isfinite(weights[i]) && weights[i] > 0.0f && bytes_per_expert[i] > 0;
+    }
+    if (!ok) {
+        return std::vector<int32_t>(n, llama_fn_even_slots(bytes_per_expert, budget, n_expert));
+    }
+    // n_l(lam) = min(n_expert, floor(lam * w_l)): the largest lam whose slots plus every layer's zero slot fit the budget
+    auto counts = [&](double lam, std::vector<int32_t> & out) {
+        size_t used = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double x = std::floor(lam * (double) weights[i]);
+            out[i] = (int32_t) std::min<double>((double) n_expert, std::max(0.0, x));
+            used += ((size_t) out[i] + 1)*bytes_per_expert[i];
+        }
+        return used;
+    };
+    std::vector<int32_t> res(n, 0);
+    std::vector<int32_t> tmp(n, 0);
+    float w_min = weights[0];
+    for (float w : weights) {
+        w_min = std::min(w_min, w);
+    }
+    double lo = 0.0;
+    double hi = (double) n_expert / (double) w_min + 1.0;
+    if (counts(0.0, res) > budget) {
+        return std::vector<int32_t>(n, 0);
+    }
+    for (int it = 0; it < 64; ++it) {
+        const double mid = 0.5*(lo + hi);
+        if (counts(mid, tmp) <= budget) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    size_t used = counts(lo, res);
+    // the rest of the budget, one slot at a time, to the layers furthest below their share (ties: layer order)
+    for (;;) {
+        size_t best = n;
+        double best_def = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (res[i] >= n_expert || used + bytes_per_expert[i] > budget) {
+                continue;
+            }
+            const double def = lo * (double) weights[i] - (double) res[i];
+            if (best == n || def > best_def) {
+                best = i;
+                best_def = def;
+            }
+        }
+        if (best == n) {
+            break;
+        }
+        res[best]++;
+        used += bytes_per_expert[best];
+    }
+    return res;
+}
+
+std::vector<float> llama_fn_parse_weights(const char * s) {
+    std::vector<float> out;
+    if (s == nullptr) {
+        return out;
+    }
+    const char * p = s;
+    while (*p) {
+        char * end = nullptr;
+        const float v = strtof(p, &end);
+        if (end == p || !std::isfinite(v) || v <= 0.0f) {
+            return {};
+        }
+        out.push_back(v);
+        p = end;
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (*p == ',') {
+            ++p;
+        } else if (*p != '\0') {
+            return {};
+        }
+    }
+    return out;
 }
 
 // [TAG_FN_VRAM_FIT] -----------------------------------------------------------------------------------------------
