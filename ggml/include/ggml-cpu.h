@@ -213,6 +213,8 @@ extern "C" {
                                              // a mispredicted expert from disk)
         int  pf_cap;                         // [TAG_FN_L6_PF] 0, or a given list is cut to its first pf_cap experts (less
                                              // DRAM traffic beside the device's host accesses at the end of the window)
+        bool pin_core;                       // [TAG_FN_L18_FIRSTANS_PIN] a worker may run on every logical CPU of its CPU's
+                                             // core (ideal CPU: its own), not only on that one CPU
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.

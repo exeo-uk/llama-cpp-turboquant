@@ -12,7 +12,9 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -206,6 +208,62 @@ int current_thread_single_cpu() {
 #endif
 }
 
+void pin_current_thread(int cpu);
+
+// [TAG_FN_L18_FIRSTANS_PIN] every logical CPU of the core that holds cpu (Windows, group 0), 0 when unknown
+uint64_t core_mask_of(int cpu) {
+#if defined(_WIN32)
+    if (cpu < 0 || cpu >= 64) {
+        return 0;
+    }
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return 0;
+    }
+    std::vector<char> buf(len);
+    auto * info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data();
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        return 0;
+    }
+    for (DWORD off = 0; off < len;) {
+        auto * p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+        if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 && p->Processor.GroupMask[0].Group == 0 &&
+            ((p->Processor.GroupMask[0].Mask >> cpu) & 1)) {
+            return (uint64_t) p->Processor.GroupMask[0].Mask;
+        }
+        off += p->Size;
+    }
+    return 0;
+#else
+    GGML_UNUSED(cpu);
+    return 0;
+#endif
+}
+
+// [TAG_FN_L18_FIRSTANS_PIN] the calling thread on cpu's core: it prefers cpu (ideal processor) and moves to the core's other
+// logical CPU only while cpu is taken. A thread pinned to one CPU waits there as long as anything of a higher priority
+// (a kernel thread) runs on it: one such worker held a bridge job's barrier for 1 s (l18 firstans hunt p4, p7)
+void pin_current_thread_core(int cpu) {
+    if (cpu < 0) {
+        return;
+    }
+#if defined(_WIN32)
+    const uint64_t m = core_mask_of(cpu);
+    if (m == 0 || cpu >= 64) {
+        pin_current_thread(cpu);
+        return;
+    }
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) m);
+    PROCESSOR_NUMBER pn = {};
+    pn.Group  = 0;
+    pn.Number = (BYTE) cpu;
+    SetThreadIdealProcessorEx(GetCurrentThread(), &pn, nullptr);
+#else
+    pin_current_thread(cpu);
+#endif
+}
+
 void pin_current_thread(int cpu) {
     if (cpu < 0) {
         return;
@@ -291,6 +349,7 @@ struct ggml_cpu_moe_pool {
     int n_threads = 1;
     int spin_us   = 0;
     int prio      = 0;
+    bool pin_core = false; // [TAG_FN_L18_FIRSTANS_PIN]
     std::vector<int>         cpus; // per worker; worker 0 is the caller
     std::vector<std::thread> workers;
 
@@ -668,9 +727,36 @@ static void moe_pool_stats_flush(ggml_cpu_moe_pool * p) {
     }
 }
 
+// [TAG_FN_L18_FIRSTANS_STALL] diagnostics (LLAMA_FN_L18_STALL): the workers carry a thread name for the stall probe's dumps
+static void moe_pool_name_thread(int ith) {
+#if defined(_WIN32)
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FN_L18_STALL");
+        return e != nullptr && atoi(e) > 0;
+    }();
+    if (!on) {
+        return;
+    }
+    using set_desc_t = HRESULT (WINAPI *)(HANDLE, PCWSTR);
+    static const set_desc_t set_desc = (set_desc_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+    if (set_desc) {
+        wchar_t w[32];
+        swprintf(w, 32, L"moe-pool %d", ith);
+        set_desc(GetCurrentThread(), w);
+    }
+#else
+    GGML_UNUSED(ith);
+#endif
+}
+
 static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
-    pin_current_thread(p->cpus[ith]);
+    if (p->pin_core) {
+        pin_current_thread_core(p->cpus[ith]); // [TAG_FN_L18_FIRSTANS_PIN]
+    } else {
+        pin_current_thread(p->cpus[ith]);
+    }
     set_current_thread_prio(p->prio);
+    moe_pool_name_thread(ith); // [TAG_FN_L18_FIRSTANS_STALL]
 
     uint32_t last = 0;
     for (;;) {
@@ -747,6 +833,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->n_threads = pp->n_threads;
     p->spin_us   = std::max(0, pp->spin_us);
     p->prio      = pp->prio;
+    p->pin_core  = pp->pin_core; // [TAG_FN_L18_FIRSTANS_PIN]
     p->split     = std::min(std::max(pp->split, (int) GGML_CPU_MOE_SPLIT_RANGE), (int) GGML_CPU_MOE_SPLIT_STEAL); // [TAG_FN_L3_CPU_SPLIT]
     p->pf_rank   = pp->pf_rank;
     p->stats     = pp->stats;
@@ -798,7 +885,11 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     // [TAG_MOE_BRIDGE] a dedicated executor thread runs the jobs: it takes the first CPU of the list itself
     if (pp->pin_caller && !list.empty()) {
         p->cpus[0] = list[0];
-        pin_current_thread(list[0]);
+        if (p->pin_core) {
+            pin_current_thread_core(list[0]); // [TAG_FN_L18_FIRSTANS_PIN]
+        } else {
+            pin_current_thread(list[0]);
+        }
         set_current_thread_prio(p->prio);
     }
     if (p->stats) { // [TAG_FN_L3_CPU_STATS]

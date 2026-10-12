@@ -10,6 +10,7 @@
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
 #include "llama-moe-bridge.h" // [TAG_FN_L3_CPU_DEVPRED]
 #include "llama-fn-tier.h"   // [TAG_FN_L16_PLEGATE] llama_fn_thread_priority_highest
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include "ggml-alloc.h"   // [TAG_FN_MTP_HEAD_IDS]
 #include "ggml-backend.h"
@@ -2609,7 +2610,7 @@ struct llama_model_qwen4exp::ple_prefetcher {
         fallback  = (const uint8_t *) tbl->data;
         row_bytes = tbl->nb[1];
         // [TAG_FN_L16_PLEGATE] the PLE fills are on the GPU's path now: the thread runs at the MoE pool's priority
-        th = std::thread([this]() { llama_fn_thread_priority_highest(); loop(); });
+        th = std::thread([this]() { llama_fn_thread_priority_highest(); llama_fn_thread_name("ple-prefetch"); loop(); }); // [TAG_FN_L18_FIRSTANS_STALL] name
     }
 
     ~ple_prefetcher() {

@@ -3,6 +3,7 @@
 
 #include "llama-moe-gen5.h"
 #include "llama-moe-gen5-impl.h"
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -155,7 +156,7 @@ void copy_pool::start(int n_threads) {
     stop();
     quit = false;
     for (int i = 1; i < n_threads; ++i) {
-        workers.emplace_back([this, i]() { run(i); });
+        workers.emplace_back([this, i]() { llama_fn_thread_name("gen5-copy", i); run(i); }); // [TAG_FN_L18_FIRSTANS_STALL] name
     }
 }
 

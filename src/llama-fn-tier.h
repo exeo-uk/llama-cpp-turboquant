@@ -13,8 +13,11 @@
 // is unlocked. Nothing is copied or charged to commit, and the load does not prefetch those ranges.
 // A no-op on other architectures and other platforms.
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 
 struct llama_model;
 struct llama_model_loader;
@@ -34,7 +37,9 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
 // [TAG_FN_L15_WARM] qwen4exp on Windows (LLAMA_FN_L15_WARM, default on): the load does not prefetch the routed experts; a
 // background thread started by llama_fn_tier_build reads them into the working set, whose maximum it first raises. It
 // starts when the trunk context's first decode returns (this call; a no-op after the first one)
-void llama_fn_warm_go();
+// [TAG_FN_L18_FIRSTANS_WARMLATE] ready = true: the caller is ready (llama_fn_ready_ext); with LLAMA_FN_L18_FIRSTANS_WARMLATE
+// only that call or the second trunk decode starts the pass
+void llama_fn_warm_go(bool ready = false);
 
 // [TAG_FN_L15_WARM] while the warm pass runs, a prompt's stream waits for each layer it has not reached: both faulting the same
 // pages in at once took the first 32K prompt from 21 s to 55 s (l15 abx6_v5_i5)
@@ -43,6 +48,18 @@ bool llama_fn_warm_running();
 
 // [TAG_FN_L15_WARMYIELD] a decode of small ubatches (answer steps, bridged) begins / ends: the warm pass waits meanwhile
 void llama_fn_warm_small_decode(bool begin);
+
+// [TAG_FN_L18_FIRSTANS_STALL] diagnostics: 0 when no warm pass runs, 1 while it reads, 2 while it waits for answer steps;
+// *mark = the 64 MiB pieces it has completed in order
+int llama_fn_warm_state(size_t * mark);
+
+// [TAG_FN_L18_FIRSTANS_STATE] asks the OS to read these mapped ranges in (asynchronous, PrefetchVirtualMemory); a no-op
+// elsewhere. Nothing is locked or copied.
+void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges);
+
+// [TAG_FN_L18_FIRSTANS_STATE] reads one byte of every page of these mapped ranges with n_threads threads (lowest priority), so
+// they are in the working set when this returns
+void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges, int n_threads, const std::atomic<bool> * abort = nullptr);
 
 // [TAG_FN_L16_PLEGATE] the calling thread at THREAD_PRIORITY_HIGHEST (the MoE pool's level with --prio 2); a no-op elsewhere
 void llama_fn_thread_priority_highest();

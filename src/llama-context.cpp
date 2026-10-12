@@ -6,6 +6,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
+#include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -61,7 +62,10 @@ struct llama_context::step_worker {
     bool                    stop = false;
 
     step_worker() {
-        th = std::thread([this]() { run(); });
+        th = std::thread([this]() {
+            llama_fn_thread_name("hot-step"); // [TAG_FN_L18_FIRSTANS_STALL]
+            run();
+        });
     }
 
     ~step_worker() {
@@ -1724,6 +1728,11 @@ llama_context::llama_context(
         // [TAG_FN_VRAM_FIT] with the VRAM fit the trunk context waits until every context of the model exists (the MTP
         // draft context comes after it). The MTP draft context never owns the hot set.
         if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            // [TAG_FN_L18_FIRSTANS_*] the first-answer switches (qwen4exp, off unless set)
+            fa18_once = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_ONCE");
+            fa18_fit  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_FIT");
+            fa18_ovl  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_OVERLAP");
+            fa18_warm = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_WARM");
             if (llama_moe_hot_fit_wanted(model) && llama_moe_hot_device(model) != nullptr) {
                 moe_hot_pending = true;
                 LLAMA_LOG_INFO("%s: moe-hot: the VRAM fit sizes the hot set at the first decode after every context of the "
@@ -1966,6 +1975,7 @@ void llama_context::sched_reserve() {
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    llama_fn_stall_scope st_scope("sched_reserve begins", "sched_reserve ends"); // [TAG_FN_L18_FIRSTANS_STALL]
 
     synchronize();
     step_join(); // [TAG_FN_L3_HOST_STEP] the moe-cache / DMA step is done before the banks or the hot set move
@@ -2268,6 +2278,46 @@ void llama_context::quiesce() {
     synchronize();
     step_join(); // [TAG_FN_L3_HOST_STEP] the step after the last graph may queue uploads
     llama_moe_hot_idle(this);
+}
+
+// [TAG_FN_L18_FIRSTANS_FIT] see llama-context.h. The fit waits for the MTP draft context only inside a decode (the server
+// creates it after the trunk's warm-up decode); called when the caller is ready, no context of the model comes later.
+// The first prompt after a start then skips the fit (~0.3 s), the SMALL reserve and the hot set's start, and the saved
+// learned set (LLAMA_MOE_HOT_STATE, with LLAMA_FN_L18_FIRSTANS_STATE) is already uploading in the background.
+void llama_context::fn_ready() {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    if (!fa18_fit || !moe_hot_pending) {
+        llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE]
+        return;
+    }
+    synchronize();
+    step_join();
+    const int64_t t0 = ggml_time_us();
+    moe_hot_waits = std::max<uint32_t>(moe_hot_waits, 1); // no other context comes: fit now
+    llama_fn_thread_name("decode"); // [TAG_FN_L18_FIRSTANS_STALL] the caller's thread runs the decodes later
+    llama_fn_stall_op(true);
+    moe_hot_fit_try();
+    if (moe_hot_pending) {
+        llama_fn_stall_op(false);
+        LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set fit did not run now: the first decode sizes it\n", __func__);
+        llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE]
+        return;
+    }
+    bool reserved = true;
+    try {
+        sched_reserve(); // the decode graphs carry the hot chain now (the reserve the first decode would make)
+    } catch (const std::exception & err) {
+        reserved = false;
+        sched_need_reserve = true;
+        LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the reserve after the fit failed (%s): the first decode reserves\n",
+                __func__, err.what());
+    }
+    llama_fn_stall_op(false);
+    LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set was sized before the first request: %.0f ms (fit + reserve%s)\n",
+            __func__, (ggml_time_us() - t0)/1000.0, reserved ? "" : " failed");
+    llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE] a pass held back for the load's end starts now
 }
 
 void llama_context::synchronize() {
@@ -3620,9 +3670,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     } warm_go { cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP, false };
+    // [TAG_FN_L18_FIRSTANS_STALL] diagnostics: a mark at each end, a dump after a slow small decode
+    struct stall_on_exit {
+        int64_t t0;
+        int     n;
+        ~stall_on_exit() {
+            llama_fn_stall_decode_end(t0, n);
+        }
+    } stall_guard { llama_fn_stall_decode_begin((int) batch_inp.tokens.size(), cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0),
+                    (int) batch_inp.tokens.size() };
     // [TAG_FN_L15_WARMYIELD] answer steps (small ubatches) make the experts' warm pass wait; a prompt chunk never does (its
     // stream may be waiting for the pass)
-    if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= 64 || cparams.n_ubatch <= 64)) {
+    // [TAG_FN_L18_FIRSTANS_WARM] LLAMA_FN_L18_FIRSTANS_WARM=1: only answer steps (no wider than the hot set's graphs) make it
+    // wait; a short prompt computes its experts on the CPU and faults them in one page at a time, so the pass reads on
+    const size_t warm_small_t = fa18_warm ? (size_t) std::max(8, llama_moe_hot_max_t()) : 64;
+    if (model.arch == LLM_ARCH_QWEN4EXP && (batch_inp.tokens.size() <= warm_small_t || cparams.n_ubatch <= 64)) {
         warm_go.small = true;
         llama_fn_warm_small_decode(true);
     }
@@ -3639,6 +3701,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_hp_scope hp_dec(hp_cls >= 0 ? llama_hp_dec_seg(hp_cls, LLAMA_HP_DEC_PREP) : LLAMA_HP_OTHER);
 
     step_join(); // [TAG_FN_L3_HOST_STEP] the last step's table changes are on the device before this graph
+    if (fa18_ovl) {
+        llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] the last prompt-end pass's experts are in the tables (2: once landed)
+    }
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -3768,6 +3833,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } else {
         cbuf_n_retry = 0;
+    }
+
+    // [TAG_FN_L18_FIRSTANS_ONCE] the last part of a split prompt is no wider than an answer step: the batches before it left
+    // their routing for the pass (they had no output), which runs now, after its SMALL switch, before its graphs (its routing then counts
+    // as an answer step's, as without the split)
+    if (fa18_once && cparams.n_seq_max == 1 && n_outputs_all > 0 && (int) n_tokens_all <= llama_moe_hot_max_t() &&
+        llama_moe_hot_adapt_owner() == this && llama_moe_hot_turn_start_on()) {
+        step_join();
+        if (llama_moe_hot_turn_pending()) {
+            llama_fn_stall_scope st_scope("prompt-end pass before a short last part begins (tokens)", "prompt-end pass ends", n_tokens_all); // [TAG_FN_L18_FIRSTANS_STALL]
+            llama_moe_hot_turn_start(this);
+            if (fa18_ovl) {
+                llama_moe_hot_turn_finish(this); // [TAG_FN_L18_FIRSTANS_OVERLAP] this batch's own graphs come next (2: no wait)
+            }
+        }
     }
 
     // [TAG_FN_L3_VRAM_ACCOUNT] device use when the batches change from prompts to decodes and back (the state the last
@@ -4274,15 +4354,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L3_VRAM_CBUF] LLAMA_FN_CBUF_EAGER (default 1): a FULL batch that did not fill n_batch ends a prompt (one
     // stream), so the return to SMALL happens now: its cost belongs to the prompt, and the tail's refill starts before
     // the first decode step. The outputs are in host buffers once cbuf_set has synchronized.
-    if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch) {
+    // [TAG_FN_L18_FIRSTANS_ONCE] a prompt ends at its batch that asks for an output (a server asks only for the prompt's last
+    // token); a batch before it - the server splits a prompt at a context checkpoint, e.g. at the last user message - keeps
+    // FULL and runs no pass, so a split prompt pays one FULL/SMALL round trip and one pass instead of one per part
+    const bool prompt_end = !fa18_once || n_outputs_all > 0;
+    if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch && prompt_end) {
         cbuf_set(false);
     }
 
     // [TAG_FN_L17_START_PRE] a prompt batch ends: the experts its routing names land before the answer's first decode step
     // (prompt time); after the tail came back above, so its layers take part. One sequence only: with more, a prompt batch
     // can carry another answer's decode tokens, which would wait for the pass
-    if (hot_owner && cparams.n_seq_max == 1 && (int) n_tokens_all > llama_moe_hot_max_t() && llama_moe_hot_turn_start_on()) {
+    if (hot_owner && cparams.n_seq_max == 1 && (int) n_tokens_all > llama_moe_hot_max_t() && prompt_end && llama_moe_hot_turn_start_on()) {
         step_join();
+        llama_fn_stall_scope st_scope("prompt-end pass begins (tokens)", "prompt-end pass ends", n_tokens_all); // [TAG_FN_L18_FIRSTANS_STALL]
         llama_moe_hot_turn_start(this);
     }
 
@@ -6041,6 +6126,7 @@ void llama_fn_vision_give(const llama_model * model) {
 // expected MTP draft context never came), size it to the VRAM that the model, the KV caches (turbot pool, indexer
 // cache), the compute buffers (QSA temporaries grow with -ub) and the draft context left, under a device-use ceiling
 void llama_context::moe_hot_fit_try() {
+    llama_fn_stall_scope st_scope("hot set fit begins", "hot set fit ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     moe_hot_waits++;
 
     const auto & hp = model.hparams;
@@ -6387,6 +6473,7 @@ bool llama_context::cbuf_set(bool full) {
     if (cbuf_state == CBUF_OFF || cbuf_state == want) {
         return true;
     }
+    llama_fn_stall_scope st_scope(full ? "cbuf -> FULL begins" : "cbuf -> SMALL begins", "cbuf switch ends"); // [TAG_FN_L18_FIRSTANS_STALL]
     constexpr double MiB = 1024.0*1024.0;
     const int64_t t0 = ggml_time_us();
     ggml_backend_dev_t dev = llama_moe_hot_device(model);
@@ -7353,6 +7440,12 @@ void llama_synchronize(llama_context * ctx) {
 
 void llama_quiesce_ext(llama_context * ctx) {
     ctx->quiesce(); // [TAG_FN_L4_EXIT]
+}
+
+void llama_fn_ready_ext(llama_context * ctx) {
+    if (ctx) {
+        ctx->fn_ready(); // [TAG_FN_L18_FIRSTANS_FIT]
+    }
 }
 
 float * llama_get_logits(llama_context * ctx) {
