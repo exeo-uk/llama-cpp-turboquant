@@ -313,6 +313,23 @@ struct moe_cache {
     int64_t               l17_st_every_us = 0;
     int64_t               l17_st_last_us  = 0;
     uint64_t              l17_st_steps    = 0;
+    // [TAG_FN_L18_CHURN_PACE] LLAMA_FN_L18_CHURN_PACE=<MiB/s>: the worker's copies of the steady state at no more than this
+    // rate (wall time, a bucket of l18_pace_cap bytes), so the uploads run beside the CPU experts as a stream instead of
+    // bursts; off while the start's burst window is open and while a lend or a stop drains the queue
+    double                l18_pace      = 0.0;  // bytes per microsecond, 0 = off
+    size_t                l18_pace_cap  = 0;
+    double                l18_pace_cr   = 0.0;  // worker only: the bucket
+    int64_t               l18_pace_t    = 0;    // worker only: its last refill
+    std::atomic<bool>     l18_pace_live { false }; // written by the owner's pass: no burst window now
+    std::atomic<bool>     l18_drain     { false }; // hot_drain_out waits for the worker's batch
+    std::atomic<uint64_t> l18_pace_waits { 0 };
+    std::atomic<uint64_t> l18_pace_us    { 0 };
+    // [TAG_FN_L18_CHURN_GATE] LLAMA_FN_L18_CHURN_GATE=<KiB>: the worker copies in pieces of this size and starts a piece, and
+    // the DMA of what it staged, only while no CPU expert job runs (llama_moe_bridge_gate_wait), so the uploads' DRAM reads
+    // and PCIe traffic fall between the jobs instead of on them (0 = off)
+    size_t                l18_gate      = 0;
+    // [TAG_FN_L18_CHURN_MIB] LLAMA_FN_L18_CHURN_MIB=<MiB>: the pass budget after the burst window (0 = LLAMA_MOE_HOT_DECAY_MIB)
+    size_t                l18_mib       = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -904,13 +921,21 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     }
     if (mc->adapt) {
         const uint64_t sn = mc->st_step_n.load(std::memory_order_relaxed);
-        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s, step host time %.0f us%s\n",
+        LLAMA_LOG_INFO("moe-hot: adaptive: %" PRIu64 " experts admitted, %" PRIu64 " verify mismatches%s, step host time %.0f us%s%s\n",
                 mc->ad_admitted, mc->ad_bad,
                 mc->dc_on ? format(", %" PRIu64 " decay passes, %" PRIu64 " swaps queued", mc->dc_passes, mc->dc_swaps).c_str() : "",
                 sn ? (double) mc->st_step_us.load(std::memory_order_relaxed)/sn : 0.0,
                 mc->up_pipe || mc->up_rate > 0 || mc->sd_node || mc->dc_burst > 0 ? format(" [TAG_FN_L3_POLICY] uploaded %.0f MiB, %" PRIu64
                         " bucket waits, %" PRIu64 " prompt tokens seeded, %" PRIu64 " burst swaps", mc->up_bytes.load()/1048576.0,
-                        mc->up_waits.load(), mc->sd_tokens.load(), mc->dc_burst_n).c_str() : "");
+                        mc->up_waits.load(), mc->sd_tokens.load(), mc->dc_burst_n).c_str() : "",
+                mc->l18_pace > 0.0 ? format(" [TAG_FN_L18_CHURN_PACE] %" PRIu64 " pace waits, %.0f ms", mc->l18_pace_waits.load(),
+                        mc->l18_pace_us.load()/1000.0).c_str() : "");
+        if (mc->l18_gate > 0) {
+            uint64_t gw = 0, gus = 0;
+            llama_moe_bridge_gate_stats(&gw, &gus);
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_GATE] %" PRIu64 " gate waits, %.1f ms in all (%.1f us each)\n", gw, gus/1000.0,
+                    gw ? (double) gus/gw : 0.0);
+        }
     }
 }
 
@@ -1015,6 +1040,41 @@ bool hot_slice_ok(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
     return true;
 }
 
+// [TAG_FN_L18_CHURN_PACE] the worker waits until the bucket holds `bytes` (refilled at l18_pace bytes per us, at most
+// l18_pace_cap). No wait while the start's burst window is open, while a lend or a stop drains the queue, or while the
+// owner is idle (the CPU experts do not run then).
+void hot_pace(moe_cache * mc, size_t bytes) {
+    if (mc->l18_pace <= 0.0) {
+        return;
+    }
+    int64_t now = ggml_time_us();
+    if (mc->l18_pace_t == 0) {
+        mc->l18_pace_t  = now;
+        mc->l18_pace_cr = (double) mc->l18_pace_cap;
+    }
+    mc->l18_pace_cr = std::min((double) mc->l18_pace_cap, mc->l18_pace_cr + (double) (now - mc->l18_pace_t)*mc->l18_pace);
+    mc->l18_pace_t  = now;
+    const bool live = mc->l18_pace_live.load(std::memory_order_relaxed) && !mc->up_yield.load(std::memory_order_relaxed);
+    if (!live || mc->l18_drain.load(std::memory_order_relaxed) || mc->l18_pace_cr >= (double) bytes) {
+        mc->l18_pace_cr = std::max(0.0, mc->l18_pace_cr - (double) bytes);
+        return;
+    }
+    const int64_t wait_us = (int64_t) (((double) bytes - mc->l18_pace_cr)/mc->l18_pace) + 1;
+    std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
+    now = ggml_time_us();
+    mc->l18_pace_waits.fetch_add(1, std::memory_order_relaxed);
+    mc->l18_pace_us.fetch_add((uint64_t) std::max<int64_t>(0, now - mc->l18_pace_t), std::memory_order_relaxed);
+    mc->l18_pace_cr = std::min((double) mc->l18_pace_cap, mc->l18_pace_cr + (double) (now - mc->l18_pace_t)*mc->l18_pace);
+    mc->l18_pace_cr = std::max(0.0, mc->l18_pace_cr - (double) bytes);
+    mc->l18_pace_t  = now;
+}
+
+// [TAG_FN_L18_CHURN_GATE] max wait for the gate per piece: a job that runs longer (page faults) does not hold the worker
+constexpr int L18_GATE_MAX_US = 2000;
+
+// [TAG_FN_L18_CHURN_GATE] the copy into staging in gated pieces (a plain copy when the gate is off)
+void hot_copy_gated(const moe_cache * mc, void * dst, const void * src, size_t n, bool nt);
+
 // [TAG_FN_L17_START_NT] a copy into staging that only the DMA reads: non-temporal stores, so no destination line is read
 // first and the staging does not push the CPU experts' lines out of the caches (the CRT memcpy streams only from ~1.5 MiB,
 // above an expert slice). Same bytes as memcpy. For the large staging buffers only: the small pinned halves of
@@ -1048,6 +1108,31 @@ void hot_copy(const moe_cache * mc, void * dst, const void * src, size_t n) {
     memcpy(dst, src, n);
 }
 
+// [TAG_FN_L18_CHURN_GATE] the gate holds the worker in the steady state only: the start's burst window fills at full speed
+bool hot_gate_on(const moe_cache * mc) {
+    return mc->l18_gate > 0 && mc->l18_pace_live.load(std::memory_order_relaxed);
+}
+
+void hot_copy_gated(const moe_cache * mc, void * dst, const void * src, size_t n, bool nt) {
+    if (!hot_gate_on(mc)) {
+        if (nt) {
+            hot_copy(mc, dst, src, n);
+        } else {
+            memcpy(dst, src, n);
+        }
+        return;
+    }
+    for (size_t o = 0; o < n; o += mc->l18_gate) {
+        const size_t k = std::min(mc->l18_gate, n - o);
+        llama_moe_bridge_gate_wait(L18_GATE_MAX_US);
+        if (nt) {
+            hot_copy(mc, (uint8_t *) dst + o, (const uint8_t *) src + o, k);
+        } else {
+            memcpy((uint8_t *) dst + o, (const uint8_t *) src + o, k);
+        }
+    }
+}
+
 // [TAG_FN_L3_POLICY_UPLOAD] LLAMA_MOE_HOT_UP_PIPE: the batch through two small pinned halves - the copy threads fill one
 // while the upload stream reads the other (an event per half orders the reuse) - so the staging stays cache resident and
 // the memcpy overlaps the DMA. Returns after every copy of the batch has landed.
@@ -1069,6 +1154,9 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
             return;
         }
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the copies read host memory too
+        if (hot_gate_on(mc)) {
+            llama_moe_bridge_gate_wait(L18_GATE_MAX_US); // [TAG_FN_L18_CHURN_GATE] the DMA starts between two jobs
+        }
         for (const auto & x : st) {
             ggml_backend_tensor_set_async(mc->up_backend, x.dst, half(h) + x.stage_off, x.off, x.size);
         }
@@ -1111,6 +1199,7 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
             }
             if (sz > mc->up_half) {
                 flush();
+                hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
                 upload_slice(dsts[k], srcs[k], j.expert, j.slot);
                 mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
                 continue;
@@ -1118,7 +1207,8 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
             if (used + sz > mc->up_half) {
                 flush();
             }
-            memcpy(half(h) + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz);
+            hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
+            hot_copy_gated(mc, half(h) + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz, false); // [TAG_FN_L18_CHURN_GATE]
             st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
             used += sz;
             mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
@@ -1146,6 +1236,9 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
     size_t used = 0;
     auto flush = [&]() {
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the copies read host memory too
+        if (hot_gate_on(mc)) {
+            llama_moe_bridge_gate_wait(L18_GATE_MAX_US); // [TAG_FN_L18_CHURN_GATE]
+        }
         for (const auto & x : st) {
             ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
         }
@@ -1171,6 +1264,7 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
                 break;
             }
             mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
+            hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
             if (sz > mc->stage_size) {
                 upload_slice(dsts[k], srcs[k], j.expert, j.slot);
                 continue;
@@ -1178,7 +1272,7 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
             if (used + sz > mc->stage_size) {
                 flush();
             }
-            hot_copy(mc, mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz); // [TAG_FN_L17_START_NT]
+            hot_copy_gated(mc, mc->stage_ptr + used, (const char *) srcs[k]->data + (size_t) j.expert*sz, sz, true); // [TAG_FN_L17_START_NT] [TAG_FN_L18_CHURN_GATE]
             st.push_back({ dsts[k], (size_t) j.slot*dsts[k]->nb[2], sz, used });
             used += sz;
         }
@@ -1410,7 +1504,19 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     if (mc->dc_burst_left > 0) {
         mc->dc_burst_left--;
     }
-    size_t total_bytes = mc->dc_bytes + (burst_now ? mc->dc_burst : 0);
+    mc->l18_pace_live.store(!(burst_now && mc->dc_burst > 0), std::memory_order_relaxed); // [TAG_FN_L18_CHURN_PACE]
+    if (mc->l18_gate > 0 && (mc->dc_passes == 32 || mc->dc_passes % 1024 == 0)) { // [TAG_FN_L18_CHURN_GATE]
+        uint64_t gw = 0, gus = 0;
+        llama_moe_bridge_gate_stats(&gw, &gus);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_GATE] pass %" PRIu64 ": %" PRIu64 " gate waits, %.1f ms in all, %.0f MiB uploaded\n",
+                mc->dc_passes, gw, gus/1000.0, mc->up_bytes.load()/1048576.0);
+    }
+    // [TAG_FN_L18_CHURN_MIB] the steady state's pass budget once the start's burst window is closed (the window keeps the
+    // small one, so the burst's strong pairs are not queued behind a big pass)
+    if (mc->l18_mib > 0 && !(burst_now && mc->dc_burst > 0)) {
+        pass_bytes = mc->l18_mib;
+    }
+    size_t total_bytes = pass_bytes + (burst_now ? mc->dc_burst : 0);
     if (mc->up_rate > 0) {
         size_t queued_b = 0;
         {
@@ -1969,6 +2075,31 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
                             mc->l17_pre >> 20, mc->l17_td, mc->l17_sn, mc->l17_threads).c_str() : "off",
                     mc->l17_nt ? "on" : "off", mc->l17_burst_start ? format("on (%d passes)", mc->dc_burst_passes).c_str() : "off",
                     mc->l17_st_every_us > 0 ? format("every >= %lld s", (long long) (mc->l17_st_every_us/1000000)).c_str() : "off");
+        }
+    }
+    // [TAG_FN_L18_CHURN_*] the steady state's upload levers of round 18 (qwen4exp only; every one off by default)
+    if (l3 && mc->dc_on) {
+        // the steady state: no burst window open (the pass keeps this up to date)
+        mc->l18_pace_live.store(!(mc->dc_burst > 0 && (mc->dc_burst_passes < 0 || mc->dc_burst_left > 0)));
+        // [TAG_FN_L18_CHURN_PACE] the steady state's uploads as a paced stream
+        if (const int mibs = llama_fn_l3_int(model, "LLAMA_FN_L18_CHURN_PACE", 0); mibs > 0) {
+            mc->l18_pace     = (double) mibs*1048576.0/1e6;
+            mc->l18_pace_cap = std::max<size_t>((size_t) 8 << 20, mc->up_pipe ? 2*mc->up_half : 0);
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_PACE] uploads of the steady state at <= %d MiB/s (bucket %zu MiB); full "
+                    "speed in the burst window and when a prompt drains the queue\n", mibs, mc->l18_pace_cap >> 20);
+        }
+        // [TAG_FN_L18_CHURN_MIB]
+        if (const int mib = llama_fn_l3_int(model, "LLAMA_FN_L18_CHURN_MIB", 0); mib > 0) {
+            mc->l18_mib = (size_t) std::min(4096, mib) << 20;
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_MIB] <= %zu MiB uploads per pass once the burst window is closed (%zu MiB "
+                    "in it)\n", mc->l18_mib >> 20, mc->dc_bytes >> 20);
+        }
+        // [TAG_FN_L18_CHURN_GATE]
+        if (const int kib = llama_fn_l3_int(model, "LLAMA_FN_L18_CHURN_GATE", 0); kib > 0) {
+            mc->l18_gate = (size_t) std::max(16, std::min(65536, kib)) << 10;
+            llama_moe_bridge_gate_enable(true);
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_GATE] uploads copied in %zu KiB pieces between the CPU expert jobs (a "
+                    "piece and a DMA start only while no job runs, at most %d us of waiting each)\n", mc->l18_gate >> 10, L18_GATE_MAX_US);
         }
     }
 
@@ -2586,6 +2717,43 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         return false;
     }
 
+    // [TAG_FN_L18_CHURN_LAYERS] LLAMA_FN_L18_CHURN_LAYERS=auto | w0,w1,... (by il; qwen4exp, even slots): the even layout's
+    // slots per layer in proportion to a weight instead of one count for all, the same bytes. auto: the table below for the
+    // 48 x 512 trunk of Qwen3.8-Flash-Next. Layers past the list keep weight 1. Placement only: the values are not touched.
+    std::vector<float> l18_w;
+    if (even && model.arch == LLM_ARCH_QWEN4EXP) {
+        const char * e = llama_fn_env(model, "LLAMA_FN_L18_CHURN_LAYERS");
+        if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0) {
+            // the base slots that the marginal routing frequency gives each layer at 119 per layer, / 119 (l18 replay of the
+            // l17 owner-like sessions t1 / t2 and the l3 long answers, E:/turbot-gates/flashnext/test/l18/churn/sim)
+            static const float k_fn_layer_w[48] = {
+                1.387f, 1.176f, 1.235f, 0.975f, 0.950f, 0.983f, 1.168f, 1.109f, 0.992f, 0.966f, 1.067f, 0.992f,
+                1.311f, 1.092f, 1.050f, 0.723f, 0.849f, 1.076f, 1.017f, 0.966f, 0.975f, 0.983f, 1.210f, 0.815f,
+                1.042f, 1.050f, 0.983f, 1.017f, 1.134f, 1.042f, 0.958f, 0.723f, 0.798f, 0.950f, 1.067f, 0.891f,
+                0.882f, 1.067f, 1.303f, 0.714f, 0.723f, 0.941f, 1.092f, 0.790f, 1.025f, 0.874f, 0.958f, 0.908f,
+            };
+            std::vector<float> by_il;
+            if (strcmp(e, "auto") == 0 || strcmp(e, "1") == 0) {
+                bool fits = model.hparams.n_layer() == 48 && model.hparams.n_expert == 512;
+                for (const auto & c : layers) {
+                    fits = fits && c.l->ffn_up_exps->ne[2] == 512;
+                }
+                if (fits) {
+                    by_il.assign(std::begin(k_fn_layer_w), std::end(k_fn_layer_w));
+                }
+            } else {
+                by_il = llama_fn_parse_weights(e);
+            }
+            if (by_il.empty()) {
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L18_CHURN_LAYERS] LLAMA_FN_L18_CHURN_LAYERS=%s: no weights for this model - even slots\n", e);
+            } else {
+                for (const auto & c : layers) {
+                    l18_w.push_back(c.il >= 0 && c.il < (int) by_il.size() ? by_il[c.il] : 1.0f);
+                }
+            }
+        }
+    }
+
     // budget
     size_t budget = budget_bytes; // [TAG_FN_VRAM_FIT] the caller's fit, logged there
     if (budget == 0) {
@@ -2708,6 +2876,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             // [TAG_FN_L10_SLOTLEND] the lend: the trunk layers from the bottom that lie below the tail and the stream's range
             // (whole layers from the top, by bytes, plus 4 granules) take E slots more each, E sized for the KV cache's
             // unmapped bytes plus up to two granules and the slack per tensor; the even count comes from the rest
+            // [TAG_FN_L18_CHURN_LAYERS] the count of each layer for a budget: even, or by the weights
+            auto slots_for = [&](size_t bud) {
+                return l18_w.empty() ? std::vector<int32_t>(layers.size(), llama_fn_even_slots(bytes, bud, n_exp_min)) :
+                                       llama_fn_weighted_slots(bytes, bud, n_exp_min, l18_w);
+            };
             std::vector<int> sl_layers;
             int32_t          sl_e = 0;
             if (sl_req) {
@@ -2718,15 +2891,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     }
                 }
                 std::sort(trunk.begin(), trunk.end(), [&](int a, int b) { return layers[a].il < layers[b].il; });
-                const int32_t n0 = llama_fn_even_slots(bytes, budget_slots > g_kv_want ? budget_slots - g_kv_want : 0, n_exp_min);
+                const std::vector<int32_t> n0 = slots_for(budget_slots > g_kv_want ? budget_slots - g_kv_want : 0);
                 // one more layer: the final even count may come out a little lower than n0
                 const size_t need_above = tail_bytes + g_kv_keep + 4*vmm_gran +
-                    (trunk.empty() ? 0 : (size_t) (n0 + 1)*layers[trunk.back()].bytes);
+                    (trunk.empty() ? 0 : (size_t) (n0[trunk.back()] + 1)*layers[trunk.back()].bytes);
                 size_t above = 0;
                 int    top   = (int) trunk.size();
                 while (top > 0 && above < need_above) {
                     --top;
-                    above += (size_t) (n0 + 1)*layers[trunk[top]].bytes;
+                    above += (size_t) (n0[trunk[top]] + 1)*layers[trunk[top]].bytes;
                 }
                 size_t per = 0;
                 for (int i = 0; i < top; ++i) {
@@ -2743,21 +2916,29 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
             // whole would give (the lend's few granules of waste come out of the headroom)
             const size_t sl_base_cut = sl_e > 0 ? g_kv_want : 0;
-            const int32_t n = llama_fn_even_slots(bytes, budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0, n_exp_min);
+            const std::vector<int32_t> nv = slots_for(budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0);
             for (size_t li = 0; li < layers.size(); ++li) {
-                n_slots_of[li] = n;
-                used += (size_t) n*layers[li].bytes;
+                n_slots_of[li] = nv[li];
+                used += (size_t) nv[li]*layers[li].bytes;
             }
-            if (sl_e > 0 && n > 0) {
+            if (sl_e > 0) {
                 for (int li : sl_layers) {
-                    const int32_t e = std::min<int32_t>(sl_e, (int32_t) layers[li].l->ffn_up_exps->ne[2] - n);
-                    if (e <= 0) {
+                    const int32_t e = std::min<int32_t>(sl_e, (int32_t) layers[li].l->ffn_up_exps->ne[2] - nv[li]);
+                    if (e <= 0 || nv[li] <= 0) {
                         continue;
                     }
-                    sl_base_of[li]  = n;
+                    sl_base_of[li]  = nv[li];
                     n_slots_of[li] += e;
                     used += (size_t) e*layers[li].bytes;
                 }
+            }
+            if (!l18_w.empty()) {
+                std::string s;
+                for (size_t li = 0; li < layers.size(); ++li) {
+                    s += format(" %d:%d", layers[li].il, nv[li]);
+                }
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_LAYERS] slots by layer weight (even %d):%s\n",
+                        llama_fn_even_slots(bytes, budget_slots > sl_base_cut ? budget_slots - sl_base_cut : 0, n_exp_min), s.c_str());
             }
         } else {
             for (const auto & c : cands) {
@@ -3252,10 +3433,12 @@ void hot_drain_out(moe_cache * mc) {
         // a rate limit this also waits for the rest of the queue (the bucket may have left jobs in it), so no upload runs
         // beside the stream
         mc->up_drain = true;
+        mc->l18_drain.store(true); // [TAG_FN_L18_CHURN_PACE] the worker's batch lands at full speed
         hot_set_yield(mc); // [TAG_FN_L4_EXIT]
         mc->wcv.notify_all();
         mc->wcv_idle.wait(lk, [mc]() { return !mc->worker_busy && (mc->stop || mc->up_rate == 0 || mc->todo.empty()); });
         mc->up_drain = false;
+        mc->l18_drain.store(false);
         hot_set_yield(mc);
     }
     hot_adapt_publish(mc);
@@ -4311,6 +4494,14 @@ void llama_moe_hot_stop(const void * owner) {
     mc->worker.join();
     if (mc->up_backend) {
         ggml_backend_synchronize(mc->up_backend);
+    }
+    if (mc->l18_gate > 0) {
+        uint64_t gw = 0, gus = 0;
+        llama_moe_bridge_gate_stats(&gw, &gus);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_GATE] %" PRIu64 " gate waits, %.1f ms in all, %.0f MiB uploaded\n", gw, gus/1000.0,
+                mc->up_bytes.load()/1048576.0);
+        mc->l18_gate = 0;
+        llama_moe_bridge_gate_enable(false); // [TAG_FN_L18_CHURN_GATE] the executors stop marking their jobs
     }
     LLAMA_LOG_INFO("moe-hot: [TAG_FN_L4_EXIT] the upload worker stopped (%zu jobs still queued, dropped)\n", mc->todo.size());
 }

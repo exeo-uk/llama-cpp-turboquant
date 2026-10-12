@@ -88,6 +88,12 @@ std::atomic<bool>       g_quiet_on{false};
 std::atomic<uint64_t>   g_quiet_waits{0};
 std::atomic<uint64_t>   g_quiet_wait_us{0};
 
+// [TAG_FN_L18_CHURN_GATE] the CPU jobs in flight, counted only while a hot set asks for it (g_gate_on > 0)
+std::atomic<int>      g_gate_on{0};
+std::atomic<int>      g_gate_busy{0};
+std::atomic<uint64_t> g_gate_waits{0};
+std::atomic<uint64_t> g_gate_wait_us{0};
+
 void br_quiet_set(bool busy) {
     {
         std::lock_guard<std::mutex> lk(g_quiet_mtx);
@@ -626,8 +632,15 @@ static void br_exec_main(llama_moe_bridge * br) {
                 br->dg_first_sum.fetch_add(br_now_ns() - br->dg_t_begin.load(std::memory_order_acquire), std::memory_order_relaxed);
                 br->dg_first_n.fetch_add(1, std::memory_order_relaxed);
             }
+            const bool gate = g_gate_on.load(std::memory_order_relaxed) > 0; // [TAG_FN_L18_CHURN_GATE]
+            if (gate) {
+                g_gate_busy.fetch_add(1, std::memory_order_acq_rel);
+            }
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
+            if (gate) {
+                g_gate_busy.fetch_sub(1, std::memory_order_acq_rel);
+            }
             if (br->probe && job.chan >= 0 && job.chan < (int) br->chans.size()) { // [TAG_FN_L14_PROBE]
                 auto & pc = br->chans[job.chan];
                 pc.p_seen = t_seen;
@@ -1219,6 +1232,36 @@ void llama_moe_bridge_release(llama_moe_bridge * br) {
     if (br && br->gb && br->fn_release) {
         br->fn_release(br->gb);
     }
+}
+
+// [TAG_FN_L18_CHURN_GATE]
+void llama_moe_bridge_gate_enable(bool on) {
+    g_gate_on.fetch_add(on ? 1 : -1, std::memory_order_acq_rel);
+}
+
+bool llama_moe_bridge_gate_wait(int max_us) {
+    if (g_gate_on.load(std::memory_order_relaxed) <= 0 || g_gate_busy.load(std::memory_order_acquire) <= 0) {
+        return true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    // pause only: the waiting thread shares a core with a pool worker, which keeps the core's resources this way
+    for (uint32_t k = 1; g_gate_busy.load(std::memory_order_acquire) > 0; ++k) {
+        br_relax();
+        if ((k & 63) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(std::max(1, max_us))) {
+            ok = false;
+            break;
+        }
+    }
+    g_gate_waits.fetch_add(1, std::memory_order_relaxed);
+    g_gate_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+    return ok;
+}
+
+void llama_moe_bridge_gate_stats(uint64_t * n_waits, uint64_t * wait_us) {
+    *n_waits = g_gate_waits.load(std::memory_order_relaxed);
+    *wait_us = g_gate_wait_us.load(std::memory_order_relaxed);
 }
 
 // [TAG_FN_L3_HOST_QUIET]
