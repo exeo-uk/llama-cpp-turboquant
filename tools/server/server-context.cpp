@@ -3478,6 +3478,7 @@ private:
                         use_best, tokens.size(), use_cur, info.c_str());
                 if (cs.on) {
                     detect_rerender(lcp_best, slot.kc_conv);
+                    slot.kc_spill.keep_first(lcp_best); // the prompt goes on differently after lcp_best
                 }
             } else {
                 SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] restoring a stored conversation of %d tokens failed (%s), the prompt is processed in full\n",
