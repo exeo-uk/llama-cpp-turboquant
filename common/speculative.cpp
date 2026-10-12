@@ -5812,7 +5812,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         const char * hq_env = getenv("LLAMA_KV_HQ_FALLBACK");
         const bool   hq     = !(hq_env != nullptr && strcmp(hq_env, "0") == 0) &&
                               ((hq_env != nullptr && strcmp(hq_env, "1") == 0) || common_spec_gguf_arch(params.model.path) == "qwen4exp");
-        const ggml_type swap = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+        // [TAG_FN_L19_DRAFT_F16KV] LLAMA_FN_L19_DRAFT_F16KV=1 (qwen4exp): f16 instead of q8_0. A draft decode then has no
+        // Hadamard rotations and no q8_0 -> f16 copy of the window, and its 1-row attention takes the f16 MMA kernel (GQA
+        // packed) instead of VEC. Drafts only (the target verifies every draft); +32 MiB at the 33K-cell draft window.
+        const char * f16_env = getenv("LLAMA_FN_L19_DRAFT_F16KV");
+        const bool   f16kv   = hq && f16_env != nullptr && atoi(f16_env) > 0 && common_spec_gguf_arch(params.model.path) == "qwen4exp";
+        const ggml_type swap = f16kv ? GGML_TYPE_F16 : hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         if (result.cache_type_k == GGML_TYPE_TURBOT_S8) {
             result.cache_type_k = swap;
         }
@@ -5824,7 +5829,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
             if (asked) {
                 LOG_WRN("%s: the draft KV cache does not support turbot, using %s for it\n", __func__, ggml_type_name(swap));
             } else {
-                LOG_INF("%s: the draft KV cache does not support turbot; this model keeps q8-level KV, using q8_0 for it\n", __func__);
+                LOG_INF("%s: the draft KV cache does not support turbot; this model keeps q8-level KV, using %s for it%s\n",
+                        __func__, ggml_type_name(swap), f16kv ? " [TAG_FN_L19_DRAFT_F16KV]" : "");
             }
         }
     }
