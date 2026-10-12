@@ -435,9 +435,9 @@ void server_keepctx::wr_run() {
             wr_q_.pop_front();
         }
         wr_job(*job);
-        // the target bytes' buffer serves the next checkpoint (take_spare)
+        // the target bytes' buffer serves the next checkpoint (take_spare); one at most, it is RAM beside the model
         std::lock_guard<std::mutex> lk(wr_mu_);
-        if (spare_.size() < 2 && !job->tgt.empty()) {
+        if (spare_.empty() && !job->tgt.empty()) {
             spare_.push_back(std::move(job->tgt));
         }
     }
