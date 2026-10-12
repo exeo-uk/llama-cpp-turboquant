@@ -19,6 +19,7 @@ add_library(${TARGET} STATIC
     server-context.h
     server-keepctx.cpp
     server-keepctx.h
+    server-convstore.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

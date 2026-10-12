@@ -338,6 +338,10 @@ target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../s
 # lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
 llama_build_and_test(test-fn-auto.cpp)
 
+# [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
+# checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
+llama_build_and_test(test-fn-convstore.cpp)
+
 # [TAG_FN_L4_HOST_TOPK] the fast candidate path of the sampler (common/sampling.cpp) against the full-vocabulary partial
 # sort the top-k sampler runs: identical candidates or a fallback, never a different result. CPU only, no model.
 llama_build_and_test(test-fn-l4-host.cpp)
