@@ -186,7 +186,7 @@ LLAMA_API void llama_quiesce_ext(struct llama_context * ctx);
 
 // [TAG_FN_L18_FIRSTANS_FIT] The caller has loaded the model and every context of it (a server about to listen) and no
 // request has come yet: qwen4exp with LLAMA_FN_L18_FIRSTANS_FIT sizes its deferred VRAM hot set now instead of in the first
-// prompt. A no-op otherwise. Outputs never change.
+// prompt, and with LLAMA_FN_L18_FIRSTANS_WARMLATE the experts' warm pass starts now. A no-op otherwise. Outputs never change.
 LLAMA_API void llama_fn_ready_ext(struct llama_context * ctx);
 
 // [TAG_FN_L3_MTP_HEADPROMPT] qwen4exp with a MTP draft vocabulary and LLAMA_MTP_HEAD_PROMPT=<cap>: the drafts also score

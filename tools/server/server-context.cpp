@@ -2713,7 +2713,8 @@ private:
         model_tags    = params_base.model_tags;
 
         // [TAG_FN_L18_FIRSTANS_FIT] every context of the model exists (the draft context, the projector): a deferred VRAM hot
-        // set is sized now, before the first request (qwen4exp with LLAMA_FN_L18_FIRSTANS_FIT; a no-op otherwise)
+        // set is sized now, before the first request, and a held-back warm pass starts (qwen4exp with LLAMA_FN_L18_FIRSTANS_FIT /
+        // _WARMLATE; a no-op otherwise)
         llama_fn_ready_ext(ctx_tgt);
 
         // propagate new defaults back to caller
