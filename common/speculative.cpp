@@ -13,6 +13,7 @@
 #include "sampling.h"
 #include "speculative-mtp-cost.h" // [TAG_FN_MTP_COST]
 #include "speculative-mtp-cost2.h" // [TAG_FN_L3_MTP_COST2]
+#include "speculative-mtp-adapt.h" // [TAG_FN_L19_DRAFT_ADAPT]
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -3527,6 +3528,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int8_t>                   fuse_in;    // in the batch being built (cleared after its decode)
     uint64_t                              fuse_n_fused = 0, fuse_n_alone = 0, fuse_n_drop = 0;
 
+    // [TAG_FN_L19_DRAFT_ADAPT] LLAMA_FN_L19_DRAFT_ADAPT=1 (qwen4exp, one sequence): the cap on the drafts of each round from
+    // the measured acceptance per position and the measured cost of each verify width (speculative-mtp-adapt.h)
+    bool             ad_on        = false;
+    common_mtp_adapt ad;
+    int32_t          ad_cap       = 0;     // this round's cap
+    int32_t          ad_dec       = 0;     // its draft decodes
+    int32_t          ad_prop      = 0;     // its proposed drafts
+    bool             ad_open      = false; // a round waits for accept()
+    int64_t          ad_t_end     = 0;     // end of the last draft() in us (0 = no step to time)
+    int32_t          ad_rows      = 0;     // verify rows it planned
+    int32_t          ad_n_proc    = 0;     // process() calls since then
+    int32_t          ad_proc_rows = 0;     // rows of the last one
+    int32_t          ad_skip      = 0;     // rounds after a prompt left out of the time samples
+    FILE *           ad_trace     = nullptr; // LLAMA_FN_L19_DRAFT_ADAPT_TRACE=<file>: one CSV line per round
+    float            ad_p[common_mtp_adapt::K_MAX] = {}; // the drafter's top p at each decoded position of the round
+    int32_t          ad_acc       = -1;    // drafts the target accepted (-1: no accept() yet)
+    double           ad_td_us     = 0.0;   // the round's draft decodes, sampling included
+    double           ad_P         = 1.0;   // P(the drafts kept so far are all accepted), calibrated (the cost cut)
+
     void fuse_clear(llama_seq_id s) {
         fuse_tok[s].clear();
         fuse_pos[s].clear();
@@ -3681,7 +3701,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 h.c_str(), c2_track ? "on" : "off (no MoE bridge)");
     }
 
+    // [TAG_FN_L19_DRAFT_ADAPT]
+    void ad_log_summary(const char * when) {
+        std::string pa, tv, h;
+        for (int k = 0; k < ad.kmax; ++k) {
+            pa += string_format("%s%.2f/%.2f", k ? " " : "", ad.pass[k], ad.acc[k]);
+        }
+        for (int w = 1; w <= ad.kmax + 1; ++w) {
+            tv += string_format("%s%.2f%s", w > 1 ? " " : "", ad.t_verify(w)/1000.0, ad.tvn[w - 1] >= ad.nmin ? "" : "*");
+        }
+        for (int k = 1; k <= ad.kmax; ++k) {
+            h += string_format("%s%lld", k > 1 ? " " : "", (long long) ad.hist[k]);
+        }
+        LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] %s: pass/acc per position {%s}, verify ms per width {%s} (* = priced from "
+                "a neighbour), draft decode ms %.2f / %.2f, caps chosen {%s} (probes %lld), rounds %lld, dropped samples %lld, "
+                "cost cut %s (%lld tokens), rate %.4f tok/ms\n",
+                __func__, when, pa.c_str(), tv.c_str(), ad.t_d0()/1000.0, ad.t_d1()/1000.0, h.c_str(), (long long) ad.n_probe,
+                (long long) ad.n_round, (long long) ad.n_drop, ad.cut > 0 ? "on" : "off", (long long) ad.n_cut, ad.lam*1000.0);
+        if (ad_trace) {
+            fflush(ad_trace);
+        }
+    }
+
     void print_stats_extra() override {
+        if (ad_on) {
+            ad_log_summary("end"); // [TAG_FN_L19_DRAFT_ADAPT]
+        }
         if (cost_on && cost.log > 0) {
             cost_log_summary("end");
         }
@@ -3799,6 +3844,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             LOG_INF("%s: [TAG_FN_L4_HOST_MTPFUSE] the rows of each verify batch go into the first draft decode after it\n", __func__);
         }
 
+        // [TAG_FN_L19_DRAFT_ADAPT] the cap replaces n_max as the bound on a round's drafts (common_speculative_mtp_adapt_kmax
+        // also raised the target's rollback ring to it)
+        if (is_qwen4exp && n_seq == 1 && !is_mem_shared && !chain_heads &&
+                llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT", 0) != 0) {
+            const char * ec = getenv("SPEC_MTP_COST");
+            const uint32_t n_rs = llama_n_rs_seq(ctx_tgt);
+            if (ec && ec[0] != '\0' && ec[0] != '0') {
+                LOG_WRN("%s: [TAG_FN_L19_DRAFT_ADAPT] off: SPEC_MTP_COST=%s picks the draft length\n", __func__, ec);
+            } else {
+                ad.init_env();
+                ad.kmax = std::min<int>(common_mtp_adapt::K_MAX, std::max<int>(1, (int) llama_fn_l4_int(llama_get_model(ctx_dft),
+                        "LLAMA_FN_L19_DRAFT_ADAPT_KMAX", ad.kmax)));
+                // the ring the target rolls back must cover kmax drafts: n_rs_seq, which the MoE bridge raised by one (it
+                // takes graphs of at most n_rs_seq rows, llama-context.cpp [TAG_FN_R1_BRIDGE_RB])
+                const char * eb  = getenv("LLAMA_MOE_BRIDGE");
+                const char * er  = getenv("LLAMA_MOE_BRIDGE_RB");
+                const int    lim = (int) n_rs - ((eb && atoi(eb) > 0 && !(er && er[0] == '0')) ? 1 : 0);
+                if (n_rs > 0 && lim < ad.kmax) {
+                    LOG_WRN("%s: [TAG_FN_L19_DRAFT_ADAPT] the target rolls back %d drafts: cap %d -> %d\n", __func__, lim,
+                            ad.kmax, std::max(1, lim));
+                    ad.kmax = std::max(1, lim);
+                }
+                ad_on              = true;
+                this->params.n_max = ad.kmax;
+                this->n_max        = ad.kmax;
+                if (const char * tp = getenv("LLAMA_FN_L19_DRAFT_ADAPT_TRACE"); tp && tp[0]) {
+                    ad_trace = fopen(tp, "a");
+                }
+                LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] adaptive draft length on: cap 1..%d per round from E[tokens] / E[us] "
+                        "(acceptance and p_min pass rate per position, EWMA %.2f; verify time per width, EWMA %.2f), probe "
+                        "every %d, the p_min %.2f rule inside the cap; rollback ring %u\n", __func__, ad.kmax, ad.w_acc,
+                        ad.w_t, ad.probe, this->params.p_min, n_rs);
+            }
+        }
+
         // [TAG_FN_MTP_COST]
         {
             const char * e = getenv("SPEC_MTP_COST");
@@ -3906,6 +3986,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             fclose(c2_trace); // [TAG_FN_L3_MTP_COST2]
             c2_trace = nullptr;
         }
+        if (ad_trace) {
+            fclose(ad_trace); // [TAG_FN_L19_DRAFT_ADAPT]
+            ad_trace = nullptr;
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -4000,6 +4084,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         c2_t_start = 0; // [TAG_FN_L3_MTP_COST2]
         c2_t_end   = 0;
         c2_skip    = cost2_on ? cost2.skip : 0;
+        ad_t_end   = 0; // [TAG_FN_L19_DRAFT_ADAPT]
+        ad_skip    = ad_on ? ad.skip : 0;
+        ad_open    = false;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -4071,6 +4158,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::copy(cold, cold + T, c2_cold);
                 }
             }
+        }
+
+        // [TAG_FN_L19_DRAFT_ADAPT] a step is timed only if exactly one target batch (its verify batch) ran since draft()
+        if (ad_on) {
+            ad_n_proc++;
+            ad_proc_rows = batch_in.size();
         }
 
         // TODO: how to make it work with vision tokens?
@@ -4354,6 +4447,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             cs_R = cs_n;
         }
 
+        // [TAG_FN_L19_DRAFT_ADAPT] the last round: its verify time (one target batch of the planned rows since then) and,
+        // when no accept() came (an empty draft before any other), its pass observation; then this round's cap
+        if (ad_on) {
+            const int64_t t0 = ggml_time_us();
+            if (ad_open && ad_prop == 0) {
+                ad.observe(ad_dec, 0, 0);
+            }
+            ad_open = false;
+            double tv_us = -1.0; // the round's verify step, -1 when it is no sample
+            if (ad_t_end > 0 && ad_n_proc == 1 && ad_proc_rows == ad_rows) {
+                if (ad_skip > 0) {
+                    ad_skip--;
+                } else if (ad.add_verify(ad_rows, (double) (t0 - ad_t_end))) {
+                    tv_us = (double) (t0 - ad_t_end);
+                }
+            }
+            if (ad_trace && ad_cap > 0) {
+                // cap, decodes, proposed, accepted, top p per decoded position, draft us, verify us, priced verify us W=1..5
+                fprintf(ad_trace, "%d,%d,%d,%d", ad_cap, ad_dec, ad_prop, ad_acc);
+                for (int k = 0; k < common_mtp_adapt::K_MAX; ++k) {
+                    fprintf(ad_trace, ",%.4f", k < ad_dec ? ad_p[k] : -1.0f);
+                }
+                fprintf(ad_trace, ",%.0f,%.0f", ad_td_us, tv_us);
+                for (int w = 1; w <= common_mtp_adapt::W_MAX; ++w) {
+                    fprintf(ad_trace, ",%.0f", ad.t_verify(w));
+                }
+                fprintf(ad_trace, "%s", "\n");
+                fflush(ad_trace); // the harness may stop the server without an exit
+            }
+            ad_acc   = -1;
+            ad_td_us = 0.0;
+            ad_P     = 1.0;
+            ad_t_end  = 0;
+            ad_n_proc = 0;
+            ad_dec    = 0;
+            ad_prop   = 0;
+            ad_cap    = dparams[0].drafting ? ad.choose() : 0;
+            if (ad_cap > 0 && dparams[0].n_max > 0) {
+                ad_cap = std::min(ad_cap, dparams[0].n_max); // the server's cap (context or n_predict end)
+            }
+        }
+
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
@@ -4458,7 +4593,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (use_policy) {
                 return cost_keep(s, conf, d, n);
             }
-            return !(conf < pmin_at(pos));
+            if (conf < pmin_at(pos)) {
+                return false;
+            }
+            // [TAG_FN_L19_DRAFT_ADAPT] the cost cut on top of p_min: the token must pay for its verify row
+            if (ad_on && ad.cut > 0 && s == 0) {
+                if (!ad.keep(pos, ad_P, conf)) {
+                    ad.n_cut++;
+                    return false;
+                }
+                ad_P *= ad.acc_p(pos, conf);
+            }
+            return true;
         };
 
         // [TAG_FN_L4_HOST_MTPFUSE] kept rows of sequences that do not draft now: in the first draft decode too (no output),
@@ -4495,8 +4641,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            const int64_t cost_it0 = (cost_on || cost2_on) ? ggml_time_us() : 0; // [TAG_FN_MTP_COST] one draft decode + sampling
+            const int64_t cost_it0 = (cost_on || cost2_on || ad_on) ? ggml_time_us() : 0; // [TAG_FN_MTP_COST] one draft decode + sampling
             const int     cost_nit = n_drafting;
+            if (ad_on && drafting[0]) {
+                ad_dec++; // [TAG_FN_L19_DRAFT_ADAPT]
+            }
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             // [TAG_FN_L4_HOST_MTPFUSE] the kept rows went with the first decode (their h views were read by it)
@@ -4558,6 +4707,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+
+                if (ad_on && seq_id == 0 && i < common_mtp_adapt::K_MAX && cur_p->size > 0) {
+                    ad_p[i] = cur_p->data[0].p; // [TAG_FN_L19_DRAFT_ADAPT]
+                }
 
                 // [TAG_MTP_DISTS] At temp > 0 the target can use rejection sampling - accept with
                 // probability p/q - but ONLY if we hand it q, the distribution this draft token was
@@ -4662,7 +4815,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                // [TAG_FN_L19_DRAFT_ADAPT] this round's cap instead of n_max
+                if ((ad_on ? ad_cap : params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -4720,6 +4874,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (cost2_on) {
                 cost2.add_td(cost_nit, (double) (ggml_time_us() - cost_it0)); // [TAG_FN_L3_MTP_COST2]
             }
+            if (ad_on) {
+                const double us = (double) (ggml_time_us() - cost_it0);
+                ad.add_decode(i == 0, us); // [TAG_FN_L19_DRAFT_ADAPT]
+                ad_td_us += us;
+            }
 
             if (batch.size() == 0) {
                 break;
@@ -4741,6 +4900,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+        }
+
+        // [TAG_FN_L19_DRAFT_ADAPT] the round waits for accept(); the verify rows it plans and the clock for its time sample
+        if (ad_on) {
+            const auto & dp = dparams[0];
+            if (dp.drafting && ad_cap > 0) {
+                ad_prop = (int32_t) dp.result->size();
+                if (dp.n_max > 0) {
+                    ad_prop = std::min(ad_prop, dp.n_max);
+                }
+                ad_open = ad_dec > 0;
+                ad_rows = ad_prop + 1;
+                if (ad.log > 0 && ad.n_round % 512 == 0) {
+                    ad_log_summary("every 512 rounds");
+                }
+            } else {
+                ad_rows = 0;
+            }
+            ad_t_end = ad_rows > 0 ? ggml_time_us() : 0;
         }
 
         // [TAG_FN_MTP_COST] the verify rows this step plans, what the calibration may see, and the clock for the next sample
@@ -4821,6 +4999,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         llama_hp_scope hp_scope(LLAMA_HP_MTP_ACCEPT); // [TAG_FN_L4_HOST]
+
+        // [TAG_FN_L19_DRAFT_ADAPT] what the target kept of this round's drafts
+        if (ad_on && ad_open && seq_id == 0) {
+            ad.observe(ad_dec, ad_prop, n_accepted);
+            ad_open = false;
+            ad_acc  = n_accepted;
+            for (int k = 0; k < std::min<int>({ ad_prop, (int) n_accepted + 1, common_mtp_adapt::K_MAX }); ++k) {
+                ad.observe_p(k, ad_p[k], k < (int) n_accepted); // the calibration of the cost cut
+            }
+        }
 
         // [TAG_FN_MTP_COST] calibrate the acceptance per drafter probability from what the target kept
         if (cost_on && !cost_ps[seq_id].empty()) {
@@ -5591,6 +5779,23 @@ static std::string common_spec_gguf_arch(const std::string & path) {
     return arch;
 }
 
+// [TAG_FN_L19_DRAFT_ADAPT]
+int32_t common_speculative_mtp_adapt_kmax(const llama_model * model, const common_params & params) {
+    const auto & types = params.speculative.types;
+    if (model == nullptr || params.n_parallel != 1 ||
+            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == types.end() ||
+            llama_fn_l4_int(model, "LLAMA_FN_L19_DRAFT_ADAPT", 0) == 0) {
+        return 0; // llama_fn_l4_int reads the switch on qwen4exp only
+    }
+    const char * ec = getenv("SPEC_MTP_COST");
+    if (ec && ec[0] != '\0' && ec[0] != '0') {
+        return 0;
+    }
+    common_mtp_adapt a;
+    a.init_env();
+    return std::min<int32_t>(common_mtp_adapt::K_MAX, std::max<int32_t>(1, llama_fn_l4_int(model, "LLAMA_FN_L19_DRAFT_ADAPT_KMAX", a.kmax)));
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -5638,7 +5843,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         const char * hq_env = getenv("LLAMA_KV_HQ_FALLBACK");
         const bool   hq     = !(hq_env != nullptr && strcmp(hq_env, "0") == 0) &&
                               ((hq_env != nullptr && strcmp(hq_env, "1") == 0) || common_spec_gguf_arch(params.model.path) == "qwen4exp");
-        const ggml_type swap = hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
+        // [TAG_FN_L19_DRAFT_F16KV] LLAMA_FN_L19_DRAFT_F16KV=1 (qwen4exp): f16 instead of q8_0. A draft decode then has no
+        // Hadamard rotations and no q8_0 -> f16 copy of the window, and its 1-row attention takes the f16 MMA kernel (GQA
+        // packed) instead of VEC. Drafts only (the target verifies every draft); +32 MiB at the 33K-cell draft window.
+        const char * f16_env = getenv("LLAMA_FN_L19_DRAFT_F16KV");
+        const bool   f16kv   = hq && f16_env != nullptr && atoi(f16_env) > 0 && common_spec_gguf_arch(params.model.path) == "qwen4exp";
+        const ggml_type swap = f16kv ? GGML_TYPE_F16 : hq ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO5P_0;
         if (result.cache_type_k == GGML_TYPE_TURBOT_S8) {
             result.cache_type_k = swap;
         }
@@ -5650,7 +5860,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
             if (asked) {
                 LOG_WRN("%s: the draft KV cache does not support turbot, using %s for it\n", __func__, ggml_type_name(swap));
             } else {
-                LOG_INF("%s: the draft KV cache does not support turbot; this model keeps q8-level KV, using q8_0 for it\n", __func__);
+                LOG_INF("%s: the draft KV cache does not support turbot; this model keeps q8-level KV, using %s for it%s\n",
+                        __func__, ggml_type_name(swap), f16kv ? " [TAG_FN_L19_DRAFT_F16KV]" : "");
             }
         }
     }
