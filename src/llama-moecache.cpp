@@ -149,6 +149,7 @@ struct moe_cache {
     bool    hot       = false;
     int     hot_max_t = 0;
     int     hot_short_t = 0; // [TAG_FN_L4_MEM_PROMPT] LLAMA_FN_L4_PROMPT_HOT: graphs of up to this many tokens build the hot chain too
+    int     hot_prompt_t = 0; // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT: wider CPU-path prompt graphs (up to this) too
     uint64_t hot_steps = 0;
 
     // [TAG_FN_MOE_HOT_ADAPT] adaptive hot set: tables change only in step() of the owning context, after its compute
@@ -2231,6 +2232,12 @@ int llama_moe_hot_graph_max_t() {
     return mc && mc->hot ? std::max(mc->hot_max_t, mc->hot_short_t) : 0;
 }
 
+// [TAG_FN_L19_TTFT_PHOT]
+int llama_moe_hot_prompt_max_t() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->hot ? mc->hot_prompt_t : 0;
+}
+
 namespace {
 
 // host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a model
@@ -2916,6 +2923,14 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
     if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
         mc->hot_short_t = 31;
+    }
+    // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT=1 (or =<n>: graphs of up to n tokens): a prompt graph on the CPU path
+    // (wider than the graphs above, no prefill stream, below GGML_OP_OFFLOAD_MIN_BATCH) builds the hot chain as well, one
+    // row per routed (token, expert) so the batched kernels (MMQ) serve it; the CPU skips the hot experts. Off = 0
+    if (const int v = llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_PHOT", 0); v > 0) {
+        mc->hot_prompt_t = v == 1 ? INT32_MAX : v;
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L19_TTFT_PHOT] CPU-path prompt graphs of up to %d tokens compute the hot experts on "
+                "the GPU (one row per routed expert), the CPU only the others\n", mc->hot_prompt_t);
     }
 
     auto free_all = [&]() {

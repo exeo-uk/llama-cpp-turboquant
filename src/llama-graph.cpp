@@ -28,6 +28,7 @@
 #include "ggml-turbot.h"
 
 #include <algorithm>
+#include <atomic> // [TAG_FN_L19_TTFT_PHOT]
 #include <cassert>
 #include <cmath>
 #include <map>
@@ -2550,6 +2551,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if ((n_tokens == 1 || n_tokens <= hot_max_t || (hot_max_t > 0 && n_tokens <= llama_moe_hot_graph_max_t())) && slot_chain_ok) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
+    // [TAG_FN_L19_TTFT_PHOT] a wider prompt graph on the CPU path (no prefill stream for this layer, below the op offload, no
+    // host bridge) builds the hot chain too: the device computes the hot experts (one row per routed (token, expert), so
+    // the batched kernels serve it), the CPU MUL_MAT_IDs skip them through the hot table (set_skip), the outputs add up
+    bool phot = false;
+    if (!mcache && hot_max_t > 0 && slot_chain_ok && !pfs && il >= 0 && n_tokens > llama_moe_hot_graph_max_t() &&
+        n_tokens <= llama_moe_hot_prompt_max_t()) {
+        const char * e_off = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        const int64_t off_min = e_off && atoi(e_off) > 0 ? atoi(e_off) : 32;
+        const llama_moe_bridge * br_chk = moe_bridge ? moe_bridge : moe_bridge_sync;
+        if (n_tokens < off_min && !(br_chk && llama_moe_bridge_fits(br_chk, (int) n_tokens, 1))) {
+            mcache = llama_moe_cache_lookup(up_exps);
+            phot   = mcache != nullptr;
+            static std::atomic<int> n_phot_log{0};
+            if (phot && n_phot_log.fetch_add(1, std::memory_order_relaxed) < 2) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_PHOT] a %lld-token prompt graph: layer %d computes its hot experts on the "
+                        "device (%lld rows), the CPU the others\n", __func__, (long long) n_tokens, il,
+                        (long long) (n_tokens*selected_experts->ne[0]));
+            }
+        }
+    }
 
     // [TAG_MOE_BRIDGE] host-resident experts through the host bridge: post x / ids / w right after the router, so the
     // host starts while the device builds the hot chain and the caller's shared expert; build_moe_bridge_finish waits
@@ -2685,6 +2706,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return down_g;
     };
     auto build_cache_chain = [&]() -> ggml_tensor * {
+        // [TAG_FN_L19_TTFT_PHOT] one row per routed (token, expert): ids [1, k*T] and the input repeated k times, so no token
+        // holds the zero slot twice (the batched MUL_MAT_ID groups each expert's columns once per token); the uncached rows
+        // read the zero slot and give 0, as in the narrow chains
+        if (phot) {
+            const int64_t nu      = mc_slot_ids->ne[0];
+            ggml_tensor * inp_all = mc_inp;
+            ggml_tensor * rep     = ggml_repeat_4d(ctx0, inp_all, inp_all->ne[0], nu, n_tokens, 1); // [n_embd, k, T]
+            mc_inp = ggml_reshape_3d(ctx0, rep, inp_all->ne[0], 1, nu*n_tokens);
+            ggml_tensor * ids = ggml_reshape_2d(ctx0, mc_slot_ids, 1, nu*n_tokens);
+            ggml_tensor * d   = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false); // [n_embd, 1, k*T]
+            mc_inp = inp_all;
+            d = ggml_reshape_3d(ctx0, d, d->ne[0], nu, n_tokens);
+            cb(d, "ffn_moe_hot_prompt", il);
+            return d;
+        }
         // [TAG_FN_L4_MEM_PROMPT] a graph wider than hot_max_t (the short prompt path with LLAMA_FN_L4_PROMPT_HOT): chunks of
         // hot_max_t tokens, so every chain takes the per-column MUL_MAT_ID kernels. The batched one (MMQ) groups an expert's
         // columns assuming it appears at most once per token, but all uncached ids of a token map to the one zero slot.
