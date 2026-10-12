@@ -469,6 +469,14 @@ private:
     // sat 7.4 s in the driver beside the pass); 0 = off
     uint32_t l19_early = 0;
     uint64_t cbuf_n_early = 0;
+    // [TAG_FN_L19_TTFT_TAILFULL] LLAMA_FN_L19_TTFT_TAILFULL=<n>: the narrow last part of a split prompt (it asks for outputs, the
+    // batch before it was wider than SMALL, had none and fewer than n tokens) stays FULL; the answer's first step returns to
+    // SMALL, as after an unsplit prompt. With LLAMA_FN_L19_TTFT_CKPT_TAIL the server splits the last 4 tokens of short turns
+    // too, and their SMALL switch (~0.25 s) would otherwise move in front of the first token. 0 = off
+    uint32_t l19_tailfull  = 0;
+    uint32_t cbuf_prev_n   = 0;     // the previous batch of this context: tokens, and whether it asked for outputs
+    bool     cbuf_prev_out = true;
+    uint64_t cbuf_n_tailfull = 0;
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a
