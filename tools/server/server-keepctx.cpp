@@ -1,5 +1,6 @@
 #include "server-keepctx.h"
 #include "server-common.h"
+#include "server-convstore.h" // [TAG_FN_L19_CONVSTORE]
 
 #include "llama.h"
 #include "log.h"
@@ -7,6 +8,7 @@
 #include "../../src/llama-ext.h" // [TAG_FN_L18_KEEPCTX] llama_state_seq_write_stream_ext
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -156,7 +158,9 @@ private:
 
 class kc_pipe {
 public:
-    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read) : file(file), writing(writing), n_read(kc_round_up(n_read)) {
+    // [TAG_FN_L19_CONVSTORE_SPILL] base: where in the file the pipe starts (a multiple of KC_ALIGN)
+    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0) :
+            file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
 #if defined(_WIN32)
         mem = (uint8_t *) VirtualAlloc(nullptr, KC_NBUF*KC_BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
@@ -280,7 +284,7 @@ private:
     }
 
     void run_write() {
-        uint64_t off = 0;
+        uint64_t off = base;
         while (true) {
             int b = -1;
             {
@@ -322,7 +326,7 @@ private:
                 q_free.pop_front();
             }
             const size_t n  = (size_t) std::min<uint64_t>(KC_BLOCK, n_read - off);
-            const bool   ok = file.pread(mem + (size_t) b*KC_BLOCK, n, off);
+            const bool   ok = file.pread(mem + (size_t) b*KC_BLOCK, n, base + off);
             off += n;
             {
                 std::lock_guard<std::mutex> lk(mu);
@@ -349,6 +353,7 @@ private:
     server_keepctx_file & file;
     const bool            writing;
     const uint64_t        n_read;
+    const uint64_t        base;
 
     uint8_t * mem = nullptr;
     size_t    len[KC_NBUF] = {};
@@ -405,7 +410,61 @@ server_keepctx::server_keepctx(const server_keepctx_params & params) : params_(p
     }
 }
 
-server_keepctx::~server_keepctx() = default;
+server_keepctx::~server_keepctx() {
+    // [TAG_FN_L19_CONVSTORE_SPILL] the queued writes finish first
+    {
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        wr_stop_ = true;
+    }
+    wr_cv_.notify_all();
+    if (wr_th_.joinable()) {
+        wr_th_.join();
+    }
+}
+
+void server_keepctx::wr_run() {
+    while (true) {
+        std::unique_ptr<spill_job> job;
+        {
+            std::unique_lock<std::mutex> lk(wr_mu_);
+            wr_cv_.wait(lk, [&]() { return wr_stop_ || !wr_q_.empty(); });
+            if (wr_q_.empty()) {
+                return;
+            }
+            job = std::move(wr_q_.front());
+            wr_q_.pop_front();
+        }
+        wr_job(*job);
+        // the target bytes' buffer serves the next checkpoint (take_spare); one at most, it is RAM beside the model
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        if (spare_.empty() && !job->tgt.empty()) {
+            spare_.push_back(std::move(job->tgt));
+        }
+    }
+}
+
+void server_keepctx::wr_job(spill_job & job) {
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t n_written = 0;
+    uint64_t hash      = 0;
+    bool     ok        = true;
+    {
+        kc_pipe pipe(*job.file, true, 0, 0);
+        pipe.hashing = job.verify;
+        ok = pipe.put(job.tgt.data(), job.tgt.size()) && pipe.put(job.dft.data(), job.dft.size()) &&
+             pipe.put(job.spec.data(), job.spec.size());
+        ok = pipe.finish(n_written) && ok;
+        hash = pipe.hash;
+    }
+    ok = ok && n_written == job.tgt.size() + job.dft.size() + job.spec.size();
+    {
+        std::lock_guard<std::mutex> lk(job.st->mu);
+        job.st->done      = ok ? 1 : -1;
+        job.st->hash_data = hash;
+        job.st->ms        = kc_ms_since(t0);
+    }
+    job.st->cv.notify_all();
+}
 
 // write a pattern in pieces of awkward sizes through the pipe, read it back in other pieces, compare
 bool server_keepctx::selftest(std::string & err) {
@@ -457,22 +516,291 @@ bool server_keepctx::selftest(std::string & err) {
         err = "data differs";
         return false;
     }
+
+    // [TAG_FN_L19_CONVSTORE_SPILL] a checkpoint through the writer thread and back, then written at once and back
+    for (int async = 1; async >= 0; --async) {
+        common_prompt_checkpoint c;
+        c.n_tokens = 1234;
+        c.pos_min  = 1233;
+        c.pos_max  = 1233;
+        c.data_tgt .resize(KC_BLOCK + 12345);
+        c.data_dft .resize(4097);
+        c.data_spec.resize(17);
+        for (size_t i = 0; i < c.data_tgt.size(); ++i) {
+            c.data_tgt[i] = (uint8_t) ((i * 2654435761u) >> 11);
+        }
+        for (size_t i = 0; i < c.data_dft.size(); ++i) {
+            c.data_dft[i] = (uint8_t) (i * 7 + async);
+        }
+        for (size_t i = 0; i < c.data_spec.size(); ++i) {
+            c.data_spec[i] = (uint8_t) (255 - i);
+        }
+        const auto rt = c.data_tgt;
+        const auto rd = c.data_dft;
+        const auto rs = c.data_spec;
+        server_keepctx_spill sp;
+        std::string info;
+        if (!spill_write(sp, c, 42, async != 0, info) || sp.list.size() != 1) {
+            err = "spill write: " + info;
+            return false;
+        }
+        common_prompt_checkpoint r;
+        if (!spill_read(sp.list[0], r, info)) {
+            err = "spill read: " + info;
+            return false;
+        }
+        if (r.data_tgt != rt || r.data_dft != rd || r.data_spec != rs || r.n_tokens != 1234 || r.pos_max != 1233 ||
+            (!async && c.data_tgt != rt)) {
+            err = async ? "spilled checkpoint differs (writer thread)" : "spilled checkpoint differs (at once)";
+            return false;
+        }
+    }
     return true;
 }
 
 uint64_t server_keepctx::n_bytes() const {
     uint64_t n = 0;
     for (const auto & e : entries) {
-        n += e.n_bytes;
+        n += e.n_bytes_all();
     }
     return n;
 }
 
-int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep) {
+uint64_t server_keepctx_entry::n_bytes_all() const {
+    uint64_t n = n_bytes;
+    for (const auto & s : spilled) {
+        n += s.bytes();
+    }
+    return n;
+}
+
+// [TAG_FN_L19_CONVSTORE_SPILL] a running hash of the tokens (media chunks by their id and size). at: positions in
+// ascending order; out[k] = the hash of tokens [0, at[k]), 0 when it cannot be computed (past the end, a position inside
+// a media chunk)
+static void kc_prefix_hashes(const server_tokens & tokens, const std::vector<int64_t> & at, std::vector<uint64_t> & out) {
+    const llama_tokens & t = tokens.get_tokens();
+    out.assign(at.size(), 0);
+    uint64_t h = KC_HASH_SEED;
+    size_t   i = 0;
+    size_t   k = 0;
+    try {
+        while (k < at.size()) {
+            if (at[k] < 0 || (size_t) at[k] > t.size()) {
+                k++; // stays 0
+                continue;
+            }
+            if ((size_t) at[k] == i) {
+                out[k++] = h == 0 ? 1 : h;
+                continue;
+            }
+            if ((size_t) at[k] < i) {
+                k++; // inside a media chunk
+                continue;
+            }
+            if (t[i] != LLAMA_TOKEN_NULL) {
+                h = (h ^ (uint32_t) t[i]) * 0x100000001b3ull;
+                ++i;
+                continue;
+            }
+            const auto & chunk = tokens.find_chunk(i);
+            if (!chunk) {
+                return;
+            }
+            const char * id = mtmd_input_chunk_get_id(chunk.get());
+            const size_t nt = mtmd_input_chunk_get_n_tokens(chunk.get());
+            if (nt == 0) {
+                return;
+            }
+            h = kc_hash(h, id ? id : "", id ? strlen(id) : 0);
+            h = (h ^ (uint64_t) nt) * 0x100000001b3ull;
+            i += nt;
+        }
+    } catch (const std::exception &) {
+        for (; k < at.size(); ++k) {
+            out[k] = 0;
+        }
+    }
+}
+
+uint64_t keepctx_prefix_hash(const server_tokens & tokens, size_t n) {
+    std::vector<uint64_t> out;
+    kc_prefix_hashes(tokens, { (int64_t) n }, out);
+    return out[0];
+}
+
+int keepctx_spill_validate(const server_tokens & tokens, std::vector<server_keepctx_spilled> & list) {
+    if (list.empty()) {
+        return 0;
+    }
+    std::vector<int64_t> at;
+    for (const auto & s : list) {
+        at.push_back(s.n_tokens);
+    }
+    std::vector<uint64_t> h;
+    kc_prefix_hashes(tokens, at, h);
+    int n_drop = 0;
+    std::vector<server_keepctx_spilled> keep;
+    for (size_t k = 0; k < list.size(); ++k) {
+        if (h[k] != 0 && h[k] == list[k].hash) {
+            keep.push_back(std::move(list[k]));
+        } else {
+            n_drop++;
+        }
+    }
+    list = std::move(keep);
+    return n_drop;
+}
+
+void server_keepctx_spill::keep_first(int64_t n_keep) {
+    while (!list.empty() && list.back().n_tokens > n_keep) {
+        list.pop_back();
+    }
+}
+
+bool server_keepctx::spill_write(server_keepctx_spill & spill, common_prompt_checkpoint & c, uint64_t prefix_hash,
+                                 bool async, std::string & info) {
+    const auto t0 = std::chrono::steady_clock::now();
+    static std::atomic<uint64_t> n_spill_files{0};
+    const auto path = std::filesystem::path(params_.dir) /
+            string_format("keepctx-%lu-spill%llu.kc", kc_pid(), (unsigned long long) ++n_spill_files);
+    std::string err;
+    auto file = server_keepctx_file::create(path, err);
+    if (!file) {
+        info = "cannot create '" + path.string() + "': " + err;
+        return false;
+    }
+    server_keepctx_spilled s;
+    s.n_tokens  = c.n_tokens;
+    s.id_task   = c.id_task;
+    s.pos_min   = c.pos_min;
+    s.pos_max   = c.pos_max;
+    s.size_tgt  = c.data_tgt.size();
+    s.size_dft  = c.data_dft.size();
+    s.size_spec = c.data_spec.size();
+    s.off       = 0;
+    s.hash      = prefix_hash;
+    s.file      = file;
+    s.st        = std::make_shared<server_keepctx_spill_state>();
+    const uint64_t nb = s.bytes();
+    auto job = std::make_unique<spill_job>();
+    job->file   = file;
+    job->st     = s.st;
+    job->tgt    = std::move(c.data_tgt);
+    job->dft    = std::move(c.data_dft);
+    job->spec   = std::move(c.data_spec);
+    job->verify = params_.verify;
+    bool queued = false;
+    if (async) {
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        if (wr_q_.size() < 4) { // more pending: the disk is behind, write this one here
+            if (!wr_th_.joinable()) {
+                wr_th_ = std::thread([this]() { wr_run(); });
+            }
+            wr_q_.push_back(std::move(job));
+            queued = true;
+        }
+    }
+    if (queued) {
+        wr_cv_.notify_all();
+    } else {
+        wr_job(*job);
+        c.data_tgt  = std::move(job->tgt);
+        c.data_dft  = std::move(job->dft);
+        c.data_spec = std::move(job->spec);
+        if (s.st->done < 0) {
+            info = string_format("writing a checkpoint at n_tokens = %lld failed", (long long) c.n_tokens);
+            return false;
+        }
+    }
+    spill.n_written++;
+    spill.bytes_written += s.bytes();
+    auto pos = std::upper_bound(spill.list.begin(), spill.list.end(), s.n_tokens,
+                                [](int64_t n, const server_keepctx_spilled & x) { return n < x.n_tokens; });
+    spill.list.insert(pos, std::move(s));
+    const double ms = kc_ms_since(t0);
+    info = string_format("%.1f MiB %s in %.1f ms", nb/1048576.0, queued ? "queued" : "written", ms);
+    return true;
+}
+
+void server_keepctx::take_spare(std::vector<uint8_t> & buf) {
+    std::lock_guard<std::mutex> lk(wr_mu_);
+    if (!spare_.empty()) {
+        buf = std::move(spare_.back());
+        spare_.pop_back();
+    }
+}
+
+bool server_keepctx::spill_read(const server_keepctx_spilled & s, common_prompt_checkpoint & c, std::string & info) {
+    if (!s.file || !s.st) {
+        info = "no file";
+        return false;
+    }
+    uint64_t hash_data = 0;
+    {
+        std::unique_lock<std::mutex> lk(s.st->mu);
+        s.st->cv.wait(lk, [&]() { return s.st->done != 0; });
+        if (s.st->done < 0) {
+            info = "its write failed";
+            return false;
+        }
+        hash_data = s.st->hash_data;
+    }
+    c.n_tokens = s.n_tokens;
+    c.id_task  = s.id_task;
+    c.pos_min  = s.pos_min;
+    c.pos_max  = s.pos_max;
+    c.data_tgt .resize(s.size_tgt);
+    c.data_dft .resize(s.size_dft);
+    c.data_spec.resize(s.size_spec);
+    kc_pipe pipe(*s.file, false, s.bytes(), s.off);
+    if (!(pipe.get(c.data_tgt.data(), c.data_tgt.size()) && pipe.get(c.data_dft.data(), c.data_dft.size()) &&
+          pipe.get(c.data_spec.data(), c.data_spec.size()))) {
+        info = "read failed";
+        return false;
+    }
+    if (params_.verify) {
+        uint64_t h = KC_HASH_SEED;
+        h = kc_hash(h, c.data_tgt.data(), c.data_tgt.size());
+        h = kc_hash(h, c.data_dft.data(), c.data_dft.size());
+        h = kc_hash(h, c.data_spec.data(), c.data_spec.size());
+        info = h == hash_data ? "verify: identical" : "verify: DIFFERS";
+    }
+    return true;
+}
+
+// [TAG_FN_L19_CONVSTORE_EVICT]
+bool server_keepctx::evict_one(const server_keepctx_entry * keep) {
+    auto victim = entries.end();
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (&*it == keep) {
+            continue;
+        }
+        if (!params_.gdsf) {
+            victim = it; // least recently stored first
+            break;
+        }
+        if (victim == entries.end() || it->value < victim->value) {
+            victim = it;
+        }
+    }
+    if (victim == entries.end()) {
+        return false;
+    }
+    if (params_.gdsf) {
+        gdsf_L_ = std::max(gdsf_L_, victim->value);
+        n_evicted_gdsf++;
+    }
+    entries.erase(victim);
+    return true;
+}
+
+int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep, int32_t tol) {
     int n = 0;
     for (auto it = entries.begin(); it != entries.end();) {
-        if (&*it != keep && it->prompt.tokens.size() <= tokens.size() &&
-            it->prompt.tokens.get_common_prefix(tokens) == it->prompt.tokens.size()) {
+        const size_t n_e = it->prompt.tokens.size();
+        // [TAG_FN_L19_CONVSTORE] superseded: shares all but its last tol tokens
+        const bool sup = tol > 0 && n_e > (size_t) tol && it->prompt.tokens.get_common_prefix(tokens) + (size_t) tol > n_e;
+        if (&*it != keep && (sup || (n_e <= tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == n_e))) {
             it = entries.erase(it);
             n++;
         } else {
@@ -484,7 +812,8 @@ int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_
 
 bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
                           common_speculative * spec, llama_seq_id seq_id, const server_keepctx_entry * keep,
-                          std::string & info) {
+                          std::string & info, const server_keepctx_spill * spill, const server_keepctx_conv * conv,
+                          int32_t supersede_tol) {
     const auto t0 = std::chrono::steady_clock::now();
 
     server_keepctx_entry e;
@@ -499,23 +828,46 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     for (const auto & c : prompt.checkpoints) {
         need += c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
     }
+    // [TAG_FN_L19_CONVSTORE_SPILL] the conversation's checkpoints on disk go with it (the same file, nothing written),
+    // except the ones the ring holds as well
+    uint64_t need_spilled = 0;
+    if (spill) {
+        for (const auto & sp : spill->list) {
+            if (sp.n_tokens > prompt.n_tokens()) {
+                continue;
+            }
+            bool in_ring = false;
+            for (const auto & c : prompt.checkpoints) {
+                in_ring = in_ring || c.n_tokens == sp.n_tokens;
+            }
+            if (!in_ring) {
+                e.spilled.push_back(sp);
+            }
+        }
+        keepctx_spill_validate(prompt.tokens, e.spilled);
+        for (const auto & sp : e.spilled) {
+            need_spilled += sp.bytes();
+        }
+    }
+    if (conv) {
+        e.conv = *conv;
+    }
+    if (need + need_spilled > params_.budget) {
+        e.spilled.clear(); // the state and the ring's checkpoints first
+        need_spilled = 0;
+    }
     if (need > params_.budget) {
         info = string_format("%.1f MiB is more than the store budget of %.1f MiB", need/1048576.0, params_.budget/1048576.0);
         return false;
     }
 
-    // room: older states of this conversation, then the oldest entries, never `keep`
-    int n_evicted = drop_prefixes_of(prompt.tokens, keep);
-    for (auto it = entries.begin(); it != entries.end() &&
-            (n_bytes() + need > params_.budget || (int32_t) entries.size() >= params_.n_max);) {
-        if (&*it == keep) {
-            ++it;
-            continue;
-        }
-        it = entries.erase(it);
+    // room: older states of this conversation, then the oldest entries (or [TAG_FN_L19_CONVSTORE_EVICT] the lowest
+    // value per byte), never `keep`
+    int n_evicted = drop_prefixes_of(prompt.tokens, keep, supersede_tol);
+    while ((n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) && evict_one(keep)) {
         n_evicted++;
     }
-    if (n_bytes() + need > params_.budget || (int32_t) entries.size() >= params_.n_max) {
+    if (n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) {
         info = string_format("no room beside the conversation the next prompt restores (%.1f MiB needed)", need/1048576.0);
         return false;
     }
@@ -578,17 +930,26 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         e.prompt.checkpoints.push_back(std::move(m));
     }
 
+    // [TAG_FN_L19_CONVSTORE_EVICT]
+    e.value = convstore_gdsf(gdsf_L_, e.conv.hits, prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
+                             params_.budget / (uint64_t) std::max(1, params_.n_max));
+
     const double ms = kc_ms_since(t0);
     info = string_format("%d tokens, %u checkpoints, %.1f MiB (target %.1f, draft %.1f) in %.0f ms = %.2f GB/s, %d older evicted, "
                          "store %zu conversations / %.1f MiB", prompt.n_tokens(), (unsigned) prompt.checkpoints.size(),
                          need/1048576.0, e.size_tgt/1048576.0, e.size_dft/1048576.0, ms, need/(ms*1e6), n_evicted,
-                         entries.size() + 1, (n_bytes() + need)/1048576.0);
+                         entries.size() + 1, (n_bytes() + e.n_bytes_all())/1048576.0);
+    if (!e.spilled.empty() || params_.gdsf) {
+        info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk (%.1f MiB), restores %lld, value %.0f, system block %d",
+                              e.spilled.size(), need_spilled/1048576.0, (long long) e.conv.hits, e.value, (int) e.conv.sys_end);
+    }
     entries.push_back(std::move(e));
     return true;
 }
 
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
-                          llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info) {
+                          llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
+                          server_keepctx_spill * spill, server_keepctx_conv * conv) {
     const auto t0 = std::chrono::steady_clock::now();
 
     server_keepctx_entry e_own;
@@ -648,6 +1009,20 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     prompt.tokens      = keep ? e.prompt.tokens.clone() : std::move(e.prompt.tokens);
     prompt.checkpoints = std::move(ckpts);
 
+    // [TAG_FN_L19_CONVSTORE] the checkpoints on disk go to the slot (the files are shared), the restore counts
+    if (spill) {
+        spill->list = e.spilled;
+    }
+    if (conv) {
+        *conv = e.conv;
+        conv->hits++;
+    }
+    if (keep) {
+        e.conv.hits++;
+        e.value = convstore_gdsf(gdsf_L_, e.conv.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
+                                 params_.budget / (uint64_t) std::max(1, params_.n_max));
+    }
+
     const double ms = kc_ms_since(t0);
 
     // [TAG_FN_L18_KEEPCTX_HOT] the next pass moves the set back toward this conversation's experts
@@ -675,6 +1050,9 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
                          prompt.n_tokens(), prompt.checkpoints.size(), e.n_bytes/1048576.0, ms, e.n_bytes/(ms*1e6),
                          keep ? "kept in the store (the prompt continues a part of it)" : "taken from the store",
                          entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
+    if (!e.spilled.empty()) {
+        info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk", e.spilled.size());
+    }
     if (keep) {
         entries.splice(entries.end(), entries, it); // the most recently used
     }
