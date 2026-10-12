@@ -2292,8 +2292,11 @@ void llama_context::fn_ready() {
     step_join();
     const int64_t t0 = ggml_time_us();
     moe_hot_waits = std::max<uint32_t>(moe_hot_waits, 1); // no other context comes: fit now
+    llama_fn_thread_name("decode"); // [TAG_FN_L18_FIRSTANS_STALL] the caller's thread runs the decodes later
+    llama_fn_stall_op(true);
     moe_hot_fit_try();
     if (moe_hot_pending) {
+        llama_fn_stall_op(false);
         LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set fit did not run now: the first decode sizes it\n", __func__);
         return;
     }
@@ -2306,7 +2309,8 @@ void llama_context::fn_ready() {
         LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the reserve after the fit failed (%s): the first decode reserves\n",
                 __func__, err.what());
     }
-    LLAMA_LOG_INFO("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set was sized before the first request: %.0f ms (fit + reserve%s)\n",
+    llama_fn_stall_op(false);
+    LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set was sized before the first request: %.0f ms (fit + reserve%s)\n",
             __func__, (ggml_time_us() - t0)/1000.0, reserved ? "" : " failed");
 }
 

@@ -22,6 +22,9 @@ void llama_fn_stall_mark(const char * what, int64_t a = 0, int64_t b = 0);
 // the last window of samples and marks to the log
 void llama_fn_stall_dump(const char * why);
 
+// a long operation that is not a decode (the hot set fit at load) begins / ends: dumps while it runs, as for a decode
+void llama_fn_stall_op(bool begin);
+
 // a decode begins (returns its start time in us, 0 when off) / ends (dumps if a small one was slow)
 int64_t llama_fn_stall_decode_begin(int n_tokens, int n_outputs);
 void    llama_fn_stall_decode_end(int64_t t0_us, int n_tokens);

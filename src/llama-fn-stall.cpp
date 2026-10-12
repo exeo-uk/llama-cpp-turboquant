@@ -26,6 +26,7 @@
 #        define WIN32_LEAN_AND_MEAN
 #    endif
 #    include <windows.h>
+#    include <dbghelp.h>
 #endif
 
 namespace {
@@ -71,6 +72,8 @@ struct st_sample {
     size_t   warm_mark = 0;
     std::vector<st_thr> thr;
     std::vector<st_thr> sys; // the System process's threads that run or are ready now
+    // the watched threads' instruction pointer and the code addresses found in the top of their stack
+    std::vector<std::pair<uint32_t, std::vector<uint64_t>>> pcs;
 };
 
 // NtQuerySystemInformation(SystemProcessInformation) records (x64 layout)
@@ -167,6 +170,11 @@ struct st_state {
 
     std::thread       th;
     std::atomic<bool> stop{false};
+
+    // threads whose code location is sampled (registered by name: the decode thread, the bridge executor)
+    std::mutex                                     watch_mtx;
+    std::vector<std::pair<uint32_t, HANDLE>>       watch;
+    bool                                           sym_init = false;
 
     // the decode that runs now (0: none) and when the watchdog dumped it last
     std::atomic<int64_t> dec_t0{0};
@@ -277,6 +285,38 @@ st_state * st_get() {
                         smp.avail = ms.ullAvailPhys;
                     }
                     smp.warm = llama_fn_warm_state(&smp.warm_mark);
+                    {
+                        // the watched threads: suspended only for GetThreadContext and a read of 32 stack slots (no lock
+                        // is taken while one is suspended)
+                        std::lock_guard<std::mutex> wlk(s->watch_mtx);
+                        for (const auto & wt : s->watch) {
+                            CONTEXT ctx;
+                            memset(&ctx, 0, sizeof(ctx));
+                            ctx.ContextFlags = CONTEXT_CONTROL;
+                            uint64_t slots[32];
+                            int n_slots = 0;
+                            if (SuspendThread(wt.second) == (DWORD) -1) {
+                                continue;
+                            }
+                            const bool ok = GetThreadContext(wt.second, &ctx) != 0;
+                            if (ok && ctx.Rsp != 0) {
+                                SIZE_T got = 0;
+                                if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID) ctx.Rsp, slots, sizeof(slots), &got)) {
+                                    n_slots = (int) (got/sizeof(uint64_t));
+                                }
+                            }
+                            ResumeThread(wt.second);
+                            if (!ok) {
+                                continue;
+                            }
+                            std::vector<uint64_t> v;
+                            v.push_back((uint64_t) ctx.Rip);
+                            for (int i = 0; i < n_slots; ++i) {
+                                v.push_back(slots[i]);
+                            }
+                            smp.pcs.push_back({ wt.first, std::move(v) });
+                        }
+                    }
                     std::lock_guard<std::mutex> lk(s->mtx);
                     s->ring[s->n_samples % s->ring.size()] = std::move(smp);
                     s->n_samples++;
@@ -286,7 +326,11 @@ st_state * st_get() {
                 if (d0 > 0 && t - d0 > (int64_t) s->win_ms*1000 && t - s->dec_dump_us > (int64_t) s->win_ms*1000) {
                     s->dec_dump_us = t;
                     char why[96];
-                    snprintf(why, sizeof(why), "a %d-token decode has run for %.0f ms", s->dec_n.load(), (t - d0)/1000.0);
+                    if (s->dec_n.load() < 0) {
+                        snprintf(why, sizeof(why), "an operation (the hot set fit) has run for %.0f ms", (t - d0)/1000.0);
+                    } else {
+                        snprintf(why, sizeof(why), "a %d-token decode has run for %.0f ms", s->dec_n.load(), (t - d0)/1000.0);
+                    }
                     llama_fn_stall_dump(why);
                 }
                 const int64_t el = st_now_us() - t;
@@ -325,6 +369,56 @@ char st_letter(uint8_t state, uint8_t wait) {
         case 39: return 'Y'; // WrPhysicalFault
         default: return '?';
     }
+}
+
+// module!export+offset of a code address ("" when no module holds it)
+std::string st_where(st_state * s, uint64_t a) {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR) a, &mod) || !mod) {
+        return std::string();
+    }
+    wchar_t wn[MAX_PATH];
+    const DWORD l = GetModuleFileNameW(mod, wn, MAX_PATH);
+    std::string name;
+    for (DWORD i = 0; i < l; ++i) {
+        name.push_back(wn[i] < 128 ? (char) wn[i] : '?');
+    }
+    const size_t sl = name.find_last_of("\\/");
+    if (sl != std::string::npos) {
+        name = name.substr(sl + 1);
+    }
+    using sym_opt_t  = DWORD (WINAPI *)(DWORD);
+    using sym_init_t = BOOL (WINAPI *)(HANDLE, PCSTR, BOOL);
+    using sym_from_t = BOOL (WINAPI *)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    static sym_from_t sym_from = nullptr;
+    if (!s->sym_init) {
+        s->sym_init = true; // one try
+        HMODULE dh = LoadLibraryW(L"dbghelp.dll");
+        auto opt  = dh ? (sym_opt_t)  (void *) GetProcAddress(dh, "SymSetOptions") : nullptr;
+        auto init = dh ? (sym_init_t) (void *) GetProcAddress(dh, "SymInitialize") : nullptr;
+        sym_from  = dh ? (sym_from_t) (void *) GetProcAddress(dh, "SymFromAddr") : nullptr;
+        if (opt && init && sym_from) {
+            opt(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            if (!init(GetCurrentProcess(), nullptr, TRUE)) {
+                sym_from = nullptr;
+            }
+        } else {
+            sym_from = nullptr;
+        }
+    }
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    auto * si = (SYMBOL_INFO *) buf;
+    memset(buf, 0, sizeof(buf));
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen   = 255;
+    DWORD64 disp = 0;
+    char tmp[400];
+    if (sym_from && sym_from(GetCurrentProcess(), (DWORD64) a, &disp, si)) {
+        snprintf(tmp, sizeof(tmp), "%s!%s+0x%llx", name.c_str(), si->Name, (unsigned long long) disp);
+    } else {
+        snprintf(tmp, sizeof(tmp), "%s+0x%llx", name.c_str(), (unsigned long long) (a - (uint64_t) mod));
+    }
+    return tmp;
 }
 
 // "aff <mask> ideal <cpu>" of a thread of this process ("" when it cannot be read)
@@ -414,6 +508,18 @@ void llama_fn_thread_name(const char * name, int k) {
     }
     w[i] = 0;
     s->set_desc(GetCurrentThread(), w);
+    if (strcmp(name, "decode") == 0 || strcmp(name, "bridge-exec") == 0) {
+        std::lock_guard<std::mutex> lk(s->watch_mtx);
+        const uint32_t tid = (uint32_t) GetCurrentThreadId();
+        bool known = false;
+        for (const auto & wt : s->watch) {
+            known = known || wt.first == tid;
+        }
+        HANDLE h = known ? nullptr : OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+        if (h) {
+            s->watch.push_back({ tid, h });
+        }
+    }
 }
 
 void llama_fn_stall_mark(const char * what, int64_t a, int64_t b) {
@@ -593,6 +699,37 @@ void llama_fn_stall_dump(const char * why) {
         }
         LLAMA_LOG_WARN("fn_stall: System threads running (R) / ready (r) in the most of %zu samples: %s\n", smp.size(), line.c_str());
     }
+    // the watched threads' code locations: the most frequent instruction pointers, each with the first code addresses of
+    // its stack (a scan, not an unwind: a slot may be stale)
+    {
+        std::unordered_map<uint32_t, std::unordered_map<std::string, int>> where;
+        for (const auto & x : smp) {
+            for (const auto & pc : x.pcs) {
+                std::string k = st_where(s, pc.second[0]);
+                if (k.empty()) {
+                    k = "?";
+                }
+                int n_code = 0;
+                for (size_t i = 1; i < pc.second.size() && n_code < 4; ++i) {
+                    const std::string w2 = st_where(s, pc.second[i]);
+                    if (!w2.empty()) {
+                        k += " < " + w2;
+                        n_code++;
+                    }
+                }
+                where[pc.first][k]++;
+            }
+        }
+        for (auto & tw : where) {
+            std::vector<std::pair<std::string, int>> v(tw.second.begin(), tw.second.end());
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+            const std::string nm = st_name(s, tw.first);
+            for (size_t i = 0; i < v.size() && i < 4; ++i) {
+                LLAMA_LOG_WARN("fn_stall: %s %u at x%d: %s\n", nm.empty() ? "?" : nm.c_str(), tw.first, v[i].second,
+                        v[i].first.c_str());
+            }
+        }
+    }
     for (const auto & m : mk) {
         const std::string nm = st_name(s, std::get<1>(m));
         LLAMA_LOG_WARN("fn_stall: mark %+8.1f ms [%s %u] %s %lld %lld\n", (std::get<0>(m) - now)/1000.0,
@@ -600,6 +737,15 @@ void llama_fn_stall_dump(const char * why) {
                 (long long) std::get<4>(m));
     }
     LLAMA_LOG_WARN("fn_stall: ===== end of dump %llu =====\n", (unsigned long long) s->n_dumps);
+}
+
+void llama_fn_stall_op(bool begin) {
+    st_state * s = st_get();
+    if (!s) {
+        return;
+    }
+    s->dec_n.store(-1);
+    s->dec_t0.store(begin ? st_now_us() : 0, std::memory_order_release);
 }
 
 int64_t llama_fn_stall_decode_begin(int n_tokens, int n_outputs) {
@@ -643,6 +789,7 @@ void llama_fn_stall_decode_end(int64_t t0_us, int n_tokens) {
 #else
 
 bool    llama_fn_stall_on() { return false; }
+void    llama_fn_stall_op(bool) {}
 void    llama_fn_thread_name(const char *, int) {}
 void    llama_fn_stall_mark(const char *, int64_t, int64_t) {}
 void    llama_fn_stall_dump(const char *) {}
