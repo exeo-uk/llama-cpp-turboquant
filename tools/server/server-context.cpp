@@ -3494,6 +3494,9 @@ private:
             if (lose_most || lose_conv || n_cur == 0) {
                 slot.kc_conv.hits = 0; // another conversation
             }
+            if (slot.kc_conv.n_prompt <= 8 || lcp_cur < slot.kc_conv.n_prompt - 8) {
+                slot.kc_conv.rerender = false; // not a continuation: its client is not known yet
+            }
             detect_rerender(lcp_cur, slot.kc_conv);
         }
 
