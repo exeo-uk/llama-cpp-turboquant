@@ -236,8 +236,8 @@ struct common_mtp_adapt {
         if (W < 1 || W > W_MAX || !(us > 0.0)) {
             return false;
         }
-        const double ref = t_verify(W);
-        if (tvn[W - 1] + tvn[0] >= 8 && us > outlier*ref) {
+        // only against the width's own estimate: a prior far from this machine's step time must not lock samples out
+        if (tvn[W - 1] >= nmin && us > outlier*tv[W - 1]) {
             n_drop++;
             return false;
         }
