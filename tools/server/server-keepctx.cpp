@@ -577,15 +577,17 @@ uint64_t server_keepctx_entry::n_bytes_all() const {
 // [TAG_FN_L19_CONVSTORE_SPILL] a running hash of the tokens (media chunks by their id and size). at: positions in
 // ascending order; out[k] = the hash of tokens [0, at[k]), 0 when it cannot be computed (past the end, a position inside
 // a media chunk)
+// The tokens are read one by one (operator[]): get_tokens() asserts on a server with a multimodal projector (vision on,
+// the owner's command), FAULT 2026-10-12 19:10:14
 static void kc_prefix_hashes(const server_tokens & tokens, const std::vector<int64_t> & at, std::vector<uint64_t> & out) {
-    const llama_tokens & t = tokens.get_tokens();
+    const size_t n_tok = tokens.size();
     out.assign(at.size(), 0);
     uint64_t h = KC_HASH_SEED;
     size_t   i = 0;
     size_t   k = 0;
     try {
         while (k < at.size()) {
-            if (at[k] < 0 || (size_t) at[k] > t.size()) {
+            if (at[k] < 0 || (size_t) at[k] > n_tok) {
                 k++; // stays 0
                 continue;
             }
@@ -597,8 +599,8 @@ static void kc_prefix_hashes(const server_tokens & tokens, const std::vector<int
                 k++; // inside a media chunk
                 continue;
             }
-            if (t[i] != LLAMA_TOKEN_NULL) {
-                h = (h ^ (uint32_t) t[i]) * 0x100000001b3ull;
+            if (tokens[i] != LLAMA_TOKEN_NULL) {
+                h = (h ^ (uint32_t) tokens[i]) * 0x100000001b3ull;
                 ++i;
                 continue;
             }
