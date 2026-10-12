@@ -3856,6 +3856,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ad.init_env();
                 ad.kmax = std::min<int>(common_mtp_adapt::K_MAX, std::max<int>(1, (int) llama_fn_l4_int(llama_get_model(ctx_dft),
                         "LLAMA_FN_L19_DRAFT_ADAPT_KMAX", ad.kmax)));
+                // the cost cut from the qwen4exp profile as well (init_env reads only the environment)
+                ad.cut  = std::max<int>(0, (int) llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT_CUT", ad.cut));
                 // the ring the target rolls back must cover kmax drafts: n_rs_seq, which the MoE bridge raised by one (it
                 // takes graphs of at most n_rs_seq rows, llama-context.cpp [TAG_FN_R1_BRIDGE_RB])
                 const char * eb  = getenv("LLAMA_MOE_BRIDGE");
@@ -5997,6 +5999,15 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
+
+        // [TAG_FN_L19_DRAFT_F16KV] the switch from the qwen4exp profile as well (common_base_params_to_speculative, which
+        // made the q8_0 swap, sees only the environment: the profile applies when the target model loads, after it)
+        if (getenv("LLAMA_FN_L19_DRAFT_F16KV") == nullptr && cparams.type_k == GGML_TYPE_Q8_0 &&
+                cparams.type_v == GGML_TYPE_Q8_0 && llama_fn_l4_int(model_tgt, "LLAMA_FN_L19_DRAFT_F16KV", 0) > 0) {
+            cparams.type_k = GGML_TYPE_F16;
+            cparams.type_v = GGML_TYPE_F16;
+            LOG_INF("%s: [TAG_FN_L19_DRAFT_F16KV] MTP draft KV in f16 (qwen4exp profile)\n", __func__);
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {
