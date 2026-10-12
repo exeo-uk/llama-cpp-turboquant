@@ -56,6 +56,15 @@ struct server_keepctx_spilled {
     uint64_t bytes() const { return size_tgt + size_dft + size_spec; }
 };
 
+// [TAG_FN_L19_CONVSTORE] what the store keeps about a conversation besides its state
+struct server_keepctx_conv {
+    int64_t hits     = 0;     // restores it served
+    int32_t sys_end  = -1;    // the end of its system + tools block (its first user message, -1 unknown)
+    int32_t n_prompt = -1;    // the length of its last prompt (before the answer, -1 unknown)
+    bool    rerender = false; // [TAG_FN_L19_CONVSTORE_OPENER] its client sent the last answer back re-rendered (the
+                              // reasoning dropped): the next prompt left the previous one inside its last tokens
+};
+
 struct server_keepctx_entry {
     uint64_t id = 0;
 
@@ -75,12 +84,11 @@ struct server_keepctx_entry {
 
     std::shared_ptr<server_keepctx_file> file;
 
-    // [TAG_FN_L19_CONVSTORE] the conversation's checkpoints on disk (beside the ring's, in file), its restores so far,
-    // its eviction value and the end of its system + tools block (-1 unknown)
+    // [TAG_FN_L19_CONVSTORE] the conversation's checkpoints on disk (beside the ring's, in file), what is known about it
+    // and its eviction value
     std::vector<server_keepctx_spilled> spilled;
-    int64_t hits    = 0;
-    double  value   = 0.0;
-    int32_t sys_end = -1;
+    server_keepctx_conv                 conv;
+    double                              value = 0.0;
 
     uint64_t n_bytes_all() const;       // n_bytes + the spilled checkpoints' bytes
 };
@@ -91,16 +99,15 @@ uint64_t keepctx_prefix_hash(const server_tokens & tokens, size_t n);
 // drop the spilled checkpoints (ascending n_tokens) whose tokens in front differ from tokens [0, n_tokens); the number dropped
 int keepctx_spill_validate(const server_tokens & tokens, std::vector<server_keepctx_spilled> & list);
 
-// [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints of a slot's conversation that its ring dropped, written to a file of the
-// slot. They are valid only while the slot holds the same tokens in front of them.
+// [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints of a slot's conversation that its ring dropped, each in its own file (shared
+// with the stored conversations that hold it, deleted with its last holder, so the disk holds only the ones kept). They
+// are valid only while the slot holds the same tokens in front of them.
 struct server_keepctx_spill {
-    std::vector<server_keepctx_spilled>  list;     // ascending n_tokens
-    std::shared_ptr<server_keepctx_file> file;     // where new ones go (shared with stored conversations)
-    uint64_t                             end = 0;  // the file's written end
-    uint64_t                             n_written = 0; // checkpoints written (statistics)
-    uint64_t                             bytes_written = 0;
+    std::vector<server_keepctx_spilled> list;              // ascending n_tokens
+    uint64_t                            n_written     = 0; // checkpoints written (statistics)
+    uint64_t                            bytes_written = 0;
 
-    void clear() { list.clear(); file.reset(); end = 0; }
+    void clear() { list.clear(); }
     // drop the ones beyond n_keep tokens (the prompt keeps only these)
     void keep_first(int64_t n_keep);
 };
@@ -120,25 +127,28 @@ struct server_keepctx {
     // store the sequence seq_id with its prompt (tokens and checkpoints). Older states of the same conversation (entries
     // whose tokens are a prefix of it) and then the oldest entries are dropped to stay within the budget and the count,
     // never `keep`. false: nothing stored (too big, no room beside `keep`, or an I/O error).
-    // [TAG_FN_L19_CONVSTORE] spill (may be null): the slot's checkpoints on disk, kept with the entry (shared file);
-    // hits / sys_end: the conversation's restores so far and the end of its system + tools block
+    // [TAG_FN_L19_CONVSTORE] spill (may be null): the slot's checkpoints on disk, kept with the entry (shared files);
+    // conv (may be null): what is known about the conversation; supersede_tol: see drop_prefixes_of
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
               llama_seq_id seq_id, const server_keepctx_entry * keep, std::string & info,
-              const server_keepctx_spill * spill = nullptr, int64_t hits = 0, int32_t sys_end = -1);
+              const server_keepctx_spill * spill = nullptr, const server_keepctx_conv * conv = nullptr, int32_t supersede_tol = 0);
 
     // restore the entry into seq_id and prompt. The entry is removed, unless keep (the prompt continues only a part of
     // it: the rest stays stored for a later continuation) and the restore worked. false: the sequence and prompt are in
     // an unknown state and the caller must clear them.
-    // [TAG_FN_L19_CONVSTORE] spill (may be null): receives the entry's checkpoints on disk; hits / sys_end: the entry's
+    // [TAG_FN_L19_CONVSTORE] spill / conv (may be null): receive the entry's checkpoints on disk and what is known about
+    // it (its restores counting this one)
     bool load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
               llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
-              server_keepctx_spill * spill = nullptr, int64_t * hits = nullptr, int32_t * sys_end = nullptr);
+              server_keepctx_spill * spill = nullptr, server_keepctx_conv * conv = nullptr);
 
     // remove the entries whose tokens are a prefix of tokens (an older state of the same conversation), except keep
-    int drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep);
+    // [TAG_FN_L19_CONVSTORE] tol > 0: also the entries that leave tokens within their last tol tokens (a conversation
+    // whose client re-rendered the last answer resumed from the entry before its end: the entry is superseded)
+    int drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep, int32_t tol = 0);
 
-    // [TAG_FN_L19_CONVSTORE_SPILL] write a checkpoint to the slot's spill file (created on first use) and add it to the
-    // list (ascending). false: not written (I/O error), the checkpoint is lost as before.
+    // [TAG_FN_L19_CONVSTORE_SPILL] write a checkpoint to a new file and add it to the list (ascending). false: not
+    // written (I/O error), the checkpoint is lost as before.
     bool spill_write(server_keepctx_spill & spill, const common_prompt_checkpoint & c, uint64_t prefix_hash, std::string & info);
 
     // read a spilled checkpoint back into c (positions and bytes)

@@ -1173,8 +1173,7 @@ struct server_slot {
     // [TAG_FN_L19_CONVSTORE] the checkpoints the ring dropped (on disk), the conversation's restores from the store and the
     // end of its system + tools block (its first user message, -1 unknown)
     server_keepctx_spill kc_spill;
-    int64_t              kc_hits    = 0;
-    int32_t              kc_sys_end = -1;
+    server_keepctx_conv  kc_conv;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -2088,6 +2087,7 @@ private:
         int32_t spill_max = 64;    //   on disk per conversation
         bool    sys       = false; // [TAG_FN_L19_CONVSTORE_SYS] store a conversation of which a prompt keeps only the system block
         int32_t opener    = -1;    // [TAG_FN_L19_CONVSTORE_OPENER] the tail split at n - 4 from this many tokens (-1 = 512 as before)
+        bool    opener_auto = true; //   only for a client that re-rendered its last answer
     } cs;
 
     server_metrics metrics;
@@ -3252,7 +3252,9 @@ private:
     //                                        + tools block (a subagent), not only when it loses most of its content
     //   LLAMA_FN_L19_CONVSTORE_OPENER=1      [_OPENER] the prompt's last 4 tokens (the assistant-turn start) get their own
     //                                        batch and checkpoint from this many tokens on (before: 512), so a client that
-    //                                        drops the reasoning of the last answer resumes at the assistant turn; -1 = off
+    //                                        drops the reasoning of the last answer resumes at the assistant turn; -1 = off;
+    //                                        _OPENER_AUTO=1: only for a conversation whose last prompt re-rendered the answer
+    //                                        before it (a client that sends the answer back as it was never needs it)
     void keepctx_init() {
         keepctx.reset();
         auto env_ll = [&](const char * name, long long def) {
@@ -3269,9 +3271,10 @@ private:
             cs.spill_max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L19_CONVSTORE_SPILL_MAX", 64));
             cs.sys       = env_ll("LLAMA_FN_L19_CONVSTORE_SYS", 1) != 0;
             cs.opener    = (int32_t) std::max<long long>(-1, env_ll("LLAMA_FN_L19_CONVSTORE_OPENER", 1));
+            cs.opener_auto = env_ll("LLAMA_FN_L19_CONVSTORE_OPENER_AUTO", 1) != 0;
             SRV_INF("[TAG_FN_L19_CONVSTORE] on: checkpoint keeping %d, checkpoints to disk %d (gap %d, max %d), store at the "
-                    "system block %d, assistant-turn checkpoint %s%d\n", cs.ckpt, cs.spill, cs.spill_gap, cs.spill_max, cs.sys,
-                    cs.opener < 0 ? "off " : "from ", cs.opener);
+                    "system block %d, assistant-turn checkpoint %s%d%s\n", cs.ckpt, cs.spill, cs.spill_gap, cs.spill_max, cs.sys,
+                    cs.opener < 0 ? "off " : "from ", cs.opener, cs.opener >= 0 && cs.opener_auto ? " (clients that re-render)" : "");
         }
         const char * on = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX");
         if (!on || atoi(on) == 0) {
@@ -3438,11 +3441,21 @@ private:
         // the slot loses most of its content and at least keepctx_min tokens
         const bool lose_most = n_cur - lcp_cur >= keepctx_min && 2*lcp_cur < n_cur;
         // [TAG_FN_L19_CONVSTORE_SYS] or the prompt keeps at most the slot's system + tools block (a subagent, another session)
-        const bool lose_conv = cs.sys && slot.kc_sys_end >= 0 && n_cur - use_cur >= keepctx_min && use_cur <= slot.kc_sys_end;
+        const bool lose_conv = cs.sys && slot.kc_conv.sys_end >= 0 && n_cur - use_cur >= keepctx_min && use_cur <= slot.kc_conv.sys_end;
+
+        // [TAG_FN_L19_CONVSTORE_OPENER] a prompt that continues the slot's conversation tells whether its client sends the
+        // last answer back as it was (it continues past the previous prompt) or re-rendered (it leaves the previous
+        // prompt within its last tokens, the assistant-turn start)
+        // (the same prompt again, a retry, tells nothing)
+        const auto detect_rerender = [](int lcp, server_keepctx_conv & conv) {
+            if (conv.n_prompt > 8 && lcp >= conv.n_prompt - 8 && lcp != conv.n_prompt) {
+                conv.rerender = lcp < conv.n_prompt;
+            }
+        };
         if (lose_most || lose_conv) {
             std::string info;
             if (keepctx->save(slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, restore ? &*it_best : nullptr, info,
-                              cs.on ? &slot.kc_spill : nullptr, slot.kc_hits, slot.kc_sys_end)) {
+                              cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] stored the outgoing conversation (the new prompt shares %d of its %d tokens%s): %s\n",
                         lcp_cur, n_cur, lose_most ? "" : ", [TAG_FN_L19_CONVSTORE_SYS] only its system block", info.c_str());
             } else {
@@ -3457,9 +3470,12 @@ private:
             const bool keep_entry = lcp_best < n_entry;
             slot.kc_spill.clear(); // [TAG_FN_L19_CONVSTORE_SPILL] the restored conversation's come with it
             if (keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, keep_entry, info,
-                              cs.on ? &slot.kc_spill : nullptr, cs.on ? &slot.kc_hits : nullptr, cs.on ? &slot.kc_sys_end : nullptr)) {
+                              cs.on ? &slot.kc_spill : nullptr, cs.on ? &slot.kc_conv : nullptr)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] restored a stored conversation: %d of the prompt's %zu tokens reused instead of %d: %s\n",
                         use_best, tokens.size(), use_cur, info.c_str());
+                if (cs.on) {
+                    detect_rerender(lcp_best, slot.kc_conv);
+                }
             } else {
                 SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] restoring a stored conversation of %d tokens failed (%s), the prompt is processed in full\n",
                         n_entry, info.c_str());
@@ -3470,16 +3486,12 @@ private:
             if (!cache_prompt) {
                 slot.kc_spill.clear();
             } else if (lcp_cur < n_cur) {
-                const size_t n_before = slot.kc_spill.list.size();
                 slot.kc_spill.keep_first(lcp_cur);
-                if (slot.kc_spill.list.size() != n_before) {
-                    slot.kc_spill.file.reset(); // new ones start a new file, the old one goes with its last user
-                    slot.kc_spill.end = 0;
-                }
             }
             if (lose_most || lose_conv || n_cur == 0) {
-                slot.kc_hits = 0; // another conversation
+                slot.kc_conv.hits = 0; // another conversation
             }
+            detect_rerender(lcp_cur, slot.kc_conv);
         }
 
         // [TAG_FN_L19_CONVSTORE_SPILL] a checkpoint on disk that resumes the prompt later than every one in the ring goes
@@ -3523,9 +3535,10 @@ private:
             }
         }
 
-        // [TAG_FN_L19_CONVSTORE] the new conversation's system + tools block
+        // [TAG_FN_L19_CONVSTORE] the new conversation's system + tools block and prompt length
         if (cs.on) {
-            slot.kc_sys_end = convstore_first_user(task.params.message_spans);
+            slot.kc_conv.sys_end  = convstore_first_user(task.params.message_spans);
+            slot.kc_conv.n_prompt = (int32_t) tokens.size();
         }
     }
 
@@ -6863,7 +6876,9 @@ private:
                             }
                             // [TAG_FN_L19_CONVSTORE_OPENER] the last 4 tokens (the assistant-turn start) get their checkpoint
                             // from cs.opener tokens on: a client that drops the last answer's reasoning resumes there
-                            const int64_t tail_min = cs.opener >= 0 && offset_hit == 4 ? (int64_t) cs.opener : ckpt_tail_min;
+                            // _OPENER_AUTO: only for a client that re-rendered its last answer
+                            const bool    opener   = cs.opener >= 0 && offset_hit == 4 && (!cs.opener_auto || slot.kc_conv.rerender);
+                            const int64_t tail_min = opener ? (int64_t) cs.opener : ckpt_tail_min;
                             // [TAG_CKPT_TURN_MERGE] the tail split only pays for itself past ckpt_tail_min tokens
                             if (should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= tail_min)) {
                                 break;

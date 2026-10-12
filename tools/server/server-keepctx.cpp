@@ -567,17 +567,14 @@ void server_keepctx_spill::keep_first(int64_t n_keep) {
 bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prompt_checkpoint & c, uint64_t prefix_hash,
                                  std::string & info) {
     const auto t0 = std::chrono::steady_clock::now();
-    if (!spill.file) {
-        static std::atomic<uint64_t> n_spill_files{0};
-        const auto path = std::filesystem::path(params_.dir) /
-                string_format("keepctx-%lu-spill%llu.kc", kc_pid(), (unsigned long long) ++n_spill_files);
-        std::string err;
-        spill.file = server_keepctx_file::create(path, err);
-        spill.end  = 0;
-        if (!spill.file) {
-            info = "cannot create '" + path.string() + "': " + err;
-            return false;
-        }
+    static std::atomic<uint64_t> n_spill_files{0};
+    const auto path = std::filesystem::path(params_.dir) /
+            string_format("keepctx-%lu-spill%llu.kc", kc_pid(), (unsigned long long) ++n_spill_files);
+    std::string err;
+    auto file = server_keepctx_file::create(path, err);
+    if (!file) {
+        info = "cannot create '" + path.string() + "': " + err;
+        return false;
     }
     server_keepctx_spilled s;
     s.n_tokens  = c.n_tokens;
@@ -587,13 +584,13 @@ bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prom
     s.size_tgt  = c.data_tgt.size();
     s.size_dft  = c.data_dft.size();
     s.size_spec = c.data_spec.size();
-    s.off       = spill.end;
+    s.off       = 0;
     s.hash      = prefix_hash;
-    s.file      = spill.file;
+    s.file      = file;
     uint64_t n_written = 0;
     bool ok = true;
     {
-        kc_pipe pipe(*spill.file, true, 0, s.off);
+        kc_pipe pipe(*file, true, 0, s.off);
         pipe.hashing = params_.verify;
         ok = pipe.put(c.data_tgt.data(), c.data_tgt.size()) && pipe.put(c.data_dft.data(), c.data_dft.size()) &&
              pipe.put(c.data_spec.data(), c.data_spec.size());
@@ -602,11 +599,8 @@ bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prom
     }
     if (!ok || n_written != s.bytes()) {
         info = string_format("writing a checkpoint at n_tokens = %lld failed", (long long) c.n_tokens);
-        spill.file.reset(); // the next one starts a new file
-        spill.end = 0;
         return false;
     }
-    spill.end += kc_round_up(s.bytes());
     spill.n_written++;
     spill.bytes_written += s.bytes();
     auto pos = std::upper_bound(spill.list.begin(), spill.list.end(), s.n_tokens,
@@ -671,11 +665,13 @@ bool server_keepctx::evict_one(const server_keepctx_entry * keep) {
     return true;
 }
 
-int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep) {
+int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep, int32_t tol) {
     int n = 0;
     for (auto it = entries.begin(); it != entries.end();) {
-        if (&*it != keep && it->prompt.tokens.size() <= tokens.size() &&
-            it->prompt.tokens.get_common_prefix(tokens) == it->prompt.tokens.size()) {
+        const size_t n_e = it->prompt.tokens.size();
+        // [TAG_FN_L19_CONVSTORE] superseded: shares all but its last tol tokens
+        const bool sup = tol > 0 && n_e > (size_t) tol && it->prompt.tokens.get_common_prefix(tokens) + (size_t) tol > n_e;
+        if (&*it != keep && (sup || (n_e <= tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == n_e))) {
             it = entries.erase(it);
             n++;
         } else {
@@ -687,7 +683,8 @@ int server_keepctx::drop_prefixes_of(const server_tokens & tokens, const server_
 
 bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
                           common_speculative * spec, llama_seq_id seq_id, const server_keepctx_entry * keep,
-                          std::string & info, const server_keepctx_spill * spill, int64_t hits, int32_t sys_end) {
+                          std::string & info, const server_keepctx_spill * spill, const server_keepctx_conv * conv,
+                          int32_t supersede_tol) {
     const auto t0 = std::chrono::steady_clock::now();
 
     server_keepctx_entry e;
@@ -723,8 +720,9 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
             need_spilled += sp.bytes();
         }
     }
-    e.hits    = hits;
-    e.sys_end = sys_end;
+    if (conv) {
+        e.conv = *conv;
+    }
     if (need + need_spilled > params_.budget) {
         e.spilled.clear(); // the state and the ring's checkpoints first
         need_spilled = 0;
@@ -736,7 +734,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     // room: older states of this conversation, then the oldest entries (or [TAG_FN_L19_CONVSTORE_EVICT] the lowest
     // value per byte), never `keep`
-    int n_evicted = drop_prefixes_of(prompt.tokens, keep);
+    int n_evicted = drop_prefixes_of(prompt.tokens, keep, supersede_tol);
     while ((n_bytes() + need + need_spilled > params_.budget || (int32_t) entries.size() >= params_.n_max) && evict_one(keep)) {
         n_evicted++;
     }
@@ -804,7 +802,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
 
     // [TAG_FN_L19_CONVSTORE_EVICT]
-    e.value = convstore_gdsf(gdsf_L_, e.hits, prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
+    e.value = convstore_gdsf(gdsf_L_, e.conv.hits, prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                              params_.budget / (uint64_t) std::max(1, params_.n_max));
 
     const double ms = kc_ms_since(t0);
@@ -814,7 +812,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
                          entries.size() + 1, (n_bytes() + e.n_bytes_all())/1048576.0);
     if (!e.spilled.empty() || params_.gdsf) {
         info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk (%.1f MiB), restores %lld, value %.0f, system block %d",
-                              e.spilled.size(), need_spilled/1048576.0, (long long) e.hits, e.value, (int) e.sys_end);
+                              e.spilled.size(), need_spilled/1048576.0, (long long) e.conv.hits, e.value, (int) e.conv.sys_end);
     }
     entries.push_back(std::move(e));
     return true;
@@ -822,7 +820,7 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
                           llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
-                          server_keepctx_spill * spill, int64_t * hits, int32_t * sys_end) {
+                          server_keepctx_spill * spill, server_keepctx_conv * conv) {
     const auto t0 = std::chrono::steady_clock::now();
 
     server_keepctx_entry e_own;
@@ -886,15 +884,13 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     if (spill) {
         spill->list = e.spilled;
     }
-    if (hits) {
-        *hits = e.hits + 1;
-    }
-    if (sys_end) {
-        *sys_end = e.sys_end;
+    if (conv) {
+        *conv = e.conv;
+        conv->hits++;
     }
     if (keep) {
-        e.hits++;
-        e.value = convstore_gdsf(gdsf_L_, e.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
+        e.conv.hits++;
+        e.value = convstore_gdsf(gdsf_L_, e.conv.hits, e.prompt.n_tokens(), e.n_bytes_all(), params_.fixed_tokens,
                                  params_.budget / (uint64_t) std::max(1, params_.n_max));
     }
 
