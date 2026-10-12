@@ -889,7 +889,11 @@ void llama_fn_warm_go(bool ready) {
     if (done.load(std::memory_order_relaxed)) {
         return;
     }
-    // [TAG_FN_L18_FIRSTANS_WARMLATE] the warm-up decode of the load does not start it; the ready call or the next decode does
+    // [TAG_FN_L18_FIRSTANS_WARMLATE] the warm-up decode of the load does not start it; the ready call or the next decode does.
+    // Without the switch the ready call does nothing (the first trunk decode starts the pass, as before)
+    if (ready && !g_warm_late.load()) {
+        return;
+    }
     if (g_warm_late.load() && !ready && g_warm_decodes.fetch_add(1) < 1) {
         return;
     }
