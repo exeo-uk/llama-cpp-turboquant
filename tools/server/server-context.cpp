@@ -2068,6 +2068,12 @@ private:
 
     // [TAG_FN_L18_KEEPCTX] conversations a prompt with another prefix took the slot from (LLAMA_FN_L18_KEEPCTX=1)
     std::unique_ptr<server_keepctx> keepctx;
+    // [TAG_FN_L19_TTFT_CKPT] LLAMA_FN_L19_TTFT_CKPT_TAIL (also from the model's automatic profile): the tail split (the last 4
+    // prompt tokens as their own batch, a context checkpoint before them) from this many tokens in the batch; upstream
+    // [TAG_CKPT_TURN_MERGE] value 512 when unset. With thinking, the next turn's prompt drops this turn's reasoning, so it
+    // leaves the cached tokens just before this prompt's end: without that checkpoint it restores the one at this turn's
+    // user message and reads the whole message again
+    int64_t ckpt_tail_min = 512;
     int32_t keepctx_min = 512;
 
     server_metrics metrics;
@@ -2697,6 +2703,11 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
+        if (const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_L19_TTFT_CKPT_TAIL"); e && *e) { // [TAG_FN_L19_TTFT_CKPT]
+            ckpt_tail_min = std::max<long long>(0, strtoll(e, nullptr, 10));
+            SRV_WRN("[TAG_FN_L19_TTFT_CKPT] a prompt batch of >= %lld tokens leaves its last 4 tokens to their own batch with a "
+                    "checkpoint before them (upstream 512)\n", (long long) ckpt_tail_min);
+        }
 
         pool_init(); // [TAG_POOL_PREEMPT]
 
@@ -6530,7 +6541,7 @@ private:
                     constexpr int64_t ckpt_merge_max = 8;
                     // the tail split (last 4 tokens as their own batch and checkpoint) only pays for itself when
                     // the batch already carries at least this many tokens that a regenerate would re-prefill
-                    constexpr int64_t ckpt_tail_min = 512;
+                    // [TAG_FN_L19_TTFT_CKPT] the member ckpt_tail_min (512 unless LLAMA_FN_L19_TTFT_CKPT_TAIL)
 
                     bool user_start_merged         = false;
                     bool user_start_merged_is_last = false;
@@ -6612,15 +6623,17 @@ private:
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
+                            int64_t tail_min = 512; // [TAG_FN_L19_TTFT_CKPT] ckpt_tail_min applies to the last-4 split only
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
+                                    tail_min = n_last == std::min(n_batch, 4) ? ckpt_tail_min : 512;
                                     break;
                                 }
                             }
                             // [TAG_CKPT_TURN_MERGE] the tail split only pays for itself past ckpt_tail_min tokens
-                            if (should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= ckpt_tail_min)) {
+                            if (should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= tail_min)) {
                                 break;
                             }
                         }
