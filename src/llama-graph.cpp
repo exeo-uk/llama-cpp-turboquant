@@ -2709,17 +2709,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // [TAG_FN_L19_TTFT_PHOT] one row per routed (token, expert): ids [1, k*T] and the input repeated k times, so no token
         // holds the zero slot twice (the batched MUL_MAT_ID groups each expert's columns once per token); the uncached rows
         // read the zero slot and give 0, as in the narrow chains
+        // The ids of one MUL_MAT_ID stay at most 8192 rows (the batched kernels' id helper keeps one 4-byte entry per row in
+        // shared memory: 10 x 3060 rows failed its smpbo check, FAULT 2026-10-12 13:08:35): wider graphs run in pieces.
         if (phot) {
             const int64_t nu      = mc_slot_ids->ne[0];
+            const int64_t tp      = std::max<int64_t>(1, 8192 / nu); // tokens per piece
             ggml_tensor * inp_all = mc_inp;
-            ggml_tensor * rep     = ggml_repeat_4d(ctx0, inp_all, inp_all->ne[0], nu, n_tokens, 1); // [n_embd, k, T]
-            mc_inp = ggml_reshape_3d(ctx0, rep, inp_all->ne[0], 1, nu*n_tokens);
-            ggml_tensor * ids = ggml_reshape_2d(ctx0, mc_slot_ids, 1, nu*n_tokens);
-            ggml_tensor * d   = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false); // [n_embd, 1, k*T]
+            ggml_tensor * out     = nullptr;
+            for (int64_t t0 = 0; t0 < n_tokens; t0 += tp) {
+                const int64_t nt  = std::min<int64_t>(tp, n_tokens - t0);
+                ggml_tensor * inp = nt == n_tokens ? inp_all : ggml_view_3d(ctx0, inp_all, inp_all->ne[0], inp_all->ne[1], nt,
+                        inp_all->nb[1], inp_all->nb[2], t0*inp_all->nb[2]);
+                ggml_tensor * sid = nt == n_tokens ? mc_slot_ids : ggml_view_2d(ctx0, mc_slot_ids, nu, nt, mc_slot_ids->nb[1],
+                        t0*mc_slot_ids->nb[1]);
+                ggml_tensor * rep = ggml_repeat_4d(ctx0, inp, inp_all->ne[0], nu, nt, 1); // [n_embd, k, nt]
+                mc_inp = ggml_reshape_3d(ctx0, rep, inp_all->ne[0], 1, nu*nt);
+                ggml_tensor * ids = ggml_reshape_2d(ctx0, sid, 1, nu*nt);
+                ggml_tensor * d   = build_slot_chain(mcache->up_c, mcache->gate_c, mcache->down_c, ids, false); // [n_embd, 1, k*nt]
+                d   = ggml_reshape_3d(ctx0, d, d->ne[0], nu, nt);
+                out = out ? ggml_concat(ctx0, out, d, 2) : d;
+            }
             mc_inp = inp_all;
-            d = ggml_reshape_3d(ctx0, d, d->ne[0], nu, n_tokens);
-            cb(d, "ffn_moe_hot_prompt", il);
-            return d;
+            cb(out, "ffn_moe_hot_prompt", il);
+            return out;
         }
         // [TAG_FN_L4_MEM_PROMPT] a graph wider than hot_max_t (the short prompt path with LLAMA_FN_L4_PROMPT_HOT): chunks of
         // hot_max_t tokens, so every chain takes the per-column MUL_MAT_ID kernels. The batched one (MMQ) groups an expert's
