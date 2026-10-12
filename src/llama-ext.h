@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -188,6 +189,23 @@ LLAMA_API void llama_quiesce_ext(struct llama_context * ctx);
 // these prompt tokens where the vocabulary leaves them out (the first cap such ids in the given order replace the last
 // set). Returns how many were taken, -1 when the model has no such list. Only drafts change; verify uses the full head.
 LLAMA_API int32_t llama_model_mtp_head_set_prompt(const struct llama_model * model, const llama_token * ids, int32_t n);
+
+// [TAG_FN_L18_KEEPCTX] The bytes of llama_state_seq_get_data_ext / llama_state_seq_set_data_ext (the same format), passed
+// through a callback in pieces of at most 32 MiB instead of one host buffer of the whole state. A callback returns false to
+// stop. Returns the bytes written / read, 0 on error; after a failed read the sequence is cleared, as after a failed
+// llama_state_seq_set_data_ext. Tensor bytes are read from the device piece by piece, so no host copy of the whole state
+// is ever made.
+typedef bool (*llama_state_stream_write_fn)(const void * src, size_t size, void * user_data);
+typedef bool (*llama_state_stream_read_fn)(void * dst, size_t size, void * user_data);
+LLAMA_API size_t llama_state_seq_write_stream_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                                  llama_state_stream_write_fn fn, void * user_data);
+LLAMA_API size_t llama_state_seq_read_stream_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                                 llama_state_stream_read_fn fn, void * user_data);
+
+// [TAG_FN_L18_KEEPCTX_HOT] The decayed counts of the MoE hot set ctx owns (qwen4exp adaptive set): get copies them, set
+// puts them back (the same process and model). false when ctx owns no decayed adaptive set or the layout differs.
+LLAMA_API bool llama_moe_hot_counts_get_ext(struct llama_context * ctx, std::vector<float> & out);
+LLAMA_API bool llama_moe_hot_counts_set_ext(struct llama_context * ctx, const std::vector<float> & in);
 
 // [TAG_TURBOT] Process-wide turbot plan path; takes precedence over env LLAMA_TURBOT_PLAN. nullptr or "" clears it.
 // [TAG_TURBOT_EMBED_PLAN] "default" selects the built-in plan; with neither set, the built-in plan is used when it fits.

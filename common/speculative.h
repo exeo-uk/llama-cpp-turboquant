@@ -137,6 +137,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// [TAG_FN_L18_KEEPCTX] get/set the host state a sequence carries from the end of one request into the next one, of every
+// implementation (draft-mtp: the last target row that the next request's first row pairs with; the others: their
+// get_state). With it a sequence saved at the end of a request and restored later drafts exactly as if it never left.
+void common_speculative_get_carry(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+bool common_speculative_set_carry(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
 // print statistics about the speculative decoding
 
 // [TAG_SPEC_PHASE_PROBE] Wall-clock accounting of one speculative decode step.

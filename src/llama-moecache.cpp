@@ -4017,6 +4017,42 @@ bool llama_moe_hot_turn_start(const void * owner) {
     return true;
 }
 
+// [TAG_FN_L18_KEEPCTX_HOT] -----------------------------------------------------------------------------------------
+
+bool llama_moe_hot_counts_get(const void * owner, std::vector<float> & out) {
+    moe_cache * mc = g_cache;
+    out.clear();
+    if (!mc || !mc->adapt || !mc->dc_on || owner != mc->owner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    for (const auto & ls : mc->layers) {
+        out.insert(out.end(), ls.dcnt.begin(), ls.dcnt.end());
+    }
+    return !out.empty();
+}
+
+bool llama_moe_hot_counts_set(const void * owner, const std::vector<float> & in) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->adapt || !mc->dc_on || owner != mc->owner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    size_t n = 0;
+    for (const auto & ls : mc->layers) {
+        n += ls.dcnt.size();
+    }
+    if (n != in.size() || n == 0) {
+        return false;
+    }
+    size_t o = 0;
+    for (auto & ls : mc->layers) {
+        std::copy(in.begin() + o, in.begin() + o + ls.dcnt.size(), ls.dcnt.begin());
+        o += ls.dcnt.size();
+    }
+    return true;
+}
+
 // [TAG_FN_L3_VRAM_CBUF] ---------------------------------------------------------------------------------------------
 
 size_t llama_moe_hot_cbuf_tail_bytes() {

@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -193,6 +194,10 @@ struct llama_context {
             const char * filepath,
      const llama_token * tokens,
                 size_t   n_token_count);
+
+    // [TAG_FN_L18_KEEPCTX] the bytes of state_seq_get_data / state_seq_set_data, passed through a callback in pieces
+    size_t state_seq_write_stream(llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(const void *, size_t)> & fn);
+    size_t state_seq_read_stream (llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(void *, size_t)> & fn);
 
     //
     // perf

@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 struct llama_model;
 struct ggml_tensor;
@@ -249,6 +250,12 @@ void llama_moe_hot_idle(const void * owner);
 // and one pass of the decay rules swaps up to <MiB> of experts, landed before it returns. Returns true if it ran a pass.
 bool llama_moe_hot_turn_start_on();
 bool llama_moe_hot_turn_start(const void * owner);
+
+// [TAG_FN_L18_KEEPCTX_HOT] the decayed counts of every layer (each layer's n_expert values, none for a layer without
+// counts): get copies them out, set puts them back, so the passes move the set toward a conversation that returns to the
+// slot. false when the owner has no decayed adaptive set, or set got another layout.
+bool llama_moe_hot_counts_get(const void * owner, std::vector<float> & out);
+bool llama_moe_hot_counts_set(const void * owner, const std::vector<float> & in);
 
 // [TAG_FN_L4_EXIT] the owner goes away: the upload worker stops after its chunk in flight and is joined, the upload stream
 // is synchronized; the hot set stays static from then on

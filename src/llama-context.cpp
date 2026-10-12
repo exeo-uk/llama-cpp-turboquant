@@ -5197,6 +5197,96 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// [TAG_FN_L18_KEEPCTX] the state bytes through a callback; tensor bytes go through one bounded piece buffer, pinned host
+// memory of the tensor's device when it has one (device copies at full speed), else plain host memory
+static constexpr size_t LLAMA_IO_STREAM_PIECE = 32u*1024*1024;
+
+class llama_io_stream_piece {
+public:
+    uint8_t * get(const ggml_tensor * tensor, size_t n) {
+        if (!pinned_tried && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+            pinned_tried = true;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (hbuft) {
+                pinned.reset(ggml_backend_buft_alloc_buffer(hbuft, LLAMA_IO_STREAM_PIECE));
+            }
+        }
+        if (pinned && n <= LLAMA_IO_STREAM_PIECE) {
+            return (uint8_t *) ggml_backend_buffer_get_base(pinned.get());
+        }
+        plain.resize(std::max(plain.size(), n));
+        return plain.data();
+    }
+
+private:
+    bool                    pinned_tried = false;
+    ggml_backend_buffer_ptr pinned;
+    std::vector<uint8_t>    plain;
+};
+
+class llama_io_write_stream : public llama_io_write_i {
+public:
+    llama_io_write_stream(const std::function<bool(const void *, size_t)> & fn) : fn(fn) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > 0 && !fn(src, size)) {
+            throw std::runtime_error("state stream write failed");
+        }
+        size_written += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        for (size_t done = 0; done < size;) {
+            const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
+            uint8_t * buf = piece.get(tensor, n);
+            ggml_backend_tensor_get(tensor, buf, offset + done, n);
+            write(buf, n);
+            done += n;
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    const std::function<bool(const void *, size_t)> & fn;
+    size_t size_written = 0;
+    llama_io_stream_piece piece;
+};
+
+class llama_io_read_stream : public llama_io_read_i {
+public:
+    llama_io_read_stream(const std::function<bool(void *, size_t)> & fn) : fn(fn) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > 0 && !fn(dst, size)) {
+            throw std::runtime_error("state stream read failed");
+        }
+        size_read += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        for (size_t done = 0; done < size;) {
+            const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
+            uint8_t * buf = piece.get(tensor, n);
+            read(buf, n);
+            ggml_backend_tensor_set(tensor, buf, offset + done, n);
+            done += n;
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+
+private:
+    const std::function<bool(void *, size_t)> & fn;
+    size_t size_read = 0;
+    llama_io_stream_piece piece;
+};
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -5745,6 +5835,47 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     llama_moe_hot_state_save(this); // [TAG_FN_L3_POLICY_STATE] a slot save keeps the learned hot set too
 
     return res;
+}
+
+// [TAG_FN_L18_KEEPCTX] the same bytes as state_seq_get_data / state_seq_set_data, but streamed
+size_t llama_context::state_seq_write_stream(llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(const void *, size_t)> & fn) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: a device state cannot be streamed\n", __func__);
+        return 0;
+    }
+    llama_io_write_stream io(fn);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        return state_seq_write_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_read_stream(llama_seq_id seq_id, llama_state_seq_flags flags, const std::function<bool(void *, size_t)> & fn) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: a device state cannot be streamed\n", __func__);
+        return 0;
+    }
+    llama_io_read_stream io(fn);
+    try {
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+
+        return state_seq_read_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        return 0;
+    }
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -7659,6 +7790,33 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
+// [TAG_FN_L18_KEEPCTX]
+size_t llama_state_seq_write_stream_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                        llama_state_stream_write_fn fn, void * user_data) {
+    if (fn == nullptr) {
+        return 0;
+    }
+    ctx->synchronize();
+
+    const std::function<bool(const void *, size_t)> cb = [fn, user_data](const void * src, size_t size) {
+        return fn(src, size, user_data);
+    };
+    return ctx->state_seq_write_stream(seq_id, flags, cb);
+}
+
+size_t llama_state_seq_read_stream_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                       llama_state_stream_read_fn fn, void * user_data) {
+    if (fn == nullptr) {
+        return 0;
+    }
+    ctx->synchronize();
+
+    const std::function<bool(void *, size_t)> cb = [fn, user_data](void * dst, size_t size) {
+        return fn(dst, size, user_data);
+    };
+    return ctx->state_seq_read_stream(seq_id, flags, cb);
+}
+
 // compat: llama_batch -> llama_batch_ext -> encode/decode
 
 // [TAG_SYNC_BATCH_EXT_COMPAT] one conversion buffer per context, reused across calls. decode(ext) only forwards the
@@ -7846,6 +8004,15 @@ bool llama_moe_bridge_track_ext(llama_context * ctx, bool on) {
 
 bool llama_moe_bridge_last_ext(const llama_context * ctx, int32_t * n_tokens, uint32_t * cold, int32_t n, uint64_t * serial) {
     return ctx != nullptr && llama_moe_bridge_last(ctx->get_moe_bridge(), n_tokens, cold, n, serial);
+}
+
+// [TAG_FN_L18_KEEPCTX_HOT]
+bool llama_moe_hot_counts_get_ext(llama_context * ctx, std::vector<float> & out) {
+    return ctx != nullptr && llama_moe_hot_counts_get(ctx, out);
+}
+
+bool llama_moe_hot_counts_set_ext(llama_context * ctx, const std::vector<float> & in) {
+    return ctx != nullptr && llama_moe_hot_counts_set(ctx, in);
 }
 
 uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {
