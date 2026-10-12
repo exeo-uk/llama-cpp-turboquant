@@ -390,6 +390,154 @@ static __global__ void k_mb_wait(const mb_dev v, const int chan, const int32_t *
     }
 }
 
+// [TAG_FN_L18_GPUFLOOR_PFWAIT] the ranges ggml-cuda.cu handed for the next marked wait of each device
+struct fn_l18_pf_pending {
+    const ggml_tensor * wait = nullptr;
+    const char *        p[GGML_CUDA_FN_L18_PF_MAX];
+    size_t              n[GGML_CUDA_FN_L18_PF_MAX];
+    int                 nr = 0;
+};
+static fn_l18_pf_pending g_fn_l18_pf[GGML_CUDA_MAX_DEVICES];
+
+void ggml_cuda_fn_l18_pf_set(int device, const ggml_tensor * wait, const char * const * p, const size_t * n, int nr) {
+    fn_l18_pf_pending & pf = g_fn_l18_pf[device];
+    pf.nr = 0;
+    for (int k = 0; k < nr && k < GGML_CUDA_FN_L18_PF_MAX; ++k) {
+        pf.p[pf.nr] = p[k];
+        pf.n[pf.nr] = n[k];
+        pf.nr++;
+    }
+    pf.wait = wait;
+}
+
+// [TAG_FN_L18_GPUFLOOR_PFWAIT] the byte ranges the loader blocks of a wait read into L2 (16-byte aligned, multiples of 16)
+#define FN_L18_PF_CHUNK (MB_WAIT_THREADS*64) // bytes per block and pass: 4 x 16 bytes per thread
+struct fn_l18_pf_args {
+    const char * p[GGML_CUDA_FN_L18_PF_MAX];
+    unsigned int nc[GGML_CUDA_FN_L18_PF_MAX];   // chunks of range r
+    unsigned int last[GGML_CUDA_FN_L18_PF_MAX]; // bytes of its last chunk (a multiple of 16, > 0)
+    int          nr;
+    unsigned int n_chunks;
+    int          n_copy; // the blocks of k_mb_wait; the blocks after them load
+};
+
+// [TAG_FN_L18_GPUFLOOR_PFWAIT] k_mb_wait with loader blocks: blocks [0, n_copy) are k_mb_wait's (block 0 also writes the
+// ticket to the channel's word l4sync[3] when its poll ends); the blocks after them read the prefetch ranges with real loads
+// (so the lines are in L2), chunk by chunk, until that word holds the ticket or all chunks are read
+static __global__ void k_mb_wait_pf(const mb_dev v, const int chan, const int32_t * __restrict__ ticket,
+        float * __restrict__ dst, const int n, const fn_l18_pf_args a) {
+    if ((int) blockIdx.x >= a.n_copy) {
+        const uint32_t want = (uint32_t) ticket[0];
+        const volatile uint32_t * flag = v.l4sync + 4*chan + 3;
+        const unsigned int nb = gridDim.x - a.n_copy;
+        uint32_t acc = 0;
+        for (unsigned int c = blockIdx.x - a.n_copy; c < a.n_chunks; c += nb) {
+            if (*flag == want) {
+                break;
+            }
+            int          r  = 0;
+            unsigned int c0 = 0;
+            while (r < a.nr - 1 && c >= c0 + a.nc[r]) {
+                c0 += a.nc[r];
+                ++r;
+            }
+            const unsigned int k  = c - c0;
+            const char *       pc = a.p[r] + (size_t) k*FN_L18_PF_CHUNK;
+            const unsigned int sz = k + 1 == a.nc[r] ? a.last[r] : FN_L18_PF_CHUNK;
+            uint4 w[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const unsigned int o = (u*MB_WAIT_THREADS + threadIdx.x)*16;
+                w[u] = o < sz ? __ldcg((const uint4 *) (pc + o)) : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                acc ^= w[u].x ^ w[u].y ^ w[u].z ^ w[u].w;
+            }
+        }
+        if (acc == 0x9E3779B9u && threadIdx.x == 1023u) {
+            ((volatile uint32_t *) v.l4sync)[4*chan + 3] = acc; // never (256 threads): keeps the loads
+        }
+        return;
+    }
+    __shared__ int s_ok;
+    if (threadIdx.x == 0) {
+        const uint32_t want = (uint32_t) ticket[0];
+        int ok = 0;
+        if (want != 0) {
+            const volatile uint32_t * done  = &v.hdr[chan].done;
+            const volatile uint32_t * taken = &v.hdr[chan].taken;
+            const volatile uint32_t * err   = &v.state[1];
+            const unsigned long long t0 = mb_now_ns();
+            bool ready = true;
+            const volatile uint32_t * rel = &v.glob->release; // [TAG_FN_R4_BRIDGE_DMA]
+            for (;;) {
+                if ((int32_t) (*done - want) >= 0) {
+                    ok = 1;
+                    break;
+                }
+                if (*err != 0 || *rel != 0) {
+                    break;
+                }
+                const unsigned long long el = mb_now_ns() - t0;
+                if (el > v.timeout_ns && ((int32_t) (*taken - want) < 0 || el > v.job_max_ns)) {
+                    if (atomicCAS(&v.state[1], 0u, (unsigned int) GGML_MOE_BRIDGE_ERR_TIMEOUT) == 0u) {
+                        *(volatile int32_t  *) &v.glob->err_chan = chan;
+                        *(volatile uint32_t *) &v.glob->err_seq  = want;
+                        __threadfence_system();
+                        *(volatile uint32_t *) &v.glob->err = GGML_MOE_BRIDGE_ERR_TIMEOUT;
+                        __threadfence_system();
+                    }
+                    break;
+                }
+                ready = false;
+                mb_sleep();
+            }
+            const unsigned long long dt = mb_now_ns() - t0;
+            if (v.stats && blockIdx.x == 0) {
+                volatile mb_glob * g = v.glob;
+                g->waits       = g->waits + 1;
+                g->waits_ready = g->waits_ready + (ready && ok ? 1 : 0);
+                g->wait_ns     = g->wait_ns + dt;
+            }
+            if (blockIdx.x == 0) { // [TAG_FN_R4_BRIDGE_DMA] the host's DMA/CPU split reads this
+                volatile mb_chan_hdr * h = v.hdr + chan;
+                h->wait_ns   = ready ? 0ull : dt;
+                if (v.probe) { // [TAG_FN_L14_PROBE]
+                    h->t_wstart = t0;
+                    h->t_wend   = t0 + dt;
+                }
+                h->times_seq = want;
+            }
+        }
+        // acquire: the host wrote out before done. The fence is in the thread that read done and comes before the
+        // barrier that hands the result to the other threads, so their reads of out are ordered after the host's writes.
+        __threadfence_system();
+        s_ok = ok;
+        if (blockIdx.x == 0) {
+            *(volatile uint32_t *) &v.l4sync[4*chan + 3] = (uint32_t) ticket[0]; // the loader blocks stop
+        }
+    }
+    __syncthreads();
+
+    const float * out    = (const float *) (v.data + (size_t) chan*v.chan_bytes + v.off_out);
+    const int     stride = a.n_copy*blockDim.x; // the copy blocks only (the loader blocks returned)
+    const int     i0     = blockIdx.x*blockDim.x + threadIdx.x;
+    if (!s_ok) {
+        for (int i = i0; i < n; i += stride) {
+            dst[i] = 0.0f;
+        }
+    } else if ((n & 3) == 0) {
+        for (int i = i0; i < n/4; i += stride) {
+            ((float4 *) dst)[i] = __ldcv((const float4 *) out + i);
+        }
+    } else {
+        for (int i = i0; i < n; i += stride) {
+            dst[i] = __ldcv(out + i);
+        }
+    }
+}
+
 // [TAG_FN_R4_BRIDGE_DMA] thread 0: wait (bounded, as k_mb_wait) for the plan of the ticket's job and check it; then the
 // block copies it into the device scratch and the slot ids into dst. A plan that never comes, or does not fit the
 // ring, the banks or the budget, sets the error and makes every slot id the zero slot (nothing is copied).
@@ -1915,6 +2063,42 @@ void ggml_cuda_op_moe_host_wait(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int n      = (int) ggml_nelements(dst);
     const int n_vec  = (n & 3) == 0 ? n/4 : n;
     const int blocks = std::min(MB_WAIT_MAX_BLOCKS, std::max(1, (n_vec + MB_WAIT_THREADS - 1)/MB_WAIT_THREADS));
+    // [TAG_FN_L18_GPUFLOOR_PFWAIT] the ranges ggml-cuda.cu stored for this node: 2 loader blocks per SM
+    fn_l18_pf_pending & pf = g_fn_l18_pf[ctx.device];
+    if (pf.wait == dst && pf.nr > 0) {
+        fn_l18_pf_args a = {};
+        a.n_copy = blocks;
+        for (int k = 0; k < pf.nr; ++k) {
+            GGML_ASSERT(((uintptr_t) pf.p[k] & 15) == 0);
+            const size_t nb16 = pf.n[k] & ~(size_t) 15;
+            if (nb16 == 0) {
+                continue;
+            }
+            const size_t nc = (nb16 + FN_L18_PF_CHUNK - 1)/FN_L18_PF_CHUNK;
+            GGML_ASSERT(nc < (1u << 24));
+            a.p[a.nr]    = pf.p[k];
+            a.nc[a.nr]   = (unsigned int) nc;
+            a.last[a.nr] = (unsigned int) (nb16 - (nc - 1)*FN_L18_PF_CHUNK);
+            a.n_chunks  += (unsigned int) nc;
+            a.nr++;
+        }
+        pf.wait = nullptr;
+        pf.nr   = 0;
+        if (a.n_chunks > 0) {
+            const int n_load = 2*ggml_cuda_info().devices[ctx.device].nsm;
+            k_mb_wait_pf<<<blocks + n_load, MB_WAIT_THREADS, 0, stream>>>(b->dev, chan, (const int32_t *) dst->src[0]->data,
+                    (float *) dst->data, n, a);
+            CUDA_CHECK(cudaGetLastError());
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true)) {
+                GGML_LOG_INFO("%s: [TAG_FN_L18_GPUFLOOR_PFWAIT] wait with %d loader blocks, %d ranges, %u chunks of %d bytes\n",
+                        __func__, n_load, a.nr, a.n_chunks, (int) FN_L18_PF_CHUNK);
+            }
+            return;
+        }
+    }
+    pf.wait = nullptr;
+    pf.nr   = 0;
     k_mb_wait<<<blocks, MB_WAIT_THREADS, 0, stream>>>(b->dev, chan, (const int32_t *) dst->src[0]->data, (float *) dst->data, n);
     CUDA_CHECK(cudaGetLastError());
 #endif

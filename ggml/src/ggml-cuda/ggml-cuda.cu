@@ -5273,6 +5273,19 @@ static void ggml_cuda_fn_l6_hc_deps(ggml_cgraph * cgraph, ggml_backend_graph_opt
     }
 }
 
+// [TAG_FN_L18_GPUFLOOR_PFWAIT] GGML_CUDA_FN_L18_PFWAIT=1: the marked bridge waits load the L2 prefetch ranges themselves
+bool ggml_cuda_fn_l18_pfwait_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_PFWAIT");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L18_GPUFLOOR_PFWAIT] bridge waits load the next layer's weights into L2 while they wait\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 // [TAG_FN_L6_L2PF] at a bridge wait marked GGML_FN_L6_L2PF: prefetch into L2 the weights in this device's buffers that
 // the nodes up to the next MOE_HOST_POST read, in graph order, up to a budget (GGML_CUDA_FN_L6_L2PF_MB, default 3/4 of
 // the L2). The device is idle while it waits for the host, and the next layer's chain then reads them from L2.
@@ -5323,6 +5336,11 @@ static void ggml_cuda_fn_l6_l2pf(ggml_backend_cuda_context * cuda_ctx, const ggm
     if (getenv("GGML_CUDA_FN_L6_DIAG") && shown.fetch_add(1) < 4) {
         GGML_LOG_INFO("ggml_cuda: [TAG_FN_L6_L2PF] wait %d (%s): %d ranges, %.1f MiB\n", i, cgraph->nodes[i]->name, r.nr,
                 total/1048576.0);
+    }
+    // [TAG_FN_L18_GPUFLOOR_PFWAIT] the wait launch loads them (real loads, until the host's result is there)
+    if (ggml_cuda_fn_l18_pfwait_enabled()) {
+        ggml_cuda_fn_l18_pf_set(cuda_ctx->device, cgraph->nodes[i], r.p, r.n, r.nr);
+        return;
     }
     ggml_cuda_fn_l6_l2pf_launch(*cuda_ctx, r);
 }
