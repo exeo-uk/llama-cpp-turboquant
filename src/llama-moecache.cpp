@@ -329,6 +329,10 @@ struct moe_cache {
     // and PCIe traffic fall between the jobs instead of on them (0 = off)
     size_t                l18_gate      = 0;
     int                   l18_settle    = 0; // LLAMA_FN_L18_CHURN_GATE_SETTLE=<us>: a DMA starts that long after the last job's end
+    // [TAG_FN_L18_CHURN_AB] LLAMA_FN_L18_CHURN_AB=pipe|mib|gate (design measurements, needs LLAMA_MOE_HOT_STATS): one lever
+    // flips at every 256-step statistics window (mode 0 = off, 1 = on), so one session measures both under the same content
+    int                   l18_ab        = 0; // 0 off, 1 pipe (staged <-> pinned halves), 2 mib (pass budget), 3 gate
+    std::atomic<int>      l18_ab_mode   { 0 };
     // [TAG_FN_L18_CHURN_MIB] LLAMA_FN_L18_CHURN_MIB=<MiB>: the pass budget after the burst window (0 = LLAMA_MOE_HOT_DECAY_MIB)
     size_t                l18_mib       = 0;
 };
@@ -885,6 +889,12 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     if (++mc->hot_steps % 256 != 0) {
         return;
     }
+    if (mc->l18_ab > 0) { // [TAG_FN_L18_CHURN_AB] the window that ends now ran in this mode; the next one in the other
+        const int m = mc->l18_ab_mode.load(std::memory_order_relaxed);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_AB] window %" PRIu64 " ran in mode %d
+", mc->hot_steps/256, m);
+        mc->l18_ab_mode.store(m ^ 1, std::memory_order_relaxed);
+    }
     uint64_t h = 0, t = 0;
     double lo = 1.0, hi = 0.0;
     for (size_t i = 0; i < g_hot_stats.hit.size(); ++i) {
@@ -1111,7 +1121,8 @@ void hot_copy(const moe_cache * mc, void * dst, const void * src, size_t n) {
 
 // [TAG_FN_L18_CHURN_GATE] the gate holds the worker in the steady state only: the start's burst window fills at full speed
 bool hot_gate_on(const moe_cache * mc) {
-    return mc->l18_gate > 0 && mc->l18_pace_live.load(std::memory_order_relaxed);
+    return mc->l18_gate > 0 && mc->l18_pace_live.load(std::memory_order_relaxed) &&
+           (mc->l18_ab != 3 || mc->l18_ab_mode.load(std::memory_order_relaxed) == 1); // [TAG_FN_L18_CHURN_AB]
 }
 
 void hot_copy_gated(const moe_cache * mc, void * dst, const void * src, size_t n, bool nt) {
@@ -1334,7 +1345,9 @@ void hot_adapt_worker(moe_cache * mc) {
             mc->todo.erase(mc->todo.begin(), mc->todo.begin() + (std::ptrdiff_t) n);
             mc->worker_busy = true; // [TAG_FN_R1_PFS_LEND]
         }
-        const size_t n_done = mc->up_pipe ? hot_upload_pipe(mc, batch) : hot_upload_staged(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
+        // [TAG_FN_L18_CHURN_AB] pipe: the staged path in mode 0 (both buffers are allocated)
+        const bool pipe = mc->up_pipe && (mc->l18_ab != 1 || mc->l18_ab_mode.load(std::memory_order_relaxed) == 1);
+        const size_t n_done = pipe ? hot_upload_pipe(mc, batch) : hot_upload_staged(mc, batch); // [TAG_FN_L3_POLICY_UPLOAD]
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (size_t i = 0; i < batch.size(); ++i) {
             upload_job j = batch[i];
@@ -1514,7 +1527,8 @@ void hot_adapt_decay(moe_cache * mc, bool decode_step) {
     }
     // [TAG_FN_L18_CHURN_MIB] the steady state's pass budget once the start's burst window is closed (the window keeps the
     // small one, so the burst's strong pairs are not queued behind a big pass)
-    if (mc->l18_mib > 0 && !(burst_now && mc->dc_burst > 0)) {
+    if (mc->l18_mib > 0 && !(burst_now && mc->dc_burst > 0) &&
+            (mc->l18_ab != 2 || mc->l18_ab_mode.load(std::memory_order_relaxed) == 1)) { // [TAG_FN_L18_CHURN_AB]
         pass_bytes = mc->l18_mib;
     }
     size_t total_bytes = pass_bytes + (burst_now ? mc->dc_burst : 0);
@@ -1909,6 +1923,16 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         if (const char * e = llama_fn_env(model, "LLAMA_MOE_HOT_UP_MIB_STEP")) {
             mc->up_rate = (size_t) std::max(0, atoi(e)) << 20;
         }
+        // [TAG_FN_L18_CHURN_AB] before the staging buffers are made: the pipe A/B needs both
+        if (const char * e = llama_fn_env(model, "LLAMA_FN_L18_CHURN_AB"); e && e[0]) {
+            mc->l18_ab = strcmp(e, "pipe") == 0 ? 1 : strcmp(e, "mib") == 0 ? 2 : strcmp(e, "gate") == 0 ? 3 : 0;
+            if (mc->l18_ab == 1) {
+                mc->up_pipe = true;
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_AB] %s flips at every 256-step statistics window (mode 0 off, 1 on; needs "
+                    "LLAMA_MOE_HOT_STATS)\n", mc->l18_ab == 1 ? "staged / pinned halves" : mc->l18_ab == 2 ? "the pass budget" :
+                    mc->l18_ab == 3 ? "the gate" : "nothing");
+        }
     }
 
     mc->up_backend = ggml_backend_dev_init(dev, nullptr);
@@ -1939,7 +1963,7 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
             mc->up_stage_p = (uint8_t *) ggml_backend_buffer_get_base(mc->up_stage);
         }
     }
-    if (!mc->up_pipe) {
+    if (!mc->up_pipe || mc->l18_ab == 1) { // [TAG_FN_L18_CHURN_AB] both buffers for the pipe A/B
         mc->stage_size = std::min(std::max<size_t>(mc->ad_bytes, 16u << 20), UP_INFLIGHT_MAX); // [TAG_FN_L4_EXIT] one flush in flight
         if (ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev)) {
             mc->staging = ggml_backend_buft_alloc_buffer(hb, mc->stage_size);
