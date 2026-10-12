@@ -42,6 +42,10 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// [TAG_FN_L19_DRAFT_ADAPT] the cap of the adaptive MTP draft length (LLAMA_FN_L19_DRAFT_ADAPT, qwen4exp, draft-mtp, one slot),
+// 0 when it is off; the target context must roll back that many drafts (n_rs_seq)
+int32_t common_speculative_mtp_adapt_kmax(const struct llama_model * model, const common_params & params);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;

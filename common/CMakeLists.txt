@@ -107,6 +107,7 @@ add_library(${TARGET}
     speculative.cpp
     speculative.h
     speculative-mtp-cost.h
+    speculative-mtp-adapt.h
     subproc.cpp
     subproc.h
     trie.cpp

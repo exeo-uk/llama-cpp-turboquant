@@ -324,6 +324,10 @@ llama_build_and_test(test-mtp-cost.cpp)
 # simulation with stalls, draft-decode spikes and a slow start, against the fixed rules and version 1. CPU only.
 llama_build_and_test(test-mtp-cost2.cpp)
 
+# [TAG_FN_L19_DRAFT_ADAPT] adaptive MTP draft length (common/speculative-mtp-adapt.h): the expectation against an
+# enumeration, the pieces, and a round simulation against the fixed caps. CPU only.
+llama_build_and_test(test-mtp-adapt.cpp)
+
 # [TAG_FN_L3_MTP_BLOCK] block verification of sampled drafts (common/speculative-block.h): exactness by enumeration, the
 # kept length against the per-token rule, the draw. CPU only.
 llama_build_and_test(test-spec-block.cpp)

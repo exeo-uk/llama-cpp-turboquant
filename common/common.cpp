@@ -1341,6 +1341,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // [TAG_FN_L19_DRAFT_ADAPT] the adaptive MTP draft length drafts up to its cap: the target rolls back that many drafts and
+    // outputs that many rows + 1 per verify (the server sized both from --spec-draft-n-max)
+    if (const int32_t kmax = common_speculative_mtp_adapt_kmax(model, params); kmax > 0 && cparams.n_rs_seq > 0) {
+        const uint32_t n_out = (uint32_t) kmax + 1;
+        COM_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] adaptive draft cap %d: recurrent rollback ring %u -> %u drafts, outputs per "
+                "sequence %u -> %u\n", __func__, kmax, cparams.n_rs_seq, std::max(cparams.n_rs_seq, (uint32_t) kmax),
+                cparams.n_outputs_max_per_seq, cparams.n_outputs_max_per_seq > 0 ? std::max(cparams.n_outputs_max_per_seq, n_out) : 0u);
+        cparams.n_rs_seq = std::max(cparams.n_rs_seq, (uint32_t) kmax);
+        if (cparams.n_outputs_max_per_seq > 0 && cparams.n_outputs_max_per_seq < n_out) {
+            cparams.n_outputs_max_per_seq = std::min(cparams.n_batch, n_out);
+        }
+        if (cparams.n_outputs_max > 0 && cparams.n_outputs_max < n_out*cparams.n_seq_max) {
+            cparams.n_outputs_max = std::min(cparams.n_batch, n_out*cparams.n_seq_max);
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
