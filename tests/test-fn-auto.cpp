@@ -439,6 +439,39 @@ static void test_cbuf() {
     TCHECK(llama_fn_cbuf_short_max(512, 256, true, 300, 31) == 512, "a larger LLAMA_FN_L4_PROMPT wins");
     TCHECK(llama_fn_cbuf_short_max(0, 256, true, 20, 31) == 0, "a batch the SMALL reserve serves anyway: unchanged");
 
+    // [TAG_FN_L20_BIGPROMPT_TAIL] a release from the top at the tail's 1 GiB segment boundaries
+    {
+        const size_t G = (size_t) 1 << 30, M = (size_t) 1 << 20;
+        const size_t lo = 20000*M, hi = lo + 8600*M;
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, G, 0) == lo, "need 0: the whole tail");
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, G, 4300*M) == lo + 4*G, "4.2 GiB of 8.4: the top 4.4 GiB from segment 4");
+        TCHECK(hi - llama_fn_cbuf_part_lo(lo, hi, G, 4300*M) >= 4300*M, "at least what was asked");
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, G, 8600*M) == lo, "all of it: the whole tail");
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, G, 9000*M) == lo, "more than the tail: the whole tail");
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, G, 1) == lo + 8*G, "1 byte: the last (partial) segment only");
+        TCHECK(llama_fn_cbuf_part_lo(lo, hi, 0, 100*M) == lo, "no segment size: the whole tail");
+        TCHECK(llama_fn_cbuf_part_lo(lo, lo, G, 100*M) == lo, "empty tail");
+        TCHECK((llama_fn_cbuf_part_lo(lo, hi, G, 3*G) - lo) % G == 0, "always a segment boundary");
+    }
+    // [TAG_FN_L20_BIGPROMPT_UB] the FULL width and the narrow parts of a prompt that goes on
+    TCHECK(llama_fn_l20_full_width(0, 8192, 9000, -1) == 8192, "off: n_ubatch");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 16384, 16388) == 16384, "a full big batch: big");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 7647, 16388) == 16384, "the first part of a 24K prompt: big (the rest follows)");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 2000, 0) == 8192, "a 2K turn: the command's width");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 8192, 0) == 8192, "exactly 8192: the command's width");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 6000, 2500) == 16384, "6000 + 2500 after it: big");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 6000, 2192) == 8192, "6000 + 2192 = 8192: the command's width");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 9000, -1) == 16384, "no hint, a 9000-token batch: big");
+    TCHECK(llama_fn_l20_full_width(8192, 16384, 5000, -1) == 8192, "no hint, 5000: the command's width");
+    TCHECK(llama_fn_l20_full_width(16384, 16384, 20000, -1) == 16384, "base = n_ubatch: n_ubatch");
+    TCHECK(llama_fn_l20_keep_full(8192, false, false, true, 16388), "a 23-token part between two big ones keeps FULL");
+    TCHECK(!llama_fn_l20_keep_full(8192, false, false, true, 0), "the prompt's last part: as before");
+    TCHECK(!llama_fn_l20_keep_full(8192, false, false, true, -1), "no hint: as before");
+    TCHECK(!llama_fn_l20_keep_full(0, false, false, true, 16388), "off: as before");
+    TCHECK(!llama_fn_l20_keep_full(8192, false, false, false, 16388), "SMALL state: nothing to keep");
+    TCHECK(!llama_fn_l20_keep_full(8192, false, true, true, 16388), "the short path stays SMALL");
+    TCHECK(!llama_fn_l20_keep_full(8192, true, false, true, 16388), "a wide batch is FULL anyway");
+
     // [TAG_FN_L19_TTFT_TAILFULL] the last 4 tokens of a split 400-token turn keep FULL; nothing else does
     TCHECK(llama_fn_cbuf_tail_full(512, true, false, 4, 1, 400, false, 31), "split short turn: the 4-token tail stays FULL");
     TCHECK(!llama_fn_cbuf_tail_full(0, true, false, 4, 1, 400, false, 31), "off");

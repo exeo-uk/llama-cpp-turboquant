@@ -1333,6 +1333,39 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // [TAG_FN_L20_BIGPROMPT_UB] a qwen4exp target context with the compute-buffer lend takes the profile's prompt ubatch when
+    // the command asked for equal -b / -ub of at least 4096; the FULL reserve then has two widths (see llama-context.h)
+    if (model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !model.hparams.no_alloc &&
+        cparams.causal_attn) {
+        const int  ub = llama_fn_l3_int(model, "LLAMA_FN_L20_BIGPROMPT_UB", 0);
+        const char * cb = llama_fn_env(model, "LLAMA_FN_CBUF");
+        if (ub > 0 && (uint32_t) ub > cparams.n_ubatch && cparams.n_ubatch >= 4096 && cparams.n_batch == cparams.n_ubatch &&
+            cb && atoi(cb) != 0 && (uint32_t) ub <= cparams.n_ctx) {
+            l20_base_ub      = cparams.n_ubatch;
+            cparams.n_batch  = (uint32_t) ub;
+            cparams.n_ubatch = (uint32_t) ub;
+            LLAMA_LOG_WARN("%s: [TAG_FN_L20_BIGPROMPT_UB] prompts wider than %u tokens run in ubatches of %u (n_batch = n_ubatch "
+                    "= %u; other wide batches keep %u-token graphs)\n", __func__, l20_base_ub, (uint32_t) ub, (uint32_t) ub,
+                    l20_base_ub);
+        }
+    }
+
+    // [TAG_FN_L20_BIGPROMPT_DFTUB] the MTP draft context of qwen4exp with the switch: its wide n_ubatch only while the target
+    // runs a big prompt (dft_set_wide), the narrow SPEC_DFT_UBATCH width otherwise
+    if (model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !model.hparams.no_alloc &&
+        llama_fn_l3_int(model, "LLAMA_FN_L20_BIGPROMPT_DFTUB", 0) > 0) {
+        int narrow = 128;
+        if (const char * e = getenv("SPEC_DFT_UBATCH"); e && atoi(e) > 0) {
+            narrow = atoi(e);
+        }
+        if ((uint32_t) narrow < cparams.n_ubatch) {
+            dft_narrow = (uint32_t) narrow;
+            dft_wide   = false;
+            LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_DFTUB] MTP draft context: ubatches of %u while the target runs a big prompt, "
+                    "%u otherwise (the compute reserve follows)\n", __func__, cparams.n_ubatch, dft_narrow);
+        }
+    }
+
     // [TAG_FN_R2_BRIDGE_UB] with a ring (n_rs_seq > 0) the hybrid and recurrent memories split every batch with
     // n_keep_tail = n_rs_seq + 1 and need n_ubatch > n_keep_tail (llama_batch_allocr::split_equal asserts it). The ring
     // the MoE bridge adds must not push a small ubatch over that limit: in the push #1 gate llama-perplexity -ub 3 with
@@ -3288,6 +3321,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
+        // [TAG_FN_L20_BIGPROMPT_PLEPRE] this ubatch read its PLE rows: the next prompt batch's go to the read-ahead thread now,
+        // so they are in the row cache when that batch's inputs are set (values unchanged: the same rows, read earlier)
+        if (!l20_ple_toks.empty()) {
+            if (l20_ple_n++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_PLEPRE] the next %d prompt tokens' PLE rows are read ahead\n", __func__,
+                        (int) l20_ple_toks.size() - l20_ple_first);
+            }
+            llama_ple_prefetch_ext(this, l20_ple_seq, l20_ple_pos0, l20_ple_toks.data(), (int32_t) l20_ple_toks.size(), l20_ple_first);
+            l20_ple_toks.clear();
+        }
+
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
@@ -3853,10 +3897,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         cbuf_prev_n   = n_tokens_all;
         cbuf_prev_out = n_outputs_all > 0;
-        if (!cbuf_set(wide || cbuf_pinned || tail_full)) {
+        // [TAG_FN_L20_BIGPROMPT_UB] the FULL width by this batch and the rest of its prompt; a narrow part of a prompt that
+        // goes on stays FULL (its tokens run with the tail out, as any narrow ubatch under FULL)
+        uint32_t full_w    = 0;
+        bool     keep_full = false;
+        if (l20_base_ub > 0) {
+            const int64_t after = l20_prompt_after;
+            full_w    = llama_fn_l20_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after);
+            keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
+            if (keep_full && l20_n_keep++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
+                        __func__, (int) n_tokens_all, (int) after);
+            }
+        }
+        l20_prompt_after = -1;
+        if (!cbuf_set(wide || cbuf_pinned || tail_full || keep_full, full_w)) {
             return -2;
         }
     }
+    l20_prompt_after = -1;
     if (cbuf_state == CBUF_SMALL && llama_moe_hot_cbuf_out()) {
         if (++cbuf_n_retry % 64 == 0) {
             cbuf_retry_restore(); // the tail could not come back at the switch: try again now and then
@@ -3920,7 +3979,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     // [TAG_FN_L4_MEM_PROMPT] the short path splits at the SMALL reserve's width
-    const uint32_t n_ubatch_split = cbuf_short ? std::min(cparams.n_ubatch, cbuf_small_t) : cparams.n_ubatch;
+    uint32_t n_ubatch_split = cbuf_short ? std::min(cparams.n_ubatch, cbuf_small_t) : cparams.n_ubatch;
+    if (!cbuf_short && cbuf_state == CBUF_FULL && l20_base_ub > 0 && cbuf_full_t > 0) {
+        n_ubatch_split = std::min(n_ubatch_split, cbuf_full_t); // [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve's width
+    }
+    if (dft_narrow > 0 && !dft_wide) {
+        n_ubatch_split = std::min(n_ubatch_split, dft_narrow); // [TAG_FN_L20_BIGPROMPT_DFTUB] the draft's reserve width
+    }
     const int64_t  t_short0       = cbuf_short ? ggml_time_us() : 0;
 
     while (true) {
@@ -6386,6 +6451,12 @@ bool llama_context::cbuf_wanted() const {
 
 uint32_t llama_context::reserve_n_tokens() const {
     const uint32_t n = std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (dft_narrow > 0 && !dft_wide) {
+        return std::min(n, dft_narrow); // [TAG_FN_L20_BIGPROMPT_DFTUB]
+    }
+    if (cbuf_state == CBUF_FULL && l20_base_ub > 0 && cbuf_full_t > 0) {
+        return std::min(n, cbuf_full_t); // [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve's width now
+    }
     return cbuf_state == CBUF_SMALL ? std::min(n, cbuf_small_t) : n;
 }
 
@@ -6426,6 +6497,16 @@ void llama_context::cbuf_off() {
     }
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
+    if (l20_base_ub > 0) {
+        // [TAG_FN_L20_BIGPROMPT_UB] no lend: a FULL reserve for good, at the command's ubatch (as without the switch)
+        LLAMA_LOG_WARN("%s: [TAG_FN_L20_BIGPROMPT_UB] no compute-buffer lend: back to n_batch = n_ubatch = %u\n", __func__,
+                l20_base_ub);
+        cparams.n_batch  = l20_base_ub;
+        cparams.n_ubatch = l20_base_ub;
+        l20_base_ub      = 0;
+        cbuf_full_t      = 0;
+        cbuf_free_compute();
+    }
     cbuf_state         = CBUF_OFF;
     sched_need_reserve = true;
     sched_reserve();
@@ -6472,14 +6553,37 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     sched_need_reserve = true;
     sched_reserve();
     const size_t full = cbuf_compute_bytes(dev);
+    if (l20_base_ub > 0) {
+        // [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve at the command's width as well (state FULL, width l20_base_ub)
+        cbuf_state         = CBUF_FULL;
+        cbuf_full_t        = l20_base_ub;
+        cbuf_free_compute();
+        sched_reserve();
+        l20_full_base_b    = cbuf_compute_bytes(dev);
+        cbuf_full_t        = 0;
+        cbuf_free_compute();
+    }
     cbuf_state         = CBUF_SMALL;
     sched_need_reserve = true;
     sched_reserve();
     const size_t small = cbuf_compute_bytes(dev);
+    if (l20_base_ub > 0) {
+        // [TAG_FN_L20_BIGPROMPT_DFTUB] the draft context's wide reserve rides on the big prompt's tail
+        if (llama_context * dft = l20_draft()) {
+            const size_t d0 = dft->cbuf_compute_bytes(dev);
+            if (dft->dft_set_wide(true)) {
+                const size_t d1 = dft->cbuf_compute_bytes(dev);
+                l20_dft_extra = d1 > d0 ? d1 - d0 : 0;
+            }
+            dft->dft_set_wide(false);
+            LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_DFTUB] the draft context's wide reserve adds %.0f MiB (%.0f MiB narrow): in the "
+                    "tail\n", __func__, l20_dft_extra/MiB, d0/MiB);
+        }
+    }
     // the FULL reserve once the hot set exists can be larger (more splits: +235 MiB at -c 16384), and a larger tail costs
     // the decode nothing (all of it is mapped between prompts): a slack of max(128 MiB, FULL / 16)
     cbuf_slack_b = std::max<size_t>((size_t) 128 << 20, full/16);
-    const size_t tail = llama_fn_cbuf_tail(full, small, (cbuf_pool_mib << 20) + cbuf_slack_b, gran, (size_t) 256 << 20);
+    const size_t tail = llama_fn_cbuf_tail(full, small, (cbuf_pool_mib << 20) + cbuf_slack_b + l20_dft_extra, gran, (size_t) 256 << 20);
     if (tail == 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the FULL compute reserve (%.0f MiB) is not much larger than the SMALL one "
                 "(%.0f MiB): off\n", __func__, full/MiB, small/MiB);
@@ -6488,6 +6592,14 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     cbuf_full_b  = full;
     cbuf_small_b = small;
+    if (l20_base_ub > 0) {
+        // [TAG_FN_L20_BIGPROMPT_UB] the tail's top part a FULL reserve at the command's width needs, with its own slack
+        const size_t slack_b = std::max<size_t>((size_t) 128 << 20, l20_full_base_b/16);
+        l20_base_need = l20_full_base_b > small ? l20_full_base_b - small + (cbuf_pool_mib << 20) + slack_b : 0;
+        LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] compute reserve FULL %.0f MiB at %u tokens (a prompt wider than that), "
+                "%.0f MiB at %u (other wide batches: %.0f MiB of the tail given back)\n", __func__, full/MiB, cparams.n_ubatch,
+                l20_full_base_b/MiB, l20_base_ub, l20_base_need/MiB);
+    }
     LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] compute reserve FULL %.0f MiB (ubatch %u), SMALL %.0f MiB (<= %u tokens): the hot "
             "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB + %.0f MiB slack)\n", __func__,
             full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib,
@@ -6498,8 +6610,11 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
 // before a batch: wider than SMALL -> FULL (the tail gives its VRAM back first), narrow -> SMALL (FULL goes first, then the
 // tail comes back and is refilled). The device use never passes the larger of the two states'. false: a reserve failed
 // (another process took the VRAM): the batch fails, the next one tries again
-bool llama_context::cbuf_set(bool full) {
+bool llama_context::cbuf_set(bool full, uint32_t width) {
     const int want = full ? CBUF_FULL : CBUF_SMALL;
+    // [TAG_FN_L20_BIGPROMPT_UB] the FULL width: n_ubatch unless a narrower class was asked for. It is chosen at the switch
+    // and kept until SMALL: a wider batch under the narrower FULL runs in ubatches of that width (correct, no re-reserve)
+    const uint32_t w_want = l20_base_ub > 0 && full ? (width > 0 && width < cparams.n_ubatch ? width : cparams.n_ubatch) : 0;
     if (cbuf_state == CBUF_OFF || cbuf_state == want) {
         return true;
     }
@@ -6538,7 +6653,11 @@ bool llama_context::cbuf_set(bool full) {
     // [TAG_FN_L19_TTFT_HUSH] bit 1: the FULL reserve's allocation without the warm pass's page faults beside it
     llama_fn_hush_scope hush_full((l19_hush & 1) != 0 && full);
     if (full) {
-        released           = llama_moe_hot_cbuf_release(this);
+        // [TAG_FN_L20_BIGPROMPT_UB] the command's width: only the tail's top part goes out
+        const bool base_w  = l20_base_ub > 0 && w_want == l20_base_ub && l20_base_need > 0;
+        released           = llama_moe_hot_cbuf_release(this, base_w ? l20_base_need : 0);
+        cbuf_full_t        = l20_base_ub > 0 ? (base_w ? l20_base_ub : cparams.n_ubatch) : 0;
+        (base_w ? l20_n_base : l20_n_big) += l20_base_ub > 0 ? 1 : 0;
         cbuf_state         = CBUF_FULL;
         sched_need_reserve = true;
         try {
@@ -6552,6 +6671,12 @@ bool llama_context::cbuf_set(bool full) {
             return false;
         }
         cbuf_n_full++;
+        // [TAG_FN_L20_BIGPROMPT_DFTUB] a big prompt: the draft context's wide reserve in the tail's room (it stays narrow if not)
+        if (l20_dft_extra > 0 && cbuf_full_t == cparams.n_ubatch) {
+            if (llama_context * dft = l20_draft()) {
+                dft->dft_set_wide(true);
+            }
+        }
         const size_t full_now = cbuf_compute_bytes(dev);
         if (full_now > cbuf_full_b + cbuf_slack_b && !cbuf_grew) {
             cbuf_grew = true;
@@ -6593,7 +6718,13 @@ bool llama_context::cbuf_set(bool full) {
 // grew, the tail is mapped and refilled, then SMALL is reserved. A SMALL reserve that fails gives the tail back (its layers
 // sit out) and tries once more. false: no reserve now (the next batch tries again).
 bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored) {
+    if (l20_dft_extra > 0) {
+        if (llama_context * dft = l20_draft()) {
+            dft->dft_set_wide(false); // [TAG_FN_L20_BIGPROMPT_DFTUB]
+        }
+    }
     cbuf_state = CBUF_SMALL;
+    cbuf_full_t = 0; // [TAG_FN_L20_BIGPROMPT_UB]
     cbuf_free_compute();
     if (cbuf_trim) {
         // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
@@ -7477,6 +7608,70 @@ void llama_quiesce_ext(llama_context * ctx) {
 void llama_fn_ready_ext(llama_context * ctx) {
     if (ctx) {
         ctx->fn_ready(); // [TAG_FN_L18_FIRSTANS_FIT]
+    }
+}
+
+// [TAG_FN_L20_BIGPROMPT_DFTUB] the model's MTP draft context with two widths (nullptr: none)
+llama_context * llama_context::l20_draft() const {
+    for (const auto & [c, type] : llama_fn_ctx_list(model)) {
+        if (c != this && type == (int) LLAMA_CONTEXT_TYPE_MTP && c->dft_narrow > 0) {
+            return c;
+        }
+    }
+    return nullptr;
+}
+
+// [TAG_FN_L20_BIGPROMPT_DFTUB] the draft context's reserve at the wide or the narrow width: its work is done first, the
+// compute buffers and graphs go, the new reserve is made. A wide reserve that fails falls back to narrow (false).
+bool llama_context::dft_set_wide(bool wide) {
+    if (dft_narrow == 0 || dft_wide == wide) {
+        return true;
+    }
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    dft_wide = wide;
+    cbuf_free_compute();
+    try {
+        sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L20_BIGPROMPT_DFTUB] the draft context's %s reserve failed (%s): narrow\n", __func__,
+                wide ? "wide" : "narrow", err.what());
+        dft_wide = false;
+        cbuf_free_compute();
+        sched_reserve(); // the narrow reserve held before; a failure here throws as any reserve
+        return false;
+    }
+    if (wide && dft_n_wide++ < 3) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_DFTUB] draft context wide (%u-token ubatches) for a big prompt\n", __func__,
+                cparams.n_ubatch);
+    }
+    return true;
+}
+
+void llama_fn_prompt_after_ext(llama_context * ctx, int32_t n_after) {
+    if (ctx) {
+        ctx->fn_prompt_after(n_after); // [TAG_FN_L20_BIGPROMPT_UB]
+    }
+}
+
+void llama_context::fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first) {
+    l20_ple_toks.clear();
+    if (toks == nullptr || n <= 0 || i_first < 0 || i_first >= n) {
+        return;
+    }
+    l20_ple_seq   = seq;
+    l20_ple_pos0  = pos0;
+    l20_ple_first = i_first;
+    l20_ple_toks.assign(toks, toks + n);
+}
+
+void llama_fn_ple_next_ext(llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks, int32_t n,
+        int32_t i_first) {
+    if (ctx) {
+        ctx->fn_ple_next(seq_id, pos0, toks, n, i_first); // [TAG_FN_L20_BIGPROMPT_PLEPRE]
     }
 }
 

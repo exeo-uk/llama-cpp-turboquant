@@ -125,7 +125,10 @@ bool   llama_moe_hot_cbuf_out();
 // [TAG_FN_L3_VRAM_CBUF] the owner's graphs are synchronized: the tail layers leave both tables and the hot chain
 // (llama_moe_cache_lookup returns nullptr for them while they are out), uploads into them stop, then the tail's VRAM goes
 // back to the driver. Returns the bytes given back (0: no tail, already out, or another owner).
-size_t llama_moe_hot_cbuf_release(const void * owner);
+// [TAG_FN_L20_BIGPROMPT_TAIL] need > 0: only the tail's top part (whole mapped segments, at least need bytes; the layers in it
+// or within a granule below it are lent); called again with more (need 0 = the whole tail) it gives back the rest. Returns
+// the bytes given back by this call.
+size_t llama_moe_hot_cbuf_release(const void * owner, size_t need = 0);
 
 // [TAG_FN_L3_VRAM_CBUF] map the tail again, clear it, upload the tail layers' resident experts and restore their tables.
 // false: the mapping failed, the tail layers stay out (correct, fewer hot slots) and the next call tries again.
