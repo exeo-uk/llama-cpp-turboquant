@@ -3542,6 +3542,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t          ad_proc_rows = 0;     // rows of the last one
     int32_t          ad_skip      = 0;     // rounds after a prompt left out of the time samples
     FILE *           ad_trace     = nullptr; // LLAMA_FN_L19_DRAFT_ADAPT_TRACE=<file>: one CSV line per round
+    float            ad_p[common_mtp_adapt::K_MAX] = {}; // the drafter's top p at each decoded position of the round
+    int32_t          ad_acc       = -1;    // drafts the target accepted (-1: no accept() yet)
+    double           ad_td_us     = 0.0;   // the round's draft decodes, sampling included
 
     void fuse_clear(llama_seq_id s) {
         fuse_tok[s].clear();
@@ -4450,13 +4453,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ad.observe(ad_dec, 0, 0);
             }
             ad_open = false;
+            double tv_us = -1.0; // the round's verify step, -1 when it is no sample
             if (ad_t_end > 0 && ad_n_proc == 1 && ad_proc_rows == ad_rows) {
                 if (ad_skip > 0) {
                     ad_skip--;
-                } else {
-                    ad.add_verify(ad_rows, (double) (t0 - ad_t_end));
+                } else if (ad.add_verify(ad_rows, (double) (t0 - ad_t_end))) {
+                    tv_us = (double) (t0 - ad_t_end);
                 }
             }
+            if (ad_trace && ad_cap > 0) {
+                // cap, decodes, proposed, accepted, top p per decoded position, draft us, verify us, priced verify us W=1..5
+                fprintf(ad_trace, "%d,%d,%d,%d", ad_cap, ad_dec, ad_prop, ad_acc);
+                for (int k = 0; k < common_mtp_adapt::K_MAX; ++k) {
+                    fprintf(ad_trace, ",%.4f", k < ad_dec ? ad_p[k] : -1.0f);
+                }
+                fprintf(ad_trace, ",%.0f,%.0f", ad_td_us, tv_us);
+                for (int w = 1; w <= common_mtp_adapt::W_MAX; ++w) {
+                    fprintf(ad_trace, ",%.0f", ad.t_verify(w));
+                }
+                fprintf(ad_trace, "%s", "\n");
+                fflush(ad_trace); // the harness may stop the server without an exit
+            }
+            ad_acc   = -1;
+            ad_td_us = 0.0;
             ad_t_end  = 0;
             ad_n_proc = 0;
             ad_dec    = 0;
@@ -4675,6 +4694,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
+                if (ad_on && seq_id == 0 && i < common_mtp_adapt::K_MAX && cur_p->size > 0) {
+                    ad_p[i] = cur_p->data[0].p; // [TAG_FN_L19_DRAFT_ADAPT]
+                }
+
                 // [TAG_MTP_DISTS] At temp > 0 the target can use rejection sampling - accept with
                 // probability p/q - but ONLY if we hand it q, the distribution this draft token was
                 // actually sampled from (the server checks dists.size() == draft.size()). Without it
@@ -4838,7 +4861,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cost2.add_td(cost_nit, (double) (ggml_time_us() - cost_it0)); // [TAG_FN_L3_MTP_COST2]
             }
             if (ad_on) {
-                ad.add_decode(i == 0, (double) (ggml_time_us() - cost_it0)); // [TAG_FN_L19_DRAFT_ADAPT]
+                const double us = (double) (ggml_time_us() - cost_it0);
+                ad.add_decode(i == 0, us); // [TAG_FN_L19_DRAFT_ADAPT]
+                ad_td_us += us;
             }
 
             if (batch.size() == 0) {
@@ -4873,18 +4898,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 ad_open = ad_dec > 0;
                 ad_rows = ad_prop + 1;
-                if (ad_trace) {
-                    // cap, decodes, proposed, pass/acc per position, verify us per width, td0, td1
-                    fprintf(ad_trace, "%d,%d,%d", ad_cap, ad_dec, ad_prop);
-                    for (int k = 0; k < common_mtp_adapt::K_MAX; ++k) {
-                        fprintf(ad_trace, ",%.3f,%.3f", ad.pass[k], ad.acc[k]);
-                    }
-                    for (int w = 1; w <= common_mtp_adapt::W_MAX; ++w) {
-                        fprintf(ad_trace, ",%.0f", ad.t_verify(w));
-                    }
-                    fprintf(ad_trace, ",%.0f,%.0f\n", ad.t_d0(), ad.t_d1());
-                    fflush(ad_trace); // the harness may stop the server without an exit
-                }
                 if (ad.log > 0 && ad.n_round % 512 == 0) {
                     ad_log_summary("every 512 rounds");
                 }
@@ -4977,6 +4990,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (ad_on && ad_open && seq_id == 0) {
             ad.observe(ad_dec, ad_prop, n_accepted);
             ad_open = false;
+            ad_acc  = n_accepted;
         }
 
         // [TAG_FN_MTP_COST] calibrate the acceptance per drafter probability from what the target kept
