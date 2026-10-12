@@ -3116,7 +3116,7 @@ private:
 
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
-                keepctx_switch(*ret, task.tokens);
+                keepctx_switch(*ret, task.tokens, task.params.cache_prompt);
             }
 
             update_cache = update_cache && prompt_cache;
@@ -3263,8 +3263,8 @@ private:
         return (int) best;
     }
 
-    // [TAG_FN_L18_KEEPCTX] slot is idle and about to take a prompt of tokens
-    void keepctx_switch(server_slot & slot, const server_tokens & tokens) {
+    // [TAG_FN_L18_KEEPCTX] slot is idle and about to take a prompt of tokens (cache_prompt: it reuses what the slot holds)
+    void keepctx_switch(server_slot & slot, const server_tokens & tokens, bool cache_prompt) {
         const int n_cur   = slot.prompt.n_tokens();
         const int lcp_cur = n_cur > 0 ? (int) slot.prompt.tokens.get_common_prefix(tokens) : 0;
         const int use_cur = n_cur > 0 ? keepctx_usable(slot.prompt, lcp_cur) : 0;
@@ -3279,7 +3279,7 @@ private:
                 it_best  = it;
             }
         }
-        const bool restore = it_best != keepctx->entries.end() && use_best >= use_cur + keepctx_min;
+        const bool restore = cache_prompt && it_best != keepctx->entries.end() && use_best >= use_cur + keepctx_min;
 
         // the slot loses most of its content and at least keepctx_min tokens
         if (n_cur - lcp_cur >= keepctx_min && 2*lcp_cur < n_cur) {
