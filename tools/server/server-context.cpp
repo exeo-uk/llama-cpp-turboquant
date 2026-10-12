@@ -5176,7 +5176,9 @@ private:
         }
 
         // [TAG_SYNC_CKPT_EVICT] only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        if (!min_step_always && slot.prompt.checkpoints.size() + 1 >= n_ckpt_max) {
+        // ([TAG_FN_L19_CONVSTORE_CKPT] not with the keeping rule above: it would drop, without writing them to disk, the
+        // checkpoints within --checkpoint-min-step of an older one, the last user message's and the halfway one included)
+        if (!min_step_always && !cs.ckpt && slot.prompt.checkpoints.size() + 1 >= n_ckpt_max) {
             evict_min_step();
         }
 
