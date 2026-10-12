@@ -190,11 +190,32 @@ const fn_item k_items[] = {
     // [TAG_FN_L17_ADOPT] round 17 (l17/int, the owner's command with vision, per-answer t/s, OLD 2 rounds vs 3): the hot set
     // is right at the start of an answer - short chats 75.2 -> 104.4, follow-ups 94.0 -> 106.2, ~20K answers 94.9 -> 106.6,
     // 131K answers 90.8 -> 100.4; short prompts +0.1 s (the pass). Not adopted: LLAMA_MOE_HOT_STATE (+LLAMA_FN_L17_START_STATE):
-    // first answer 74 -> 96 t/s but its load runs in the first prompt (first token 6.2 -> 8.8 s on average)
+    // first answer 74 -> 96 t/s but its load runs in the first prompt (first token 6.2 -> 8.8 s on average); round 18 adopts it
+    // with the load in the background ([TAG_FN_L18_FIRSTANS_STATE], below)
     { "LLAMA_FN_L17_START_PRE",      "2048",  P_ALL }, // [TAG_FN_L17_START_PRE]
     { "LLAMA_FN_L17_START_NT",       "1",     P_ALL }, // [TAG_FN_L17_START_NT]
     { "LLAMA_FN_L17_START_BURST",    "64",    P_ALL }, // [TAG_FN_L17_START_BURST]
     { "LLAMA_FN_L17_VISION",         "1",     P_ALL }, // [TAG_FN_L17_VISION_LEND]
+    // [TAG_FN_L18_ADOPT] round 18 (l18/int, the owner's command with vision, per-answer t/s + time to first token, OLD = main
+    // 364fd4f6a, 2 interleaved rounds + leave-one-out): the next message after a chat-title side request 27.2 s -> 0.68 s to
+    // first token (t/s 72 -> 99), short chats 94.9 -> 106.3, first answer after a start 85 -> 95-98 t/s (first token 3.7 ->
+    // 2.3 s, ready 22.9 -> 8.7 s), 32K / 131K answers 94.8 / 100.4 -> 106.4 / 102.5. LLAMA_FN_L18_FIRSTANS_OVERLAP stays off:
+    // it moved ~60 ms into an answer's first 8 tokens (short chats 106.3 -> 99.3 t/s) for 0.1 s less to first token.
+    // LLAMA_MOE_HOT_STATE=cache: the learned set is <LLAMA_CACHE or %LOCALAPPDATA%/llama.cpp>/hotstate/<model file>.hotstate
+    { "LLAMA_FN_L18_KEEPCTX",            "1",     P_ALL }, // [TAG_FN_L18_KEEPCTX] a side request no longer throws the conversation away (store on disk)
+    { "LLAMA_FN_L18_FIRSTANS_PIN",       "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_PIN] pool threads on both logical CPUs of their core (bridge wait timeouts)
+    { "LLAMA_FN_L18_FIRSTANS_FIT",       "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_FIT] the hot set fit at the server's ready call
+    { "LLAMA_FN_L18_FIRSTANS_WARMLATE",  "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_WARMLATE] the warm pass starts at ready (with FIT)
+    { "LLAMA_FN_L18_FIRSTANS_STATE",     "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_STATE] the saved set loads in the background
+    { "LLAMA_MOE_HOT_STATE",             "cache", P_ALL }, // <LLAMA_CACHE or %LOCALAPPDATA%/llama.cpp>/hotstate/<model file>.hotstate
+    { "LLAMA_FN_L17_START_STATE",        "60",    P_ALL }, // [TAG_FN_L17_START_STATE] the set is saved at idle (60 s) and at a clean exit
+    { "LLAMA_FN_L18_FIRSTANS_ONCE",      "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_ONCE] one prompt-end pass per prompt
+    { "LLAMA_FN_L18_FIRSTANS_WARM",      "1",     P_ALL }, // [TAG_FN_L18_FIRSTANS_WARM] the warm pass keeps reading during short prompts
+    { "LLAMA_MOE_HOT_UP_PIPE",           "1",     P_ALL }, // [TAG_FN_L3_POLICY_UPLOAD] steady-state uploads through two 8 MiB pinned halves
+    { "LLAMA_FN_L18_CHURN_LAYERS",       "auto",  P_ALL }, // [TAG_FN_L18_CHURN_LAYERS] the even layout's slots per layer by routing weight
+    { "GGML_CUDA_FN_L18_HCUP",           "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_HCUP] hc up loads its weights before the PDL wait
+    { "LLAMA_FN_L18_GF_GDNOUT",          "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_GDNOUT] GDN output norm + gate + q8_1 copy in one launch
+    { "LLAMA_FN_L18_GF_QKVZ",            "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_QKVZ] GDN qkv and z projections in one launch
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
