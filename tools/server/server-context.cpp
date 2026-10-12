@@ -3272,6 +3272,14 @@ private:
     //                                        drops the reasoning of the last answer resumes at the assistant turn; -1 = off;
     //                                        _OPENER_AUTO=1: only for a conversation whose last prompt re-rendered the answer
     //                                        before it (a client that sends the answer back as it was never needs it)
+    //
+    // [TAG_FN_L20_CONVFIX] the store's own cost (default off; the bytes and the answers are the same):
+    //   LLAMA_FN_L20_CONVFIX_IO=1     [_IO] a store / restore allocates nothing: the restored checkpoints take the outgoing
+    //                                 ring's buffers, the pipe blocks and the pinned piece are allocated once
+    //   LLAMA_FN_L20_CONVFIX_LAZY=1   [_LAZY] a restore reads the target and draft states only; the stored checkpoints stay
+    //                                 on disk as the slot's checkpoints on disk (read back when a prompt resumes at one,
+    //                                 stored again without a write); needs LLAMA_FN_L19_CONVSTORE, not with _CKPT + _SPILL
+    //   LLAMA_FN_L20_CONVFIX_TRACE=1  [_TRACE] the parts of a store / restore in its log line
     void keepctx_init() {
         keepctx.reset();
         auto env_ll = [&](const char * name, long long def) {
@@ -3326,8 +3334,10 @@ private:
         // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
         kp.io_reuse = env_ll("LLAMA_FN_L20_CONVFIX_IO", 0) != 0;
         kp.trace    = env_ll("LLAMA_FN_L20_CONVFIX_TRACE", 0) != 0;
-        // [TAG_FN_L20_CONVFIX_LAZY] (needs LLAMA_FN_L19_CONVSTORE: the slot's checkpoints on disk)
-        kp.lazy     = cs.on && env_ll("LLAMA_FN_L20_CONVFIX_LAZY", 0) != 0;
+        // [TAG_FN_L20_CONVFIX_LAZY] (needs LLAMA_FN_L19_CONVSTORE: the slot's checkpoints on disk). Not beside the keeping
+        // rule's checkpoints on disk (_CKPT + _SPILL): those stay for many turns, and a checkpoint left in an old store
+        // file keeps the whole file on disk; with the ring of before the two together keep only the newest few
+        kp.lazy     = cs.on && !cs.spill && env_ll("LLAMA_FN_L20_CONVFIX_LAZY", 0) != 0;
         keepctx_min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_MIN", 512));
         auto kc = std::make_unique<server_keepctx>(kp);
         if (!kc->ok()) {
