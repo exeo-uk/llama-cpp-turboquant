@@ -88,9 +88,11 @@ std::atomic<bool>       g_quiet_on{false};
 std::atomic<uint64_t>   g_quiet_waits{0};
 std::atomic<uint64_t>   g_quiet_wait_us{0};
 
-// [TAG_FN_L18_CHURN_GATE] the CPU jobs in flight, counted only while a hot set asks for it (g_gate_on > 0)
+// [TAG_FN_L18_CHURN_GATE] the CPU jobs in flight, counted only while a hot set asks for it (g_gate_on > 0), and when the
+// last one completed (steady clock ns)
 std::atomic<int>      g_gate_on{0};
 std::atomic<int>      g_gate_busy{0};
+std::atomic<int64_t>  g_gate_end_ns{0};
 std::atomic<uint64_t> g_gate_waits{0};
 std::atomic<uint64_t> g_gate_wait_us{0};
 
@@ -639,6 +641,7 @@ static void br_exec_main(llama_moe_bridge * br) {
             const bool ok = br_run(&job, br);
             br->fn_complete(br->gb, &job, ok);
             if (gate) {
+                g_gate_end_ns.store(br_now_ns(), std::memory_order_relaxed);
                 g_gate_busy.fetch_sub(1, std::memory_order_acq_rel);
             }
             if (br->probe && job.chan >= 0 && job.chan < (int) br->chans.size()) { // [TAG_FN_L14_PROBE]
@@ -1239,14 +1242,23 @@ void llama_moe_bridge_gate_enable(bool on) {
     g_gate_on.fetch_add(on ? 1 : -1, std::memory_order_acq_rel);
 }
 
-bool llama_moe_bridge_gate_wait(int max_us) {
-    if (g_gate_on.load(std::memory_order_relaxed) <= 0 || g_gate_busy.load(std::memory_order_acquire) <= 0) {
+bool llama_moe_bridge_gate_wait(int max_us, int settle_us) {
+    if (g_gate_on.load(std::memory_order_relaxed) <= 0) {
+        return true;
+    }
+    // closed: a job runs, or the last one completed less than settle_us ago (the device reads its result then)
+    const int64_t settle_ns = (int64_t) std::max(0, settle_us)*1000;
+    auto closed = [&]() {
+        return g_gate_busy.load(std::memory_order_acquire) > 0 ||
+               (settle_ns > 0 && br_now_ns() - g_gate_end_ns.load(std::memory_order_relaxed) < settle_ns);
+    };
+    if (!closed()) {
         return true;
     }
     const auto t0 = std::chrono::steady_clock::now();
     bool ok = true;
     // pause only: the waiting thread shares a core with a pool worker, which keeps the core's resources this way
-    for (uint32_t k = 1; g_gate_busy.load(std::memory_order_acquire) > 0; ++k) {
+    for (uint32_t k = 1; closed(); ++k) {
         br_relax();
         if ((k & 63) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(std::max(1, max_us))) {
             ok = false;

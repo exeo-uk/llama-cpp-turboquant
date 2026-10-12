@@ -147,9 +147,10 @@ void llama_moe_bridge_quiet_wait(int max_ms);
 // [TAG_FN_L18_CHURN_GATE] LLAMA_FN_L18_CHURN_GATE (qwen4exp, spin executors): the hot set's upload copies wait here while
 // a CPU expert job runs (the executor marks each job from its take to its completion), so the copies and their DMA run
 // between jobs. gate_enable(true) turns the marking on (reference counted); gate_wait returns true at once when it is off
-// or no job runs, false after max_us of waiting. gate_stats: the waits and their total time.
+// or no job runs and the last one completed at least settle_us ago, false after max_us of waiting. gate_stats: the waits
+// and their total time.
 void llama_moe_bridge_gate_enable(bool on);
-bool llama_moe_bridge_gate_wait(int max_us);
+bool llama_moe_bridge_gate_wait(int max_us, int settle_us = 0);
 void llama_moe_bridge_gate_stats(uint64_t * n_waits, uint64_t * wait_us);
 
 // [TAG_FN_L16_PLEGATE] LLAMA_FN_L16_PLE_GATE (qwen4exp, spin waits): the bridge has one more channel that no layer posts

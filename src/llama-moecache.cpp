@@ -328,6 +328,7 @@ struct moe_cache {
     // the DMA of what it staged, only while no CPU expert job runs (llama_moe_bridge_gate_wait), so the uploads' DRAM reads
     // and PCIe traffic fall between the jobs instead of on them (0 = off)
     size_t                l18_gate      = 0;
+    int                   l18_settle    = 0; // LLAMA_FN_L18_CHURN_GATE_SETTLE=<us>: a DMA starts that long after the last job's end
     // [TAG_FN_L18_CHURN_MIB] LLAMA_FN_L18_CHURN_MIB=<MiB>: the pass budget after the burst window (0 = LLAMA_MOE_HOT_DECAY_MIB)
     size_t                l18_mib       = 0;
 };
@@ -1155,7 +1156,7 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
         }
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the copies read host memory too
         if (hot_gate_on(mc)) {
-            llama_moe_bridge_gate_wait(L18_GATE_MAX_US); // [TAG_FN_L18_CHURN_GATE] the DMA starts between two jobs
+            llama_moe_bridge_gate_wait(L18_GATE_MAX_US, mc->l18_settle); // [TAG_FN_L18_CHURN_GATE] the DMA starts between two jobs
         }
         for (const auto & x : st) {
             ggml_backend_tensor_set_async(mc->up_backend, x.dst, half(h) + x.stage_off, x.off, x.size);
@@ -1237,7 +1238,7 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
     auto flush = [&]() {
         llama_moe_bridge_quiet_wait(100); // [TAG_FN_L3_HOST_QUIET] the copies read host memory too
         if (hot_gate_on(mc)) {
-            llama_moe_bridge_gate_wait(L18_GATE_MAX_US); // [TAG_FN_L18_CHURN_GATE]
+            llama_moe_bridge_gate_wait(L18_GATE_MAX_US, mc->l18_settle); // [TAG_FN_L18_CHURN_GATE]
         }
         for (const auto & x : st) {
             ggml_backend_tensor_set_async(mc->up_backend, x.dst, mc->stage_ptr + x.stage_off, x.off, x.size);
@@ -2096,10 +2097,12 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
         }
         // [TAG_FN_L18_CHURN_GATE]
         if (const int kib = llama_fn_l3_int(model, "LLAMA_FN_L18_CHURN_GATE", 0); kib > 0) {
-            mc->l18_gate = (size_t) std::max(16, std::min(65536, kib)) << 10;
+            mc->l18_gate   = (size_t) std::max(16, std::min(65536, kib)) << 10;
+            mc->l18_settle = std::max(0, std::min(1000, llama_fn_l3_int(model, "LLAMA_FN_L18_CHURN_GATE_SETTLE", 0)));
             llama_moe_bridge_gate_enable(true);
             LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_GATE] uploads copied in %zu KiB pieces between the CPU expert jobs (a "
-                    "piece and a DMA start only while no job runs, at most %d us of waiting each)\n", mc->l18_gate >> 10, L18_GATE_MAX_US);
+                    "piece and a DMA start only while no job runs, a DMA %d us after the last job's end at the earliest, at most "
+                    "%d us of waiting each; the burst window at full speed)\n", mc->l18_gate >> 10, mc->l18_settle, L18_GATE_MAX_US);
         }
     }
 
