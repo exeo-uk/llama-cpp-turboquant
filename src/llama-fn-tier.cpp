@@ -49,6 +49,9 @@ static int64_t fn_warm_now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static std::atomic<size_t> g_warm_mark{0};
+// [TAG_FN_L18_FIRSTANS_WARMLATE] the pass starts at llama_fn_warm_go(true) (the caller is ready) or at the second trunk decode
+static std::atomic<bool>   g_warm_late{false};
+static std::atomic<int>    g_warm_decodes{0};
 static std::vector<size_t> g_warm_layer_end;
 
 namespace {
@@ -785,7 +788,14 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
             return nullptr;
         }
         g_fn_warm_go = w->go;
-        const DWORD delay = (DWORD) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_DELAY_MS", 15000));
+        DWORD delay = (DWORD) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_DELAY_MS", 15000));
+        // [TAG_FN_L18_FIRSTANS_WARMLATE] LLAMA_FN_L18_FIRSTANS_WARMLATE=1: started at the load's end (the server's ready call),
+        // the pass no longer shares the disk and the memory manager with the projector's load and the hot set's fit (the
+        // projector took 15-16 s to load beside it, the fit at load ~6 s); the fallback delay grows to 120 s
+        if (llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_WARMLATE")) {
+            g_warm_late.store(true);
+            delay = std::max<DWORD>(delay, 120000);
+        }
         const llama_model * m = &model;
         llama_fn_tier * t = w.get();
         w->worker = std::thread([m, t, delay]() {
@@ -874,11 +884,19 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
 #endif
 
 // [TAG_FN_L15_WARM] see llama-fn-tier.h
-void llama_fn_warm_go() {
+void llama_fn_warm_go(bool ready) {
     static std::atomic<bool> done{false};
-    if (done.load(std::memory_order_relaxed) || done.exchange(true)) {
+    if (done.load(std::memory_order_relaxed)) {
         return;
     }
+    // [TAG_FN_L18_FIRSTANS_WARMLATE] the warm-up decode of the load does not start it; the ready call or the next decode does
+    if (g_warm_late.load() && !ready && g_warm_decodes.fetch_add(1) < 1) {
+        return;
+    }
+    if (done.exchange(true)) {
+        return;
+    }
+    llama_fn_stall_mark("warm pass released (ready call)", ready ? 1 : 0); // [TAG_FN_L18_FIRSTANS_STALL]
 #ifdef _WIN32
     if (g_fn_warm_go != nullptr) {
         SetEvent(g_fn_warm_go);

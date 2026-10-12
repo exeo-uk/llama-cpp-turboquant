@@ -329,6 +329,7 @@ struct moe_cache {
     // set's start (their pages read ahead first) instead of one synchronous refill; each lands and is published at an owner
     // step like any admission. The counts of what is still in flight (owner's step / wmtx)
     bool                  fa18_state       = false;
+    std::thread           fa18_pf_th; // the read-ahead of the saved residents' pages (PrefetchVirtualMemory can block)
     size_t                fa18_st_left     = 0;
     size_t                fa18_st_n        = 0;
     size_t                fa18_st_bytes    = 0;
@@ -3973,7 +3974,12 @@ void hot_state_load(moe_cache * mc) {
                 bytes += sz;
             }
         }
-        llama_fn_prefetch_ranges(ranges);
+        if (!mc->fa18_pf_th.joinable()) {
+            mc->fa18_pf_th = std::thread([r = std::move(ranges)]() {
+                llama_fn_thread_name("state-readahead"); // [TAG_FN_L18_FIRSTANS_STALL]
+                llama_fn_prefetch_ranges(r);
+            });
+        }
         {
             std::lock_guard<std::mutex> lk(mc->wmtx);
             for (const auto & u : ups) {
@@ -4569,6 +4575,9 @@ void llama_moe_hot_stop(const void * owner) {
     {
         std::lock_guard<std::mutex> slk(mc->step_mtx);
         hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP]
+    }
+    if (mc->fa18_pf_th.joinable()) {
+        mc->fa18_pf_th.join(); // [TAG_FN_L18_FIRSTANS_STATE]
     }
     {
         std::lock_guard<std::mutex> lk(mc->wmtx);

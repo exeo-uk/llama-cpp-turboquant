@@ -2285,7 +2285,11 @@ void llama_context::quiesce() {
 // The first prompt after a start then skips the fit (~0.3 s), the SMALL reserve and the hot set's start, and the saved
 // learned set (LLAMA_MOE_HOT_STATE, with LLAMA_FN_L18_FIRSTANS_STATE) is already uploading in the background.
 void llama_context::fn_ready() {
-    if (!fa18_fit || !moe_hot_pending || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    if (!fa18_fit || !moe_hot_pending) {
+        llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE]
         return;
     }
     synchronize();
@@ -2298,6 +2302,7 @@ void llama_context::fn_ready() {
     if (moe_hot_pending) {
         llama_fn_stall_op(false);
         LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set fit did not run now: the first decode sizes it\n", __func__);
+        llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE]
         return;
     }
     bool reserved = true;
@@ -2312,6 +2317,7 @@ void llama_context::fn_ready() {
     llama_fn_stall_op(false);
     LLAMA_LOG_WARN("%s: [TAG_FN_L18_FIRSTANS_FIT] the hot set was sized before the first request: %.0f ms (fit + reserve%s)\n",
             __func__, (ggml_time_us() - t0)/1000.0, reserved ? "" : " failed");
+    llama_fn_warm_go(true); // [TAG_FN_L18_FIRSTANS_WARMLATE] a pass held back for the load's end starts now
 }
 
 void llama_context::synchronize() {
