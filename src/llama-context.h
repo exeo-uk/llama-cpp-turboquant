@@ -474,6 +474,10 @@ private:
     // SMALL, as after an unsplit prompt. With LLAMA_FN_L19_TTFT_CKPT_TAIL the server splits the last 4 tokens of short turns
     // too, and their SMALL switch (~0.25 s) would otherwise move in front of the first token. 0 = off
     uint32_t l19_tailfull  = 0;
+    // [TAG_FN_L20_CONVFIX_IO] LLAMA_FN_L20_CONVFIX_IO=1: the pinned piece of the streamed state reads / writes (the
+    // conversation store) is allocated once per context instead of once per call (-1 = not read yet)
+    int                     l20_io = -1;
+    ggml_backend_buffer_ptr io_stream_pinned;
     uint32_t cbuf_prev_n   = 0;     // the previous batch of this context: tokens, and whether it asked for outputs
     bool     cbuf_prev_out = true;
     uint64_t cbuf_n_tailfull = 0;

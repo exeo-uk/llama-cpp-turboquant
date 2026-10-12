@@ -5318,31 +5318,38 @@ static constexpr size_t LLAMA_IO_STREAM_PIECE = 32u*1024*1024;
 
 class llama_io_stream_piece {
 public:
+    // [TAG_FN_L20_CONVFIX_IO] keep (may be null): a pinned piece that outlives this stream (the context's), used and,
+    // when empty, filled instead of a piece of this stream's own
+    explicit llama_io_stream_piece(ggml_backend_buffer_ptr * keep = nullptr) : keep(keep) {}
+
     uint8_t * get(const ggml_tensor * tensor, size_t n) {
+        ggml_backend_buffer_ptr & pin = keep ? *keep : pinned;
         if (!pinned_tried && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
             pinned_tried = true;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-            if (hbuft) {
-                pinned.reset(ggml_backend_buft_alloc_buffer(hbuft, LLAMA_IO_STREAM_PIECE));
+            if (hbuft && (!pin || ggml_backend_buffer_get_type(pin.get()) != hbuft)) {
+                pin.reset(ggml_backend_buft_alloc_buffer(hbuft, LLAMA_IO_STREAM_PIECE));
             }
         }
-        if (pinned && n <= LLAMA_IO_STREAM_PIECE) {
-            return (uint8_t *) ggml_backend_buffer_get_base(pinned.get());
+        if (pin && n <= LLAMA_IO_STREAM_PIECE) {
+            return (uint8_t *) ggml_backend_buffer_get_base(pin.get());
         }
         plain.resize(std::max(plain.size(), n));
         return plain.data();
     }
 
 private:
-    bool                    pinned_tried = false;
-    ggml_backend_buffer_ptr pinned;
-    std::vector<uint8_t>    plain;
+    bool                      pinned_tried = false;
+    ggml_backend_buffer_ptr   pinned;
+    ggml_backend_buffer_ptr * keep = nullptr;
+    std::vector<uint8_t>      plain;
 };
 
 class llama_io_write_stream : public llama_io_write_i {
 public:
-    llama_io_write_stream(const std::function<bool(const void *, size_t)> & fn) : fn(fn) {}
+    llama_io_write_stream(const std::function<bool(const void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr) :
+            fn(fn), piece(keep) {}
 
     void write(const void * src, size_t size) override {
         if (size > 0 && !fn(src, size)) {
@@ -5373,7 +5380,8 @@ private:
 
 class llama_io_read_stream : public llama_io_read_i {
 public:
-    llama_io_read_stream(const std::function<bool(void *, size_t)> & fn) : fn(fn) {}
+    llama_io_read_stream(const std::function<bool(void *, size_t)> & fn, ggml_backend_buffer_ptr * keep = nullptr) :
+            fn(fn), piece(keep) {}
 
     void read(void * dst, size_t size) override {
         if (size > 0 && !fn(dst, size)) {
@@ -5958,7 +5966,10 @@ size_t llama_context::state_seq_write_stream(llama_seq_id seq_id, llama_state_se
         LLAMA_LOG_ERROR("%s: a device state cannot be streamed\n", __func__);
         return 0;
     }
-    llama_io_write_stream io(fn);
+    if (l20_io < 0) {
+        l20_io = llama_fn_l3_int(model, "LLAMA_FN_L20_CONVFIX_IO", 0) != 0 ? 1 : 0; // [TAG_FN_L20_CONVFIX_IO]
+    }
+    llama_io_write_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr);
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id, sizeof(seq_id));
@@ -5975,7 +5986,10 @@ size_t llama_context::state_seq_read_stream(llama_seq_id seq_id, llama_state_seq
         LLAMA_LOG_ERROR("%s: a device state cannot be streamed\n", __func__);
         return 0;
     }
-    llama_io_read_stream io(fn);
+    if (l20_io < 0) {
+        l20_io = llama_fn_l3_int(model, "LLAMA_FN_L20_CONVFIX_IO", 0) != 0 ? 1 : 0; // [TAG_FN_L20_CONVFIX_IO]
+    }
+    llama_io_read_stream io(fn, l20_io > 0 ? &io_stream_pinned : nullptr);
     try {
         uint32_t magic_read;
         io.read(&magic_read, sizeof(magic_read));

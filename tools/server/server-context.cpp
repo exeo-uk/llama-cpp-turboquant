@@ -1169,6 +1169,9 @@ struct server_slot {
 
     // [TAG_CKPT_BUFFER_REUSE] the buffer of the last evicted checkpoint, handed to the next one
     std::vector<uint8_t> ckpt_spare;
+    // [TAG_FN_L20_CONVFIX_IO] more of them: the outgoing ring's buffers a restore did not take (a restore that leaves the
+    // checkpoints on disk takes none), for the checkpoints of the next prompts
+    std::vector<std::vector<uint8_t>> ckpt_spares;
 
     // [TAG_FN_L19_CONVSTORE] the checkpoints the ring dropped (on disk), the conversation's restores from the store and the
     // end of its system + tools block (its first user message, -1 unknown)
@@ -2095,6 +2098,7 @@ private:
         bool    sys       = false; // [TAG_FN_L19_CONVSTORE_SYS] store a conversation of which a prompt keeps only the system block
         int32_t opener    = -1;    // [TAG_FN_L19_CONVSTORE_OPENER] the tail split at n - 4 from this many tokens (-1 = 512 as before)
         bool    opener_auto = true; //   only for a client that re-rendered its last answer
+        bool    lazy      = false; // [TAG_FN_L20_CONVFIX_LAZY] a restore leaves the checkpoints on disk (needs keepctx)
     } cs;
 
     server_metrics metrics;
@@ -3319,6 +3323,11 @@ private:
         }
         kp.verify   = env_ll("LLAMA_FN_L18_KEEPCTX_VERIFY", 0) != 0;
         kp.hot      = env_ll("LLAMA_FN_L18_KEEPCTX_HOT", 0) != 0;
+        // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
+        kp.io_reuse = env_ll("LLAMA_FN_L20_CONVFIX_IO", 0) != 0;
+        kp.trace    = env_ll("LLAMA_FN_L20_CONVFIX_TRACE", 0) != 0;
+        // [TAG_FN_L20_CONVFIX_LAZY] (needs LLAMA_FN_L19_CONVSTORE: the slot's checkpoints on disk)
+        kp.lazy     = cs.on && env_ll("LLAMA_FN_L20_CONVFIX_LAZY", 0) != 0;
         keepctx_min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_MIN", 512));
         auto kc = std::make_unique<server_keepctx>(kp);
         if (!kc->ok()) {
@@ -3327,9 +3336,12 @@ private:
             return;
         }
         keepctx = std::move(kc);
+        cs.lazy = kp.lazy;
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
-                "from %d tokens%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
-                kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "");
+                "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
+                kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "",
+                kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "",
+                kp.lazy ? ", [TAG_FN_L20_CONVFIX_LAZY] restores leave the checkpoints on disk" : "");
     }
 
     // [TAG_FN_L19_CONVSTORE] the end of the system + tools block: the start of the first user message (-1 unknown)
@@ -3340,6 +3352,47 @@ private:
             }
         }
         return -1;
+    }
+
+    // [TAG_FN_L20_CONVFIX_IO] the ring's size for checkpoints of `one` bytes: --ctx-checkpoints, lowered by the byte budget
+    // (the rule of create_checkpoint)
+    size_t convfix_ring_cap(size_t one) const {
+        size_t n = (size_t) std::max(1, params_base.n_ctx_checkpoints);
+        const size_t budget = slot_file_ckpt_budget_bytes();
+        if (budget > 0 && one > 0) {
+            n = std::min(n, std::max<size_t>(1, budget / one));
+        }
+        return n;
+    }
+
+    // [TAG_FN_L20_CONVFIX_LAZY] without the keeping rule the ring keeps its newest checkpoints: the checkpoints a restore
+    // left on disk count with it, so a stored conversation holds the same newest positions as before
+    void convfix_trim_disk(server_slot & slot) {
+        auto & list = slot.kc_spill.list;
+        if (list.empty()) {
+            return;
+        }
+        const size_t one = !slot.prompt.checkpoints.empty() ? slot.prompt.checkpoints.back().size() : (size_t) list.back().bytes();
+        const size_t cap = convfix_ring_cap(one);
+        std::vector<int64_t> pos;
+        for (const auto & c : slot.prompt.checkpoints) {
+            pos.push_back(c.n_tokens);
+        }
+        for (const auto & s : list) {
+            pos.push_back(s.n_tokens);
+        }
+        const int64_t n_min = convfix_keep_from(pos, cap);
+        size_t n_drop = 0;
+        for (auto it = list.begin(); it != list.end(); ) {
+            if (it->n_tokens < n_min) {
+                it = list.erase(it);
+                n_drop++;
+            } else {
+                ++it;
+            }
+        }
+        SLT_DBG(slot, "[TAG_FN_L20_CONVFIX_LAZY] %zu older checkpoints on disk dropped (ring %zu, cap %zu)\n", n_drop,
+                slot.prompt.checkpoints.size(), cap);
     }
 
     // [TAG_FN_L19_CONVSTORE_SPILL] the ring drops c to make room for a checkpoint at n_new: keep it on disk unless a kept
@@ -3424,8 +3477,10 @@ private:
         const bool            cache_prompt = task.params.cache_prompt;
 
         // [TAG_FN_L19_CONVSTORE_SPILL] the slot's checkpoints on disk that still describe its tokens
+        // [TAG_FN_L20_CONVFIX_LAZY] also the ones a restore left on disk
+        const bool disk_ckpts = cs.spill || cs.lazy;
         const std::vector<server_keepctx_spilled> * own_spill = nullptr;
-        if (cs.spill) {
+        if (disk_ckpts) {
             const int n_bad = keepctx_spill_validate(slot.prompt.tokens, slot.kc_spill.list);
             if (n_bad > 0) {
                 SLT_WRN(slot, "[TAG_FN_L19_CONVSTORE_SPILL] %d checkpoints on disk no longer match the slot's tokens, dropped\n", n_bad);
@@ -3443,7 +3498,7 @@ private:
         int  lcp_best = 0;
         for (auto it = keepctx->entries.begin(); it != keepctx->entries.end(); ++it) {
             const int lcp = (int) it->prompt.tokens.get_common_prefix(tokens);
-            const int use = keepctx_usable(it->prompt, lcp, cs.spill ? &it->spilled : nullptr);
+            const int use = keepctx_usable(it->prompt, lcp, disk_ckpts ? &it->spilled : nullptr);
             if (use > 0 && use >= use_best) {
                 use_best = use;
                 lcp_best = lcp;
@@ -3467,6 +3522,11 @@ private:
             }
         };
         if (lose_most || lose_conv) {
+            // [TAG_FN_L20_CONVFIX_LAZY] with the ring's rule of before (no keeping rule, no checkpoints on disk), the ring
+            // and the checkpoints a restore left on disk together keep the newest ones, as the ring alone did
+            if (cs.lazy && !cs.spill) {
+                convfix_trim_disk(slot);
+            }
             std::string info;
             if (keepctx->save(slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, restore ? &*it_best : nullptr, info,
                               cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0)) {
@@ -3483,8 +3543,30 @@ private:
             // a prompt that leaves the stored conversation before its end gets a copy, the conversation stays stored
             const bool keep_entry = lcp_best < n_entry;
             slot.kc_spill.clear(); // [TAG_FN_L19_CONVSTORE_SPILL] the restored conversation's come with it
-            if (keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, keep_entry, info,
-                              cs.on ? &slot.kc_spill : nullptr, cs.on ? &slot.kc_conv : nullptr)) {
+            // [TAG_FN_L20_CONVFIX_IO] the outgoing ring (stored above when it was worth it) lends its buffers to the
+            // restored checkpoints
+            std::list<common_prompt_checkpoint> reuse;
+            if (keepctx->params().io_reuse) {
+                reuse.swap(slot.prompt.checkpoints);
+            }
+            const bool loaded = keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, keep_entry, info,
+                                              cs.on ? &slot.kc_spill : nullptr, cs.on ? &slot.kc_conv : nullptr,
+                                              keepctx->params().io_reuse ? &reuse : nullptr);
+            if (loaded) {
+                // the next checkpoints' buffers (as many as the ring holds, the rest is freed)
+                for (auto & r : reuse) {
+                    if (r.data_tgt.empty()) {
+                        continue;
+                    }
+                    if (slot.ckpt_spare.empty()) {
+                        slot.ckpt_spare = std::move(r.data_tgt);
+                    } else if (slot.ckpt_spares.size() + slot.prompt.checkpoints.size() + 1 < convfix_ring_cap(r.data_tgt.size())) {
+                        slot.ckpt_spares.push_back(std::move(r.data_tgt));
+                    }
+                }
+            }
+            reuse.clear();
+            if (loaded) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] restored a stored conversation: %d of the prompt's %zu tokens reused instead of %d: %s\n",
                         use_best, tokens.size(), use_cur, info.c_str());
                 if (cs.on) {
@@ -3514,7 +3596,7 @@ private:
 
         // [TAG_FN_L19_CONVSTORE_SPILL] a checkpoint on disk that resumes the prompt later than every one in the ring goes
         // back into the ring, where the prompt's checkpoint search finds it
-        if (cs.spill && cache_prompt && !slot.kc_spill.list.empty()) {
+        if (disk_ckpts && cache_prompt && !slot.kc_spill.list.empty()) {
             const int n_now = slot.prompt.n_tokens();
             const int lcp   = n_now > 0 ? (int) slot.prompt.tokens.get_common_prefix(tokens) : 0;
             if (lcp < n_now) {
@@ -5216,6 +5298,9 @@ private:
         if (!slot.ckpt_spare.empty()) {
             cur.data_tgt    = std::move(slot.ckpt_spare);
             slot.ckpt_spare = std::vector<uint8_t>();
+        } else if (!slot.ckpt_spares.empty()) {
+            cur.data_tgt = std::move(slot.ckpt_spares.back()); // [TAG_FN_L20_CONVFIX_IO]
+            slot.ckpt_spares.pop_back();
         }
 
         cur.id_task = id_task;
