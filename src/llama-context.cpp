@@ -5197,8 +5197,33 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
-// [TAG_FN_L18_KEEPCTX] the state bytes through a callback; tensor bytes go through one bounded piece buffer
+// [TAG_FN_L18_KEEPCTX] the state bytes through a callback; tensor bytes go through one bounded piece buffer, pinned host
+// memory of the tensor's device when it has one (device copies at full speed), else plain host memory
 static constexpr size_t LLAMA_IO_STREAM_PIECE = 32u*1024*1024;
+
+class llama_io_stream_piece {
+public:
+    uint8_t * get(const ggml_tensor * tensor, size_t n) {
+        if (!pinned_tried && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+            pinned_tried = true;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (hbuft) {
+                pinned.reset(ggml_backend_buft_alloc_buffer(hbuft, LLAMA_IO_STREAM_PIECE));
+            }
+        }
+        if (pinned && n <= LLAMA_IO_STREAM_PIECE) {
+            return (uint8_t *) ggml_backend_buffer_get_base(pinned.get());
+        }
+        plain.resize(std::max(plain.size(), n));
+        return plain.data();
+    }
+
+private:
+    bool                    pinned_tried = false;
+    ggml_backend_buffer_ptr pinned;
+    std::vector<uint8_t>    plain;
+};
 
 class llama_io_write_stream : public llama_io_write_i {
 public:
@@ -5214,9 +5239,9 @@ public:
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         for (size_t done = 0; done < size;) {
             const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
-            piece.resize(std::max(piece.size(), n));
-            ggml_backend_tensor_get(tensor, piece.data(), offset + done, n);
-            write(piece.data(), n);
+            uint8_t * buf = piece.get(tensor, n);
+            ggml_backend_tensor_get(tensor, buf, offset + done, n);
+            write(buf, n);
             done += n;
         }
     }
@@ -5228,7 +5253,7 @@ public:
 private:
     const std::function<bool(const void *, size_t)> & fn;
     size_t size_written = 0;
-    std::vector<uint8_t> piece;
+    llama_io_stream_piece piece;
 };
 
 class llama_io_read_stream : public llama_io_read_i {
@@ -5245,9 +5270,9 @@ public:
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         for (size_t done = 0; done < size;) {
             const size_t n = std::min(LLAMA_IO_STREAM_PIECE, size - done);
-            piece.resize(std::max(piece.size(), n));
-            read(piece.data(), n);
-            ggml_backend_tensor_set(tensor, piece.data(), offset + done, n);
+            uint8_t * buf = piece.get(tensor, n);
+            read(buf, n);
+            ggml_backend_tensor_set(tensor, buf, offset + done, n);
             done += n;
         }
     }
@@ -5259,7 +5284,7 @@ public:
 private:
     const std::function<bool(void *, size_t)> & fn;
     size_t size_read = 0;
-    std::vector<uint8_t> piece;
+    llama_io_stream_piece piece;
 };
 
 class llama_io_write_device : public llama_io_write_i {
