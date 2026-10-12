@@ -46,6 +46,11 @@ enum ggml_fn_l3_mark {
     // [TAG_FN_L6_L2PF] lever round 6 (LLAMA_FN_L6_L2PF): MOE_HOST_WAIT of a bridged layer: before the wait, the device
     // weights that the nodes up to the next MOE_HOST_POST read are prefetched into L2 (no value changes)
     GGML_FN_L6_L2PF    = 0x4C364C01,
+
+    // [TAG_FN_L18_GPUFLOOR_GDNOUT] lever round 18 (LLAMA_FN_L18_GF_GDNOUT): RMS_NORM of a GDN layer's gated output norm:
+    // RMS_NORM -> MUL (gamma) -> UNARY SIGMOID (z) -> MUL in one launch that also writes the q8_1 copy for the MUL_MAT
+    // (ssm_out) that reads it (the MMVQ reuse cache, same bytes)
+    GGML_FN_L18_GDNOUT = 0x4C313801,
 };
 
 // [TAG_FN_L6] lever round 6 bits: int32 op_params slot 13 (bytes 52..55, free in MUL_MAT and MUL), magic in the high half.

@@ -33,6 +33,10 @@ enum ggml_cuda_fn_l3_path {
     GGML_CUDA_FN_L3_PATH_Q8F_MMID,
     GGML_CUDA_FN_L3_PATH_ZSKIP,
     GGML_CUDA_FN_L3_PATH_GDNAB,
+    GGML_CUDA_FN_L18_PATH_MMV,    // [TAG_FN_L18_GPUFLOOR_MMV]
+    GGML_CUDA_FN_L18_PATH_MMV_MULTI,
+    GGML_CUDA_FN_L18_PATH_QKVZ,   // [TAG_FN_L18_GPUFLOOR_QKVZ]
+    GGML_CUDA_FN_L18_PATH_GDNOUT, // [TAG_FN_L18_GPUFLOOR_GDNOUT]
     GGML_CUDA_FN_L3_PATH_COUNT,
 };
 
@@ -77,6 +81,10 @@ void ggml_cuda_fn_l3_hclo(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // mul_mat_vec_f / mul_mat_vec_q at the launch shape those pick, so the same bits. false: not taken (nothing launched).
 bool ggml_cuda_fn_l3_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// [TAG_FN_L18_GPUFLOOR_MMV] GGML_CUDA_FN_L18_MMV=1: the marked q8_0 mat-vecs whose rows one pass does not cover (the K 2560 /
+// 6144 projections, the output and draft heads) take one warp per row (mmvq.cu), the same bits as mul_mat_vec_q
+bool ggml_cuda_fn_l18_mmv_enabled();
 
 // [TAG_FN_L3_GPU_COMPACT] the sparse-index lists of flash_attn_mask_to_sparse_indices (fattn.cu), counted and written
 // by many blocks. Same arguments, same lists in the same order.

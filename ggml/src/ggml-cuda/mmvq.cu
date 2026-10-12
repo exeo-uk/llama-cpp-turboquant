@@ -2278,6 +2278,151 @@ static __global__ void mul_mat_vec_q_fn_l3_smk(
     }
 }
 
+// [TAG_FN_L18_GPUFLOOR_MMV] mul_mat_vec_q<GGML_TYPE_Q8_0, ncols_dst, false> (generic table: a block of 4 warps, 1 or 2 rows)
+// for a plain 2-D product with one warp per row and rpw rows per warp. Lane l adds the terms of the original block's
+// threads l, 32 + l, 64 + l and 96 + l, each in its own K order, then adds the four sums in warp order and takes the same
+// warp sum: the same bits, as mul_mat_vec_q_fn_l3_smk does for one pass. The K loop takes FN_L18_MMV_AHEAD passes of the
+// original block at a time, so a lane has the loads of up to 4*FN_L18_MMV_AHEAD terms in flight. No shared memory and no
+// block barrier. zero is 0.0f, a parameter so that no add of a zero partial sum is folded away. Up to 3 products that read
+// the same src1 (same K) in one launch: segment s takes the warps from its warp0 on.
+#define FN_L18_MMV_AHEAD 3
+struct fn_l18_mmv_seg {
+    const void * vx;
+    float *      dst;
+    uint32_t     nrows;
+    uint32_t     stride_row_x;
+    uint32_t     stride_col_dst;
+    uint32_t     warp0;
+};
+
+template <int ncols_dst, int rpw>
+__launch_bounds__(4*32, 1)
+static __global__ void mul_mat_vec_q_fn_l18_wr(
+        const fn_l18_mmv_seg s0, const fn_l18_mmv_seg s1, const fn_l18_mmv_seg s2, const int n_seg,
+        const void * vy, const uint32_t ncols_x, const uint32_t stride_col_y, const float zero) {
+    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    constexpr int vdr = get_vdr_mmvq(GGML_TYPE_Q8_0);
+    constexpr int vw  = 4;                       // the original block's warps
+    constexpr int blocks_per_iter = vdr*vw*32/qi; // its q8_0 blocks per pass of the K loop
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(GGML_TYPE_Q8_0);
+    static_assert(qi/vdr == 4 && blocks_per_iter == 32, "fn_l18 mmv: the q8_0 layout of the generic mul_mat_vec_q");
+
+    const uint32_t gw = blockIdx.x*blockDim.y + threadIdx.y;
+    const int      sg = n_seg > 2 && gw >= s2.warp0 ? 2 : n_seg > 1 && gw >= s1.warp0 ? 1 : 0;
+    const void *   vx             = sg == 2 ? s2.vx             : sg == 1 ? s1.vx             : s0.vx;
+    float *        dst            = sg == 2 ? s2.dst            : sg == 1 ? s1.dst            : s0.dst;
+    const int      nrows_x        = sg == 2 ? s2.nrows          : sg == 1 ? s1.nrows          : s0.nrows;
+    const uint32_t stride_row_x   = sg == 2 ? s2.stride_row_x   : sg == 1 ? s1.stride_row_x   : s0.stride_row_x;
+    const uint32_t stride_col_dst = sg == 2 ? s2.stride_col_dst : sg == 1 ? s1.stride_col_dst : s0.stride_col_dst;
+    const uint32_t warp0          = sg == 2 ? s2.warp0          : sg == 1 ? s1.warp0          : s0.warp0;
+
+    const int lane = threadIdx.x;
+    const int row0 = (int) (gw - warp0)*rpw;
+    if (row0 >= nrows_x) {
+        return;
+    }
+    const int nb  = ncols_x / QK8_0;
+    const int kqs = vdr*(lane % (qi/vdr)); // thread 32*w + lane of the original: (32*w + lane) % 4 == lane % 4
+    const int kbl = lane / (qi/vdr);       // its first block: (32*w + lane)/4 == 8*w + lane/4
+
+    ggml_cuda_pdl_sync();
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float p[rpw][ncols_dst][vw];
+#pragma unroll
+    for (int i = 0; i < rpw; ++i) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int w = 0; w < vw; ++w) {
+                p[i][j][w] = zero;
+            }
+        }
+    }
+
+    for (int kb0 = 0; kb0 < nb; kb0 += FN_L18_MMV_AHEAD*blocks_per_iter) {
+#pragma unroll
+        for (int u = 0; u < FN_L18_MMV_AHEAD; ++u) {
+#pragma unroll
+            for (int w = 0; w < vw; ++w) {
+                const int kbx = kb0 + u*blocks_per_iter + 8*w + kbl;
+                if (kbx < nb) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                        for (int i = 0; i < rpw; ++i) {
+                            if (rpw == 1 || row0 + i < nrows_x) {
+                                p[i][j][w] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kbx], (row0 + i)*stride_row_x + kbx, kqs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < rpw; ++i) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float r = p[i][j][0];
+#pragma unroll
+            for (int w = 1; w < vw; ++w) {
+                r += p[i][j][w];
+            }
+            r = warp_reduce_sum<32>(r);
+            if (lane == 0 && (rpw == 1 || row0 + i < nrows_x)) {
+                dst[j*stride_col_dst + row0 + i] = r;
+            }
+        }
+    }
+}
+
+static void fn_l18_mmv_launch(const fn_l18_mmv_seg * seg, const int n_seg, const int rpw, const void * vy, const int64_t ne10,
+        const int64_t ne11, const uint32_t s11, cudaStream_t stream) {
+    fn_l18_mmv_seg sg[3] = {};
+    uint32_t nwarps = 0;
+    for (int s = 0; s < n_seg; ++s) {
+        sg[s]       = seg[s];
+        sg[s].warp0 = nwarps;
+        nwarps     += (sg[s].nrows + rpw - 1)/rpw;
+    }
+    for (int s = n_seg; s < 3; ++s) {
+        sg[s] = sg[0];
+    }
+    const ggml_cuda_kernel_launch_params lp(dim3((nwarps + 3)/4, 1, 1), dim3(32, 4, 1), 0, stream);
+#define FN_L18_MMV_CASE(nc, r) case nc*8 + r:                                                                              \
+    ggml_cuda_kernel_launch(mul_mat_vec_q_fn_l18_wr<nc, r>, lp, sg[0], sg[1], sg[2], n_seg, vy, (uint32_t) ne10, s11, 0.0f); \
+    break;
+    switch ((int) ne11*8 + rpw) {
+        FN_L18_MMV_CASE(1, 1) FN_L18_MMV_CASE(1, 2) FN_L18_MMV_CASE(1, 4)
+        FN_L18_MMV_CASE(2, 1) FN_L18_MMV_CASE(2, 2) FN_L18_MMV_CASE(2, 4)
+        FN_L18_MMV_CASE(3, 1) FN_L18_MMV_CASE(3, 2) FN_L18_MMV_CASE(3, 4)
+        FN_L18_MMV_CASE(4, 1) FN_L18_MMV_CASE(4, 2) FN_L18_MMV_CASE(4, 4)
+        default:
+            GGML_ABORT("fatal error");
+    }
+#undef FN_L18_MMV_CASE
+}
+
+bool ggml_cuda_fn_l18_mmv_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_MMV");
+        return ggml_cuda_fn_l3_enabled() && e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static int ggml_cuda_fn_l18_mmv_rpw() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_MMV_RPW");
+        const int r = e ? atoi(e) : 2;
+        return r == 1 || r == 2 || r == 4 ? r : 2;
+    }();
+    return v;
+}
+
 // [TAG_FN_L4_HC]
 bool ggml_cuda_fn_l4_mmvq_generic(int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && get_device_table_id(cc) == MMVQ_PARAMETERS_GENERIC;
@@ -2312,13 +2457,15 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
     // run-ahead kernel (RA); each has its own off switch
     const bool use_smk = ne11 >= 2 && ne11 <= 4 &&
         ne00/QK8_0 <= calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*blocks_per_iter_1warp;
-    if (use_smk ? !ggml_cuda_fn_l3_smk_enabled() : !ggml_cuda_fn_l3_ra_enabled()) {
+    // [TAG_FN_L18_GPUFLOOR_MMV] the warp-per-row kernel for every row that one pass does not cover (any K)
+    const bool use_wr = !use_smk && ggml_cuda_fn_l18_mmv_enabled();
+    if (!use_wr && (use_smk ? !ggml_cuda_fn_l3_smk_enabled() : !ggml_cuda_fn_l3_ra_enabled())) {
         return false;
     }
     // RA only where one pass of FN_L3_MMVQ_AHEAD iterations covers the row (K <= 4096 at 1..4 columns): the longer rows
     // ran slower at one column (test-backend-ops perf, K 10240 x 320 and K 6144 x 2560: +28 %) and no faster at three
     // (l3/gpu/gpu/l3gpu_perf_fnl3.txt), so the hc down and the K 6144 projections keep mul_mat_vec_q
-    if (!use_smk && ne00/QK8_0 > FN_L3_MMVQ_AHEAD*calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*
+    if (!use_smk && !use_wr && ne00/QK8_0 > FN_L3_MMVQ_AHEAD*calc_nwarps(GGML_TYPE_Q8_0, (int) ne11, MMVQ_PARAMETERS_GENERIC)*
             blocks_per_iter_1warp) {
         return false;
     }
@@ -2364,6 +2511,14 @@ bool ggml_cuda_fn_l3_mul_mat_vec_q(ggml_backend_cuda_context & ctx, const ggml_t
         }
 #undef FN_L3_MMVQ_SMK_CASE
         ggml_cuda_fn_l3_note(GGML_CUDA_FN_L3_PATH_MMVQ_SMK, "MMV: short-row q8_0 mat-vecs (K <= 1024), one warp per block");
+        return true;
+    }
+
+    if (use_wr) {
+        // [TAG_FN_L18_GPUFLOOR_MMV]
+        const fn_l18_mmv_seg seg = { src0->data, (float *) dst->data, (uint32_t) ne01, s01, s1, 0 };
+        fn_l18_mmv_launch(&seg, 1, ggml_cuda_fn_l18_mmv_rpw(), src1_q8, ne10, ne11, s11, stream);
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L18_PATH_MMV, "[TAG_FN_L18_GPUFLOOR_MMV] q8_0 mat-vecs with one warp per row");
         return true;
     }
 
@@ -2559,6 +2714,21 @@ void ggml_cuda_fn_l4_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const 
         const int64_t s13 = src1->nb[3] / sizeof(float);
         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8, src0[0]->type, ne10, s11, s12, s13, ne10_padded,
                 ne11, ne12, ne13, stream);
+    }
+
+    // [TAG_FN_L18_GPUFLOOR_MMV] the warp-per-row kernel for the products of one launch
+    if (ggml_cuda_fn_l18_mmv_enabled()) {
+        fn_l18_mmv_seg sg[3] = {};
+        for (int s = 0; s < n; ++s) {
+            sg[s].vx             = src0[s]->data;
+            sg[s].dst            = (float *) dst[s]->data;
+            sg[s].nrows          = (uint32_t) src0[s]->ne[1];
+            sg[s].stride_row_x   = (uint32_t) (src0[s]->nb[1] / ggml_type_size(src0[s]->type));
+            sg[s].stride_col_dst = (uint32_t) (dst[s]->nb[1] / sizeof(float));
+        }
+        fn_l18_mmv_launch(sg, n, ggml_cuda_fn_l18_mmv_rpw(), src1_q8, ne10, ne11, (uint32_t) (ne10_padded / QK8_1), stream);
+        ggml_cuda_fn_l3_note(GGML_CUDA_FN_L18_PATH_MMV_MULTI, "[TAG_FN_L18_GPUFLOOR_MMV] products of one input in one warp-per-row launch");
+        return;
     }
 
     fn_l4_mmvq_seg seg[3] = {};

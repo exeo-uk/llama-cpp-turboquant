@@ -4775,6 +4775,118 @@ static int ggml_cuda_fn_l4_try_qkv(ggml_backend_cuda_context * ctx, ggml_cgraph 
     return (j - 1) - i;
 }
 
+// [TAG_FN_L18_GPUFLOOR_HCADD] GGML_CUDA_FN_L18_HCADD=1: the hc norm launch (K1) also folds in the ADD of the bridged FFN
+// output (hot chain + host experts) that comes before the ADD of the shared expert: (hot + host) + shared, as the two
+// adds compute it, one launch less per layer
+static bool fn_l18_hcadd_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_HCADD");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L18_GPUFLOOR_HCADD] the hc norm launch also adds the bridged FFN output\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+// [TAG_FN_L18_GPUFLOOR_QKVZ] the marked GDN qkv projection at node i and the z projection after it (no-op views between),
+// both reading the same src1, both run-ahead mat-vecs: one launch of the run-ahead body (the warp-per-row one with
+// GGML_CUDA_FN_L18_MMV=1), the same bits per row. Returns the nodes
+// skipped, 0 when not taken (nothing launched).
+static int ggml_cuda_fn_l18_try_qkvz(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, int i) {
+    ggml_tensor * mm[2] = { cg->nodes[i], nullptr };
+    int j = i + 1;
+    while (j < cg->n_nodes && ggml_cuda_is_view_or_noop(cg->nodes[j])) {
+        ++j;
+    }
+    if (j >= cg->n_nodes) {
+        return 0;
+    }
+    mm[1] = cg->nodes[j++];
+    for (ggml_tensor * t : mm) {
+        if (!ggml_cuda_fn_l4_qkv_node_ok(*ctx, t) || t->src[1] != mm[0]->src[1] || t->src[0]->ne[0] != mm[0]->src[0]->ne[0]) {
+            return 0;
+        }
+    }
+    const ggml_tensor * src0[2] = { mm[0]->src[0], mm[1]->src[0] };
+    ggml_cuda_fn_l4_mul_mat_vec_q_multi(*ctx, src0, mm[0]->src[1], mm, 2);
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L18_PATH_QKVZ, "[TAG_FN_L18_GPUFLOOR_QKVZ] the GDN qkv and z projections in one launch");
+    return (j - 1) - i;
+}
+
+// [TAG_FN_L18_GPUFLOOR_GDNOUT] the marked RMS_NORM at node i -> MUL (gamma) -> UNARY SIGMOID (z) -> MUL, the inner nodes
+// read only by the next one: one launch, plus the q8_1 copy for the MUL_MAT that reads the result next. Returns the
+// nodes skipped, 0 when not taken (nothing launched).
+static int32_t ggml_cuda_fn_l4_uses(const ggml_cgraph * cgraph, const ggml_tensor * t);
+static int ggml_cuda_fn_l18_try_gdnout(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, int i) {
+    const auto next = [cg](int k) {
+        for (++k; k < cg->n_nodes && ggml_cuda_is_view_or_noop(cg->nodes[k]); ++k) {
+        }
+        return k < cg->n_nodes ? k : -1;
+    };
+    const auto f32c = [](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+    const auto inner = [cg](const ggml_tensor * t) {
+        return ggml_cuda_fn_l4_uses(cg, t) == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->view_src == nullptr;
+    };
+    ggml_tensor * rms = cg->nodes[i];
+    const int i_mw = next(i);
+    const int i_sg = i_mw < 0 ? -1 : next(i_mw);
+    if (i_sg < 0 || i_sg + 1 >= cg->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mw = cg->nodes[i_mw];
+    ggml_tensor * sg = cg->nodes[i_sg];
+    ggml_tensor * m  = cg->nodes[i_sg + 1];
+    const ggml_tensor * x = rms->src[0];
+    if (rms->op != GGML_OP_RMS_NORM || x == nullptr || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) ||
+            !f32c(rms) || !inner(rms) || rms->ne[3] != 1 || rms->ne[0] % 32 != 0 || rms->ne[0] > 256 ||
+            !ggml_are_same_shape(x, rms) || x->ne[3] != 1 || (x->nb[1] % sizeof(float)) != 0 || (x->nb[2] % sizeof(float)) != 0) {
+        return 0;
+    }
+    const ggml_tensor * w = mw->op == GGML_OP_MUL ? (mw->src[0] == rms ? mw->src[1] : mw->src[1] == rms ? mw->src[0] : nullptr) : nullptr;
+    if (w == nullptr || !f32c(w) || ggml_nelements(w) != rms->ne[0] || w->ne[0] != rms->ne[0] || !f32c(mw) ||
+            !ggml_are_same_shape(mw, rms) || !inner(mw)) {
+        return 0;
+    }
+    const ggml_tensor * z = sg->src[0];
+    if (sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || !f32c(z) || !f32c(sg) || !inner(sg) ||
+            !ggml_are_same_shape(z, rms)) {
+        return 0;
+    }
+    if (m->op != GGML_OP_MUL || !((m->src[0] == mw && m->src[1] == sg) || (m->src[0] == sg && m->src[1] == mw)) || !f32c(m) ||
+            !ggml_are_same_shape(m, rms)) {
+        return 0;
+    }
+    // the outputs do not overlap the inputs the launch reads
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(m, x) || overlap(m, w) || overlap(m, z)) {
+        return 0;
+    }
+    ggml_cuda_fn_l3_q8_dst q8;
+    block_q8_1 * yq = nullptr;
+    int64_t bpr = 0;
+    if (ggml_cuda_mmvq_q8_produce(*ctx, m, q8, /*padding_ok =*/ false)) {
+        if (q8.ne10 != rms->ne[0]*rms->ne[1] || q8.nrows != rms->ne[2] || q8.bpr*QK8_1 != q8.ne10) {
+            ctx->mmvq_q8.reset();
+        } else {
+            yq  = q8.y;
+            bpr = q8.bpr;
+            ctx->mmvq_q8.group   = cg->nodes + i;
+            ctx->mmvq_q8.n_group = i_sg + 1 - i + 1;
+        }
+    }
+    ggml_cuda_fn_l18_gdnout_launch(*ctx, rms, w, z, m, yq, bpr);
+    ggml_cuda_fn_l3_note(GGML_CUDA_FN_L18_PATH_GDNOUT, "[TAG_FN_L18_GPUFLOOR_GDNOUT] GDN output norm, gate and q8_1 copy in one launch");
+    return (i_sg + 1) - i;
+}
+
 // [TAG_FN_L4_HC] graph uses of t (0: not a node of the graph)
 static int32_t ggml_cuda_fn_l4_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
     const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
@@ -4839,9 +4951,19 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
 
     // at an ADD: the block output of a combine that starts here (the FFN half's routed + shared experts)
     ggml_tensor * add = nullptr;
+    ggml_tensor * add0 = nullptr; // [TAG_FN_L18_GPUFLOOR_HCADD] the ADD before it (hot chain + host experts), folded in too
     int i_s1 = i;
     if (n0->op == GGML_OP_ADD) {
         i_s1 = next(i);
+        if (i_s1 >= 0 && cgraph->nodes[i_s1]->op == GGML_OP_ADD && fn_l18_hcadd_enabled()) {
+            ggml_tensor * a2 = cgraph->nodes[i_s1];
+            const int i_s2 = next(i_s1);
+            if ((a2->src[0] == n0 || a2->src[1] == n0) && i_s2 >= 0 && cgraph->nodes[i_s2]->op == GGML_OP_SCALE) {
+                add0 = n0;
+                n0   = a2;
+                i_s1 = i_s2;
+            }
+        }
         if (i_s1 < 0 || cgraph->nodes[i_s1]->op != GGML_OP_SCALE) {
             return 0;
         }
@@ -4938,6 +5060,17 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
                 return fn_l6_fail(__LINE__);
             }
         }
+        // [TAG_FN_L18_GPUFLOOR_HCADD] add0: two same-shaped f32 [n_embd, T] operands, its only reader add (not written)
+        if (add0 != nullptr) {
+            const ggml_tensor * b0 = add0->src[0];
+            const ggml_tensor * b1 = add0->src[1];
+            if (add == nullptr || !f32c(add0) || !inner(add0) || b0 == nullptr || b1 == nullptr || b0->type != GGML_TYPE_F32 ||
+                    b1->type != GGML_TYPE_F32 || !ggml_are_same_shape(b0, add0) || !ggml_are_same_shape(b1, add0) ||
+                    !ggml_are_same_shape(add0, add) || b0->nb[0] != sizeof(float) || b1->nb[0] != sizeof(float)) {
+                return fn_l6_fail(__LINE__);
+            }
+        }
+        c.add0 = add0;
         c.add  = add;
         c.s1   = s1;
         c.s2   = s2;
@@ -5047,9 +5180,10 @@ static int ggml_cuda_fn_l4_try_hc(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
 
     // the written tensors overlap neither each other nor what a launch reads after another one wrote
     const ggml_tensor * outs[4] = { c.post, mul, c.inject, pre };
-    const ggml_tensor * ins[9]  = { c.post ? c.post->src[0] : nullptr, c.post ? c.post->src[1] : nullptr,
+    const ggml_tensor * ins[11] = { c.post ? c.post->src[0] : nullptr, c.post ? c.post->src[1] : nullptr,
                                     c.s1 ? c.s1->src[0] : nullptr, x_in, mul, w_norm, c.inject ? c.inject->src[0] : nullptr,
-                                    c.add ? c.add->src[0] : nullptr, c.add ? c.add->src[1] : nullptr };
+                                    c.add ? c.add->src[0] : nullptr, c.add ? c.add->src[1] : nullptr,
+                                    c.add0 ? c.add0->src[0] : nullptr, c.add0 ? c.add0->src[1] : nullptr };
     const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data;
         const char * b0 = (const char *) b->data;
@@ -5124,9 +5258,13 @@ static void ggml_cuda_fn_l6_hc_deps(ggml_cgraph * cgraph, ggml_backend_graph_opt
             continue;
         }
         ggml_tensor * bo = post->src[0];
-        ggml_tensor * keep[] = { bo, post->src[1], s1->src[0],
-                                 bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[0] : nullptr,
-                                 bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[1] : nullptr };
+        ggml_tensor * b0 = bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[0] : nullptr;
+        ggml_tensor * b1 = bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[1] : nullptr;
+        // [TAG_FN_L18_GPUFLOOR_HCADD] an ADD operand of that ADD: its operands as well (K1 reads them when it folds it in)
+        ggml_tensor * bb = b0 != nullptr && b0->op == GGML_OP_ADD ? b0 : b1 != nullptr && b1->op == GGML_OP_ADD ? b1 : nullptr;
+        ggml_tensor * keep[] = { bo, post->src[1], s1->src[0], b0, b1,
+                                 fn_l18_hcadd_enabled() && bb != nullptr ? bb->src[0] : nullptr,
+                                 fn_l18_hcadd_enabled() && bb != nullptr ? bb->src[1] : nullptr };
         for (ggml_tensor * t : keep) {
             if (t != nullptr) {
                 params->add_alloc_dep(params->user_data, t, pre);
@@ -5201,6 +5339,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [TAG_FN_L4_QSA_QKV]
     if (node->op == GGML_OP_MUL_MAT && (ggml_fn_l4_qsa_get(node) & GGML_FN_L4_QSA_QKV) && ggml_cuda_fn_l4_qsa_enabled()) {
         const int n = ggml_cuda_fn_l4_try_qkv(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+    // [TAG_FN_L18_GPUFLOOR_GDNOUT]
+    if (node->op == GGML_OP_RMS_NORM && ggml_fn_l3_get(node) == GGML_FN_L18_GDNOUT && ggml_cuda_fn_l3_enabled()) {
+        const int n = ggml_cuda_fn_l18_try_gdnout(cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+    // [TAG_FN_L18_GPUFLOOR_QKVZ]
+    if (node->op == GGML_OP_MUL_MAT && (ggml_fn_l4_qsa_get(node) & GGML_FN_L18_QKVZ) && ggml_cuda_fn_l3_enabled()) {
+        const int n = ggml_cuda_fn_l18_try_qkvz(cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;
         }
