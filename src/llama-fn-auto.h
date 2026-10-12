@@ -126,6 +126,14 @@ LLAMA_API size_t   llama_fn_cbuf_tail(size_t full, size_t small, size_t pool_ext
 LLAMA_API int      llama_fn_cbuf_first_tail_layer(const std::vector<size_t> & layer_bytes, size_t tail_bytes);
 // the budget holds the tail, the prefill stream's lend range and about one layer (budget / 32) between them, plus slack
 LLAMA_API bool     llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend);
+// [TAG_FN_L19_TTFT_EARLY] the widest batch the short SMALL path takes now: short_max (LLAMA_FN_L4_PROMPT), raised to early
+// (LLAMA_FN_L19_TTFT_EARLY) for a wider batch of at most early tokens while the experts' warm pass runs
+LLAMA_API uint32_t llama_fn_cbuf_short_max(uint32_t short_max, uint32_t early, bool warm_running, uint32_t n_tokens, uint32_t small_t);
+// [TAG_FN_L19_TTFT_TAILFULL] the narrow last part of a split prompt keeps FULL: tailfull (LLAMA_FN_L19_TTFT_TAILFULL) > 0, the
+// state is FULL, the batch is not on the short path, is no wider than small_t, asks for outputs, and the batch before it
+// was wider than small_t, asked for none and had fewer than tailfull tokens
+LLAMA_API bool     llama_fn_cbuf_tail_full(uint32_t tailfull, bool state_full, bool short_path, uint32_t n_tokens, uint32_t n_outputs,
+        uint32_t prev_n, bool prev_out, uint32_t small_t);
 // the hot-set budget with the lend: the fit's budget plus pool_extra (LLAMA_FN_CBUF_POOL_MIB, also in the tail), never
 // above budget_max nor above free - 256 MiB (unless the fit's budget already is)
 LLAMA_API size_t   llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max);

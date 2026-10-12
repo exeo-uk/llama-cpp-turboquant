@@ -3815,8 +3815,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cbuf_n_batch++;
         bool wide = n_tokens_all > cbuf_small_t;
         // [TAG_FN_L19_TTFT_EARLY] while the warm pass runs, prompts up to l19_early tokens take the short path as well
-        const bool early = l19_early > 0 && wide && (uint32_t) n_tokens_all <= l19_early && llama_fn_warm_running();
-        const uint32_t short_max = early ? std::max(cbuf_short_max, l19_early) : cbuf_short_max;
+        const uint32_t short_max = llama_fn_cbuf_short_max(cbuf_short_max, l19_early, l19_early > 0 && llama_fn_warm_running(),
+                n_tokens_all, cbuf_small_t);
+        const bool     early     = short_max > cbuf_short_max;
         // [TAG_FN_L4_MEM_PROMPT] a short prompt between decodes stays SMALL (a FULL state of a running long prompt stays)
         if (wide && short_max > 0 && (uint32_t) n_tokens_all <= short_max && cbuf_state == CBUF_SMALL && !cbuf_pinned) {
             wide       = false;
@@ -3842,10 +3843,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
         }
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
-        bool tail_full = false;
-        if (!wide && l19_tailfull > 0 && cbuf_state == CBUF_FULL && !cbuf_short && n_outputs_all > 0 && !cbuf_prev_out &&
-            cbuf_prev_n > cbuf_small_t && cbuf_prev_n < l19_tailfull) {
-            tail_full = true;
+        const bool tail_full = !wide && llama_fn_cbuf_tail_full(l19_tailfull, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
+                n_outputs_all, cbuf_prev_n, cbuf_prev_out, cbuf_small_t);
+        if (tail_full) {
             if (cbuf_n_tailfull++ < 3) {
                 LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_TAILFULL] the %d-token last part of a split prompt (%u tokens before it) stays "
                         "FULL: the answer's first step returns to SMALL\n", __func__, (int) n_tokens_all, cbuf_prev_n);
