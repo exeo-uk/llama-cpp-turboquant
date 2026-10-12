@@ -2085,6 +2085,7 @@ private:
         bool    spill     = false; // [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints a ring drops go to disk (needs keepctx, ckpt)
         int32_t spill_gap = 1024;  //   not when a kept checkpoint lies within this many tokens
         int32_t spill_max = 64;    //   on disk per conversation
+        bool    spill_sync = false; //   written in the request's time instead of by the writer thread
         bool    sys       = false; // [TAG_FN_L19_CONVSTORE_SYS] store a conversation of which a prompt keeps only the system block
         int32_t opener    = -1;    // [TAG_FN_L19_CONVSTORE_OPENER] the tail split at n - 4 from this many tokens (-1 = 512 as before)
         bool    opener_auto = true; //   only for a client that re-rendered its last answer
@@ -3247,7 +3248,8 @@ private:
     //   LLAMA_FN_L19_CONVSTORE_SPILL=1       [_SPILL] the checkpoints the ring drops are written to disk and stored with the
     //                                        conversation (none within _SPILL_GAP=1024 tokens of a kept one, at most
     //                                        _SPILL_MAX=64 per conversation); a prompt resumes from the best of the ring,
-    //                                        the disk and the stored conversations (needs _CKPT and keepctx)
+    //                                        the disk and the stored conversations (needs _CKPT and keepctx); a writer
+    //                                        thread writes them (_SPILL_SYNC=1: in the request's time)
     //   LLAMA_FN_L19_CONVSTORE_SYS=1         [_SYS] also store a conversation when the new prompt keeps only its system
     //                                        + tools block (a subagent), not only when it loses most of its content
     //   LLAMA_FN_L19_CONVSTORE_OPENER=1      [_OPENER] the prompt's last 4 tokens (the assistant-turn start) get their own
@@ -3269,6 +3271,7 @@ private:
             cs.spill     = cs.ckpt && env_ll("LLAMA_FN_L19_CONVSTORE_SPILL", 1) != 0;
             cs.spill_gap = (int32_t) std::max<long long>(0, env_ll("LLAMA_FN_L19_CONVSTORE_SPILL_GAP", 1024));
             cs.spill_max = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L19_CONVSTORE_SPILL_MAX", 64));
+            cs.spill_sync = env_ll("LLAMA_FN_L19_CONVSTORE_SPILL_SYNC", 0) != 0;
             cs.sys       = env_ll("LLAMA_FN_L19_CONVSTORE_SYS", 1) != 0;
             cs.opener    = (int32_t) std::max<long long>(-1, env_ll("LLAMA_FN_L19_CONVSTORE_OPENER", 1));
             cs.opener_auto = env_ll("LLAMA_FN_L19_CONVSTORE_OPENER_AUTO", 1) != 0;
@@ -3330,7 +3333,7 @@ private:
 
     // [TAG_FN_L19_CONVSTORE_SPILL] the ring drops c to make room for a checkpoint at n_new: keep it on disk unless a kept
     // checkpoint lies within spill_gap tokens; past spill_max the one closest to its predecessor goes
-    void convstore_spill(server_slot & slot, const common_prompt_checkpoint & c, int64_t n_new) {
+    void convstore_spill(server_slot & slot, common_prompt_checkpoint & c, int64_t n_new) {
         if (!cs.spill || !keepctx || c.data_tgt.empty()) {
             return;
         }
@@ -3354,7 +3357,7 @@ private:
             return;
         }
         std::string info;
-        if (!keepctx->spill_write(slot.kc_spill, c, h, info)) {
+        if (!keepctx->spill_write(slot.kc_spill, c, h, !cs.spill_sync, info)) {
             SLT_WRN(slot, "[TAG_FN_L19_CONVSTORE_SPILL] checkpoint at n_tokens = %lld not kept on disk: %s\n", (long long) c.n_tokens, info.c_str());
             return;
         }
@@ -5162,6 +5165,10 @@ private:
                     slot.ckpt_spare = std::move(it->data_tgt);
                 }
                 slot.prompt.checkpoints.erase(it);
+                // the bytes went to the writer thread: a buffer it is done with serves the new checkpoint
+                if (slot.ckpt_spare.empty() && keepctx) {
+                    keepctx->take_spare(slot.ckpt_spare);
+                }
             }
         }
 

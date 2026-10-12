@@ -14,10 +14,14 @@
 
 #include "server-task.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct llama_context;
@@ -37,6 +41,15 @@ struct server_keepctx_params {
 
 class server_keepctx_file;
 
+// [TAG_FN_L19_CONVSTORE_SPILL] the write of a checkpoint to disk, done by the store's writer thread
+struct server_keepctx_spill_state {
+    std::mutex              mu;
+    std::condition_variable cv;
+    int                     done      = 0;   // 0 being written, 1 written, -1 failed
+    uint64_t                hash_data = 0;   // params.verify: a hash of the bytes written
+    double                  ms        = 0.0; // the write
+};
+
 // [TAG_FN_L19_CONVSTORE_SPILL] a context checkpoint kept on disk: its position, where its bytes are, and a hash of the
 // conversation's tokens before it (it is valid only while the tokens in front of it are the same)
 struct server_keepctx_spilled {
@@ -49,9 +62,9 @@ struct server_keepctx_spilled {
     uint64_t  size_spec = 0;
     uint64_t  off       = 0;   // in file, a multiple of the sector size
     uint64_t  hash      = 0;   // keepctx_prefix_hash of the tokens [0, n_tokens)
-    uint64_t  hash_data = 0;   // params.verify: a hash of the bytes written
 
-    std::shared_ptr<server_keepctx_file> file;
+    std::shared_ptr<server_keepctx_file>        file;
+    std::shared_ptr<server_keepctx_spill_state> st;   // the write (a reader waits for it)
 
     uint64_t bytes() const { return size_tgt + size_dft + size_spec; }
 };
@@ -147,12 +160,17 @@ struct server_keepctx {
     // whose client re-rendered the last answer resumed from the entry before its end: the entry is superseded)
     int drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep, int32_t tol = 0);
 
-    // [TAG_FN_L19_CONVSTORE_SPILL] write a checkpoint to a new file and add it to the list (ascending). false: not
-    // written (I/O error), the checkpoint is lost as before.
-    bool spill_write(server_keepctx_spill & spill, const common_prompt_checkpoint & c, uint64_t prefix_hash, std::string & info);
+    // [TAG_FN_L19_CONVSTORE_SPILL] write a checkpoint to a new file and add it to the list (ascending). Its bytes are
+    // moved out of c: async (the default), the writer thread writes them and keeps the buffer for take_spare(); else they
+    // are written at once and given back to c. false: not written (I/O error), the checkpoint is lost as before.
+    bool spill_write(server_keepctx_spill & spill, common_prompt_checkpoint & c, uint64_t prefix_hash, bool async,
+                     std::string & info);
 
-    // read a spilled checkpoint back into c (positions and bytes)
+    // read a spilled checkpoint back into c (positions and bytes), after its write is done
     bool spill_read(const server_keepctx_spilled & s, common_prompt_checkpoint & c, std::string & info);
+
+    // a buffer the writer thread is done with, for the next checkpoint (buf stays empty when there is none)
+    void take_spare(std::vector<uint8_t> & buf);
 
     // [TAG_FN_L19_CONVSTORE_EVICT] statistics of the store
     uint64_t n_evicted_gdsf = 0;
@@ -161,6 +179,24 @@ private:
     bool selftest(std::string & err);
     // drop the entry of the lowest value (or the oldest), never keep; false when only keep is left
     bool evict_one(const server_keepctx_entry * keep);
+
+    // [TAG_FN_L19_CONVSTORE_SPILL] the writer thread and a checkpoint's bytes on their way to disk
+    struct spill_job {
+        std::shared_ptr<server_keepctx_file>        file;
+        std::shared_ptr<server_keepctx_spill_state> st;
+        std::vector<uint8_t>                        tgt;
+        std::vector<uint8_t>                        dft;
+        std::vector<uint8_t>                        spec;
+        bool                                        verify = false;
+    };
+    void wr_run();
+    void wr_job(spill_job & job);
+    std::thread                             wr_th_;
+    std::mutex                              wr_mu_;
+    std::condition_variable                 wr_cv_;
+    std::deque<std::unique_ptr<spill_job>>  wr_q_;
+    bool                                    wr_stop_ = false;
+    std::vector<std::vector<uint8_t>>       spare_;   // buffers of written checkpoints (wr_mu_)
 
     server_keepctx_params params_;
     bool                  ok_     = false;

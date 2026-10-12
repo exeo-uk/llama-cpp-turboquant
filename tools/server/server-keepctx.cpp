@@ -410,7 +410,61 @@ server_keepctx::server_keepctx(const server_keepctx_params & params) : params_(p
     }
 }
 
-server_keepctx::~server_keepctx() = default;
+server_keepctx::~server_keepctx() {
+    // [TAG_FN_L19_CONVSTORE_SPILL] the queued writes finish first
+    {
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        wr_stop_ = true;
+    }
+    wr_cv_.notify_all();
+    if (wr_th_.joinable()) {
+        wr_th_.join();
+    }
+}
+
+void server_keepctx::wr_run() {
+    while (true) {
+        std::unique_ptr<spill_job> job;
+        {
+            std::unique_lock<std::mutex> lk(wr_mu_);
+            wr_cv_.wait(lk, [&]() { return wr_stop_ || !wr_q_.empty(); });
+            if (wr_q_.empty()) {
+                return;
+            }
+            job = std::move(wr_q_.front());
+            wr_q_.pop_front();
+        }
+        wr_job(*job);
+        // the target bytes' buffer serves the next checkpoint (take_spare)
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        if (spare_.size() < 2 && !job->tgt.empty()) {
+            spare_.push_back(std::move(job->tgt));
+        }
+    }
+}
+
+void server_keepctx::wr_job(spill_job & job) {
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t n_written = 0;
+    uint64_t hash      = 0;
+    bool     ok        = true;
+    {
+        kc_pipe pipe(*job.file, true, 0, 0);
+        pipe.hashing = job.verify;
+        ok = pipe.put(job.tgt.data(), job.tgt.size()) && pipe.put(job.dft.data(), job.dft.size()) &&
+             pipe.put(job.spec.data(), job.spec.size());
+        ok = pipe.finish(n_written) && ok;
+        hash = pipe.hash;
+    }
+    ok = ok && n_written == job.tgt.size() + job.dft.size() + job.spec.size();
+    {
+        std::lock_guard<std::mutex> lk(job.st->mu);
+        job.st->done      = ok ? 1 : -1;
+        job.st->hash_data = hash;
+        job.st->ms        = kc_ms_since(t0);
+    }
+    job.st->cv.notify_all();
+}
 
 // write a pattern in pieces of awkward sizes through the pipe, read it back in other pieces, compare
 bool server_keepctx::selftest(std::string & err) {
@@ -564,8 +618,8 @@ void server_keepctx_spill::keep_first(int64_t n_keep) {
     }
 }
 
-bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prompt_checkpoint & c, uint64_t prefix_hash,
-                                 std::string & info) {
+bool server_keepctx::spill_write(server_keepctx_spill & spill, common_prompt_checkpoint & c, uint64_t prefix_hash,
+                                 bool async, std::string & info) {
     const auto t0 = std::chrono::steady_clock::now();
     static std::atomic<uint64_t> n_spill_files{0};
     const auto path = std::filesystem::path(params_.dir) /
@@ -587,19 +641,37 @@ bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prom
     s.off       = 0;
     s.hash      = prefix_hash;
     s.file      = file;
-    uint64_t n_written = 0;
-    bool ok = true;
-    {
-        kc_pipe pipe(*file, true, 0, s.off);
-        pipe.hashing = params_.verify;
-        ok = pipe.put(c.data_tgt.data(), c.data_tgt.size()) && pipe.put(c.data_dft.data(), c.data_dft.size()) &&
-             pipe.put(c.data_spec.data(), c.data_spec.size());
-        ok = pipe.finish(n_written) && ok;
-        s.hash_data = pipe.hash;
+    s.st        = std::make_shared<server_keepctx_spill_state>();
+    const uint64_t nb = s.bytes();
+    auto job = std::make_unique<spill_job>();
+    job->file   = file;
+    job->st     = s.st;
+    job->tgt    = std::move(c.data_tgt);
+    job->dft    = std::move(c.data_dft);
+    job->spec   = std::move(c.data_spec);
+    job->verify = params_.verify;
+    bool queued = false;
+    if (async) {
+        std::lock_guard<std::mutex> lk(wr_mu_);
+        if (wr_q_.size() < 4) { // more pending: the disk is behind, write this one here
+            if (!wr_th_.joinable()) {
+                wr_th_ = std::thread([this]() { wr_run(); });
+            }
+            wr_q_.push_back(std::move(job));
+            queued = true;
+        }
     }
-    if (!ok || n_written != s.bytes()) {
-        info = string_format("writing a checkpoint at n_tokens = %lld failed", (long long) c.n_tokens);
-        return false;
+    if (queued) {
+        wr_cv_.notify_all();
+    } else {
+        wr_job(*job);
+        c.data_tgt  = std::move(job->tgt);
+        c.data_dft  = std::move(job->dft);
+        c.data_spec = std::move(job->spec);
+        if (s.st->done < 0) {
+            info = string_format("writing a checkpoint at n_tokens = %lld failed", (long long) c.n_tokens);
+            return false;
+        }
     }
     spill.n_written++;
     spill.bytes_written += s.bytes();
@@ -607,14 +679,32 @@ bool server_keepctx::spill_write(server_keepctx_spill & spill, const common_prom
                                 [](int64_t n, const server_keepctx_spilled & x) { return n < x.n_tokens; });
     spill.list.insert(pos, std::move(s));
     const double ms = kc_ms_since(t0);
-    info = string_format("%.1f MiB in %.0f ms", c.size()/1048576.0, ms);
+    info = string_format("%.1f MiB %s in %.1f ms", nb/1048576.0, queued ? "queued" : "written", ms);
     return true;
 }
 
+void server_keepctx::take_spare(std::vector<uint8_t> & buf) {
+    std::lock_guard<std::mutex> lk(wr_mu_);
+    if (!spare_.empty()) {
+        buf = std::move(spare_.back());
+        spare_.pop_back();
+    }
+}
+
 bool server_keepctx::spill_read(const server_keepctx_spilled & s, common_prompt_checkpoint & c, std::string & info) {
-    if (!s.file) {
+    if (!s.file || !s.st) {
         info = "no file";
         return false;
+    }
+    uint64_t hash_data = 0;
+    {
+        std::unique_lock<std::mutex> lk(s.st->mu);
+        s.st->cv.wait(lk, [&]() { return s.st->done != 0; });
+        if (s.st->done < 0) {
+            info = "its write failed";
+            return false;
+        }
+        hash_data = s.st->hash_data;
     }
     c.n_tokens = s.n_tokens;
     c.id_task  = s.id_task;
@@ -634,7 +724,7 @@ bool server_keepctx::spill_read(const server_keepctx_spilled & s, common_prompt_
         h = kc_hash(h, c.data_tgt.data(), c.data_tgt.size());
         h = kc_hash(h, c.data_dft.data(), c.data_dft.size());
         h = kc_hash(h, c.data_spec.data(), c.data_spec.size());
-        info = h == s.hash_data ? "verify: identical" : "verify: DIFFERS";
+        info = h == hash_data ? "verify: identical" : "verify: DIFFERS";
     }
     return true;
 }
