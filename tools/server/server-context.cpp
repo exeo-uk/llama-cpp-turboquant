@@ -3275,10 +3275,13 @@ private:
         // the stored conversation this prompt continues furthest (the newest of equals)
         auto it_best  = keepctx->entries.end();
         int  use_best = 0;
+        int  lcp_best = 0;
         for (auto it = keepctx->entries.begin(); it != keepctx->entries.end(); ++it) {
-            const int use = keepctx_usable(it->prompt, (int) it->prompt.tokens.get_common_prefix(tokens));
+            const int lcp = (int) it->prompt.tokens.get_common_prefix(tokens);
+            const int use = keepctx_usable(it->prompt, lcp);
             if (use > 0 && use >= use_best) {
                 use_best = use;
+                lcp_best = lcp;
                 it_best  = it;
             }
         }
@@ -3298,7 +3301,9 @@ private:
         if (restore) {
             const int   n_entry = it_best->prompt.n_tokens();
             std::string info;
-            if (keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, info)) {
+            // a prompt that leaves the stored conversation before its end gets a copy, the conversation stays stored
+            const bool keep_entry = lcp_best < n_entry;
+            if (keepctx->load(it_best, slot.prompt, ctx_tgt, ctx_dft, spec.get(), slot.id, keep_entry, info)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] restored a stored conversation: %d of the prompt's %zu tokens reused instead of %d: %s\n",
                         use_best, tokens.size(), use_cur, info.c_str());
             } else {

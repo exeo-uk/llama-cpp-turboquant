@@ -71,10 +71,11 @@ struct server_keepctx {
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
               llama_seq_id seq_id, const server_keepctx_entry * keep, std::string & info);
 
-    // restore the entry into seq_id and prompt; the entry is removed in every case. false: the sequence and prompt are
-    // in an unknown state and the caller must clear them.
+    // restore the entry into seq_id and prompt. The entry is removed, unless keep (the prompt continues only a part of
+    // it: the rest stays stored for a later continuation) and the restore worked. false: the sequence and prompt are in
+    // an unknown state and the caller must clear them.
     bool load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
-              llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, std::string & info);
+              llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info);
 
     // remove the entries whose tokens are a prefix of tokens (an older state of the same conversation), except keep
     int drop_prefixes_of(const server_tokens & tokens, const server_keepctx_entry * keep);

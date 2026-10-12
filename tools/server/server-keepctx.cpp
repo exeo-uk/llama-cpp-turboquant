@@ -588,15 +588,27 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 }
 
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
-                          llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, std::string & info) {
+                          llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info) {
     const auto t0 = std::chrono::steady_clock::now();
 
-    server_keepctx_entry e = std::move(*it);
-    entries.erase(it);
+    server_keepctx_entry e_own;
+    if (!keep) {
+        e_own = std::move(*it);
+        entries.erase(it);
+    }
+    server_keepctx_entry & e = keep ? *it : e_own;
+
+    // a kept entry that failed to restore is not offered again
+    auto fail = [&](const char * why) {
+        info = why;
+        if (keep) {
+            entries.erase(it);
+        }
+        return false;
+    };
 
     if ((e.size_dft > 0) != (ctx_dft != nullptr)) {
-        info = "the draft context does not match the stored state";
-        return false;
+        return fail("the draft context does not match the stored state");
     }
 
     std::list<common_prompt_checkpoint> ckpts;
@@ -627,15 +639,13 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         }
     }
     if (!ok) {
-        info = "reading the stored state failed";
-        return false;
+        return fail("reading the stored state failed");
     }
     if (!common_speculative_set_carry(spec, seq_id, e.carry)) {
-        info = "the drafter carry does not match this drafter";
-        return false;
+        return fail("the drafter carry does not match this drafter");
     }
 
-    prompt.tokens      = std::move(e.prompt.tokens);
+    prompt.tokens      = keep ? e.prompt.tokens.clone() : std::move(e.prompt.tokens);
     prompt.checkpoints = std::move(ckpts);
 
     const double ms = kc_ms_since(t0);
@@ -661,8 +671,12 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         const bool vd = !ctx_dft || (state_hash(ctx_dft, hd) && hd == e.hash_dft);
         ver = string_format(", verify: target %s, draft %s", vt ? "identical" : "DIFFERS", ctx_dft ? (vd ? "identical" : "DIFFERS") : "none");
     }
-    info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, store %zu conversations / %.1f MiB%s%s",
+    info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, %s, store %zu conversations / %.1f MiB%s%s",
                          prompt.n_tokens(), prompt.checkpoints.size(), e.n_bytes/1048576.0, ms, e.n_bytes/(ms*1e6),
+                         keep ? "kept in the store (the prompt continues a part of it)" : "taken from the store",
                          entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
+    if (keep) {
+        entries.splice(entries.end(), entries, it); // the most recently used
+    }
     return true;
 }
