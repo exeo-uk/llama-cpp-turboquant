@@ -30,8 +30,8 @@ struct common_mtp_adapt {
 
     // configuration, LLAMA_FN_L19_DRAFT_ADAPT_* (init_env)
     int   kmax    = 3;       // _KMAX: the cap's upper bound (1..4)
-    int   probe   = 8;       // _PROBE: every this-many rounds K + 1 (0 = never)
-    float w_acc   = 0.10f;   // _WACC: EWMA weight of a new pass / accept observation
+    int   probe   = 16;      // _PROBE: every this-many rounds K + 1 (0 = never)
+    float w_acc   = 0.03f;   // _WACC: EWMA weight of a new pass / accept observation (0.10 flipped caps on noise)
     float w_t     = 0.05f;   // _WT: EWMA weight of a new time sample
     float pass0   = 0.80f;   // _PASS0: prior pass_i
     float acc0    = 0.80f;   // _ACC0: prior acc_i
