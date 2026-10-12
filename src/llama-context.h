@@ -464,6 +464,11 @@ private:
     // [TAG_FN_L19_TTFT_HUSH] LLAMA_FN_L19_TTFT_HUSH: bit 1 = the warm pass and the saved state's read-ahead pause while a FULL
     // compute reserve is made, bit 2 = while a prompt batch (wider than an answer step) runs; 0 = off
     int      l19_hush  = 0;
+    // [TAG_FN_L19_TTFT_EARLY] LLAMA_FN_L19_TTFT_EARLY=<n>: while the experts' warm pass runs (the first minute or so after a
+    // start), a prompt batch of up to n tokens stays SMALL (the LLAMA_FN_L4_PROMPT path: no FULL reserve, whose allocation
+    // sat 7.4 s in the driver beside the pass); 0 = off
+    uint32_t l19_early = 0;
+    uint64_t cbuf_n_early = 0;
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a
