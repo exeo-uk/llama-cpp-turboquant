@@ -3545,6 +3545,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     float            ad_p[common_mtp_adapt::K_MAX] = {}; // the drafter's top p at each decoded position of the round
     int32_t          ad_acc       = -1;    // drafts the target accepted (-1: no accept() yet)
     double           ad_td_us     = 0.0;   // the round's draft decodes, sampling included
+    double           ad_P         = 1.0;   // P(the drafts kept so far are all accepted), calibrated (the cost cut)
 
     void fuse_clear(llama_seq_id s) {
         fuse_tok[s].clear();
@@ -3713,9 +3714,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             h += string_format("%s%lld", k > 1 ? " " : "", (long long) ad.hist[k]);
         }
         LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] %s: pass/acc per position {%s}, verify ms per width {%s} (* = priced from "
-                "a neighbour), draft decode ms %.2f / %.2f, caps chosen {%s} (probes %lld), rounds %lld, dropped samples %lld\n",
+                "a neighbour), draft decode ms %.2f / %.2f, caps chosen {%s} (probes %lld), rounds %lld, dropped samples %lld, "
+                "cost cut %s (%lld tokens), rate %.4f tok/ms\n",
                 __func__, when, pa.c_str(), tv.c_str(), ad.t_d0()/1000.0, ad.t_d1()/1000.0, h.c_str(), (long long) ad.n_probe,
-                (long long) ad.n_round, (long long) ad.n_drop);
+                (long long) ad.n_round, (long long) ad.n_drop, ad.cut > 0 ? "on" : "off", (long long) ad.n_cut, ad.lam*1000.0);
         if (ad_trace) {
             fflush(ad_trace);
         }
@@ -4476,6 +4478,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             ad_acc   = -1;
             ad_td_us = 0.0;
+            ad_P     = 1.0;
             ad_t_end  = 0;
             ad_n_proc = 0;
             ad_dec    = 0;
@@ -4590,7 +4593,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (use_policy) {
                 return cost_keep(s, conf, d, n);
             }
-            return !(conf < pmin_at(pos));
+            if (conf < pmin_at(pos)) {
+                return false;
+            }
+            // [TAG_FN_L19_DRAFT_ADAPT] the cost cut on top of p_min: the token must pay for its verify row
+            if (ad_on && ad.cut > 0 && s == 0) {
+                if (!ad.keep(pos, ad_P, conf)) {
+                    ad.n_cut++;
+                    return false;
+                }
+                ad_P *= ad.acc_p(pos, conf);
+            }
+            return true;
         };
 
         // [TAG_FN_L4_HOST_MTPFUSE] kept rows of sequences that do not draft now: in the first draft decode too (no output),
@@ -4991,6 +5005,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ad.observe(ad_dec, ad_prop, n_accepted);
             ad_open = false;
             ad_acc  = n_accepted;
+            for (int k = 0; k < std::min<int>({ ad_prop, (int) n_accepted + 1, common_mtp_adapt::K_MAX }); ++k) {
+                ad.observe_p(k, ad_p[k], k < (int) n_accepted); // the calibration of the cost cut
+            }
         }
 
         // [TAG_FN_MTP_COST] calibrate the acceptance per drafter probability from what the target kept

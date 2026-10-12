@@ -13,6 +13,9 @@
 // tv[W]: EWMA of the time from the end of draft() to the next draft() when the verify had W rows (target decode, sampling,
 // accept); a width with few samples is priced on the line through the two nearest measured widths (row_us per row when
 // only one is measured). td0 / td1: EWMA of the first / a later draft decode, sampling included. Every `probe`-th round uses K + 1, so the deeper positions stay measured.
+// Cost cut (LLAMA_FN_L19_DRAFT_ADAPT_CUT=1, on top of the p_min rule, so it can only shorten a draft): a drafted token at
+// position k is kept only if P * a_k(p) >= lambda * (tv[k + 1] - tv[k]): P the probability that the drafts before it are
+// accepted, a_k(p) the acceptance calibrated per position and top-p bin (prior: p), lambda the best E[tok] / E[us].
 // Exact: only the draft length changes; the target verifies every draft (rejection sampling unchanged).
 // Pure arithmetic, no llama calls: tests/test-mtp-adapt.cpp drives it with simulated rounds.
 
@@ -40,6 +43,11 @@ struct common_mtp_adapt {
     float outlier = 3.0f;    // _OUTLIER: a time sample above this x its current estimate is dropped (stall, page-in)
     int   skip    = 4;       // _SKIP: rounds after a prompt that are no time samples (hot-set refill)
     int   log     = 0;       // _LOG: 1 = a summary every 512 rounds and at the end
+    int   cut     = 0;       // _CUT: 1 = the cost cut on top of p_min
+    float cal_w0  = 4.0f;    // _CAL_W0: weight (samples) of the prior a(p) = p in a calibration bin
+    float cal_dec = 0.995f;  // _CAL_DECAY: weight of a bin's past samples per new sample in it
+
+    static constexpr int N_BIN = 10; // top-p bins of the calibration
 
     // state
     float   pass[K_MAX] = {};
@@ -52,6 +60,10 @@ struct common_mtp_adapt {
     int64_t n_drop  = 0;
     int64_t hist[K_MAX + 1] = {};  // chosen caps (probes included)
     int64_t n_probe = 0;
+    double  lam     = 0.0;         // the best E[tok] / E[us] of the last choose()
+    float   cal_n[K_MAX][N_BIN] = {};
+    float   cal_a[K_MAX][N_BIN] = {};
+    int64_t n_cut   = 0;           // drafted tokens the cost cut dropped
 
     static float env_f(const char * name, float def) {
         const char * e = getenv(name);
@@ -73,6 +85,9 @@ struct common_mtp_adapt {
         outlier = std::max(1.5f, env_f("LLAMA_FN_L19_DRAFT_ADAPT_OUTLIER", outlier));
         skip    = std::max(0, (int) env_f("LLAMA_FN_L19_DRAFT_ADAPT_SKIP", (float) skip));
         log     = std::max(0, (int) env_f("LLAMA_FN_L19_DRAFT_ADAPT_LOG", (float) log));
+        cut     = std::max(0, (int) env_f("LLAMA_FN_L19_DRAFT_ADAPT_CUT", (float) cut));
+        cal_w0  = std::max(0.01f, env_f("LLAMA_FN_L19_DRAFT_ADAPT_CAL_W0", cal_w0));
+        cal_dec = std::min(1.0f, std::max(0.9f, env_f("LLAMA_FN_L19_DRAFT_ADAPT_CAL_DECAY", cal_dec)));
         reset();
     }
 
@@ -87,6 +102,36 @@ struct common_mtp_adapt {
         }
         td0 = td1 = 0.0;
         td0n = td1n = 0;
+        for (int i = 0; i < K_MAX; ++i) {
+            for (int b = 0; b < N_BIN; ++b) {
+                cal_n[i][b] = cal_a[i][b] = 0.0f;
+            }
+        }
+    }
+
+    static int bin_of(float p) {
+        return std::min(N_BIN - 1, std::max(0, (int) (p*N_BIN)));
+    }
+
+    // calibrated acceptance of a draft at position pos (0-based) whose top p is p
+    double acc_p(int pos, float p) const {
+        pos = std::min(K_MAX - 1, std::max(0, pos));
+        const int b = bin_of(p);
+        return (cal_a[pos][b] + cal_w0*p)/(cal_n[pos][b] + cal_w0);
+    }
+
+    void observe_p(int pos, float p, bool accepted) {
+        pos = std::min(K_MAX - 1, std::max(0, pos));
+        const int b = bin_of(p);
+        cal_n[pos][b] = cal_n[pos][b]*cal_dec + 1.0f;
+        cal_a[pos][b] = cal_a[pos][b]*cal_dec + (accepted ? 1.0f : 0.0f);
+    }
+
+    // the cost cut: keep the draft at position pos (0-based, top p) when the drafts before it are all accepted with
+    // probability P_prev; lam = 0 (no choose() yet) keeps it
+    bool keep(int pos, double P_prev, float p) const {
+        const double dt = t_verify(pos + 2) - t_verify(pos + 1);
+        return !(cut > 0) || !(lam > 0.0) || P_prev*acc_p(pos, p) >= lam*dt;
     }
 
     static void ewma(double & v, int64_t & n, double x, double w) {
@@ -161,6 +206,7 @@ struct common_mtp_adapt {
             }
         }
         int K = best;
+        lam   = best_r;
         if (count) {
             n_round++;
             if (probe > 0 && n_round % probe == 0 && K < kmax) {

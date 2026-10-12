@@ -249,10 +249,129 @@ static void test_sim() {
     }
 }
 
+// the cost cut: drafts carry a top p; acceptance grows with it; a draft is proposed only if p >= p_min (0.5), and with
+// the cut only if it also pays for its verify row. The cut may only help: >= 99 % of the cap rule alone everywhere.
+struct scenario_p {
+    const char * name;
+    float lo, hi;  // top p ~ U(lo, hi) per position
+    float a_lo;    // acceptance at p = 0.5 (linear up to 0.97 at p = 1)
+    float tv1, row2, row3, row4, td0, td1;
+};
+
+static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mtp_adapt * pol) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    std::normal_distribution<double>       N(0.0, 1.0);
+    const float rows[5] = { 0.0f, 0.0f, sc.row2, sc.row3, sc.row4 };
+    double tok = 0.0, us = 0.0;
+    for (int r = 0; r < 6000; ++r) {
+        const int K = pol ? pol->choose() : fixed_k;
+        int    dec = 0, prop = 0;
+        double t = 0.0, P = 1.0;
+        float  ps[4] = {};
+        for (int i = 1; i <= K; ++i) {
+            dec++;
+            const double td = (i == 1 ? sc.td0 : sc.td1)*(1.0 + 0.1*N(rng));
+            t += td;
+            if (pol) {
+                pol->add_decode(i == 1, td);
+            }
+            const float p = (float) (sc.lo + (sc.hi - sc.lo)*U(rng));
+            if (p < 0.5f) {
+                break;
+            }
+            if (pol && !pol->keep(i - 1, P, p)) {
+                break;
+            }
+            if (pol) {
+                P *= pol->acc_p(i - 1, p);
+            }
+            ps[prop++] = p;
+        }
+        int acc = 0;
+        while (acc < prop) {
+            const double a = sc.a_lo + (0.97 - sc.a_lo)*(ps[acc] - 0.5)/0.5;
+            if (U(rng) >= a) {
+                break;
+            }
+            acc++;
+        }
+        const int W  = prop + 1;
+        double    tv = sc.tv1;
+        for (int w = 2; w <= W; ++w) {
+            tv += rows[w];
+        }
+        tv *= 1.0 + 0.08*N(rng);
+        t += tv;
+        if (pol) {
+            pol->add_verify(W, tv);
+            pol->observe(dec, prop, acc);
+            for (int k = 0; k < std::min(prop, acc + 1); ++k) {
+                pol->observe_p(k, ps[k], k < acc);
+            }
+        }
+        tok += 1.0 + acc;
+        us  += t;
+    }
+    return tok/us*1000.0;
+}
+
+static void test_cut() {
+    {
+        common_mtp_adapt c;
+        c.init_env();
+        TCHECK(std::fabs(c.acc_p(0, 0.65f) - 0.65) < 1e-6, "prior a(p) = p");
+        for (int k = 0; k < 200; ++k) {
+            c.observe_p(1, 0.65f, k % 4 != 0); // 75 %
+        }
+        TCHECK(std::fabs(c.acc_p(1, 0.62f) - 0.75) < 0.03, "calibrated %.3f", c.acc_p(1, 0.62f));
+        TCHECK(std::fabs(c.acc_p(0, 0.62f) - 0.62) < 1e-6, "other position untouched");
+        c.cut = 1;
+        for (int k = 0; k < 20; ++k) {
+            c.add_verify(1, 12000.0);
+            c.add_verify(2, 14000.0);
+            c.add_verify(3, 18000.0);
+        }
+        c.lam = 0.11/1000.0; // tok/us
+        TCHECK(c.keep(0, 1.0, 0.55f), "row 2 (2 ms = 0.22 tok) pays at a 0.55");
+        TCHECK(!c.keep(1, 0.7, 0.55f), "row 3 (4 ms = 0.44 tok) does not pay at 0.7 x 0.55");
+        TCHECK(c.keep(1, 0.95, 0.95f), "row 3 pays at 0.95 x 0.95");
+        c.cut = 0;
+        TCHECK(c.keep(1, 0.1, 0.5f), "cut off keeps everything");
+    }
+    const scenario_p scs[] = {
+        // name                       lo     hi    a_lo    tv1    row2  row3  row4  td0  td1
+        { "prose, row 3 costly",    0.20f, 1.0f, 0.45f, 12000, 2000, 4200, 4500, 720, 720 },
+        { "code, row 3 costly",     0.45f, 1.0f, 0.70f, 12000, 2000, 4200, 4500, 720, 720 },
+        { "copy, cheap rows",       0.70f, 1.0f, 0.85f, 12000, 1000, 1500, 2000, 720, 720 },
+        { "flat costs",             0.30f, 1.0f, 0.60f, 12000, 1500, 1500, 1500, 720, 720 },
+    };
+    for (const auto & sc : scs) {
+        double fix2 = 0.0, ad = 0.0, adc = 0.0;
+        const int n_seed = 4;
+        for (int s = 0; s < n_seed; ++s) {
+            fix2 += run_p(sc, 2, 300 + s, nullptr);
+            common_mtp_adapt a;
+            a.init_env();
+            ad += run_p(sc, 0, 300 + s, &a);
+            common_mtp_adapt b;
+            b.init_env();
+            b.cut = 1;
+            adc += run_p(sc, 0, 300 + s, &b);
+        }
+        fix2 /= n_seed; ad /= n_seed; adc /= n_seed;
+        printf("  %-22s fixed K=2 %.4f, adaptive %.4f (%+.1f %%), adaptive + cut %.4f (%+.1f %%)\n", sc.name, fix2, ad,
+               100.0*(ad/fix2 - 1.0), adc, 100.0*(adc/fix2 - 1.0));
+        TCHECK(adc >= 0.99*ad, "%s: the cut lost %.4f vs %.4f", sc.name, adc, ad);
+        TCHECK(ad >= 0.99*fix2, "%s: adaptive lost %.4f vs fixed 2 %.4f", sc.name, ad, fix2);
+    }
+}
+
 int main() {
     test_pieces();
     printf("pieces: %d checks, %d failed\n", g_checks, g_fail);
     test_sim();
+    test_cut();
     printf("total: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
