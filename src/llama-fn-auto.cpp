@@ -168,8 +168,8 @@ const fn_item k_items[] = {
     // [TAG_FN_L12_ADOPT] round 12: a prompt chunk under 384 tokens runs its host experts on the CPU instead of streaming every
     // expert of all 48 layers through the GPU (~3.4 s whatever the size): on a 24K context 32 / 128 / 256 new tokens took
     // 3.39 / 3.40 / 3.38 s, now 0.33 / 0.84 / 1.42 s (l11/pp_mid; the CPU path costs more than the stream from ~600 tokens)
-    { "LLAMA_PREFILL_STREAM_MIN",    "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN]
-    { "GGML_OP_OFFLOAD_MIN_BATCH",   "384",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] no op-offload copy below it either
+    { "LLAMA_PREFILL_STREAM_MIN",    "768",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] [TAG_FN_L19_ADOPT] 384 until round 19 (the CPU path with PHOT beats the stream to ~768 tokens)
+    { "GGML_OP_OFFLOAD_MIN_BATCH",   "768",   P_ALL }, // [TAG_FN_L12_PROMPTMIN] no op-offload copy below it either ([TAG_FN_L19_ADOPT] 384 until round 19)
     // [TAG_FN_L13_SPEC_EQUAL] round 13: streams that draft together draft the same length, so a step is one ubatch
     { "SPEC_MTP_EQUAL_SEQS",         "1",     P_ALL },
     // [TAG_FN_L14_ARENA] round 14: the host layers' routed experts read once into locked RAM, whole layers above a reserve
@@ -216,6 +216,26 @@ const fn_item k_items[] = {
     { "GGML_CUDA_FN_L18_HCUP",           "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_HCUP] hc up loads its weights before the PDL wait
     { "LLAMA_FN_L18_GF_GDNOUT",          "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_GDNOUT] GDN output norm + gate + q8_1 copy in one launch
     { "LLAMA_FN_L18_GF_QKVZ",            "1",     P_ALL }, // [TAG_FN_L18_GPUFLOOR_QKVZ] GDN qkv and z projections in one launch
+    // [TAG_FN_L19_ADOPT] round 19 (l19/int, the owner's command with vision, per-answer t/s + time to first token, OLD = main
+    // 09d57d3b8, 1 round + arms; the smartness eval held the GPU until 21:42): the ttft family and convstore's assistant-turn
+    // checkpoint. Follow-ups 0.98 -> 0.36 s to first token (median), short chats 0.43 -> 0.31 s, first answer 2.21 -> 1.55 s,
+    // a first message 5 s after ready 18.8 -> 5.5 s, 128-token turns 2.1 -> 1.5 s, 450 / 750-token turns 4.2-4.5 -> 2.5-2.7 /
+    // 3.4-3.6 s (CPU path to 768 tokens, LLAMA_PREFILL_STREAM_MIN / GGML_OP_OFFLOAD_MIN_BATCH above), a client that drops the
+    // last answer's reasoning re-reads 85 instead of 517 tokens (5.1 -> 0.8 s); answer t/s unchanged. Not adopted: convstore's
+    // 16-conversation store / keeping rule / disk checkpoints / system-block stores (agent workload cache share 75 -> 82 % but
+    // TTFT sum 117.1 -> 118.6 s: a >= 384-token chunk costs one stream pass whatever its size), LLAMA_FN_L19_DRAFT_ADAPT (+ CUT:
+    // 105 -> 75 t/s, the cut dropped ~99 % of drafts after an early 4-row verify sample priced width 2 at 42.75 ms) and
+    // LLAMA_FN_L19_DRAFT_F16KV (neutral: pooled decode 111.7 -> 111.0 t/s)
+    { "LLAMA_FN_L19_TTFT_HUSH",         "3",      P_ALL }, // [TAG_FN_L19_TTFT_HUSH] the warm pass / state read-ahead pause during a FULL reserve and prompt batches
+    { "LLAMA_FN_L19_TTFT_EARLY",        "256",    P_ALL }, // [TAG_FN_L19_TTFT_EARLY] a <= 256-token prompt during the warm pass stays SMALL (no FULL reserve)
+    { "LLAMA_FN_L19_TTFT_PHOT",         "1",      P_ALL }, // [TAG_FN_L19_TTFT_PHOT] CPU-path prompt graphs compute their hot experts on the GPU
+    { "LLAMA_FN_L4_PROMPT",             "160",    P_ALL }, // [TAG_FN_L4_MEM_PROMPT] a <= 160-token prompt stays SMALL (ubatches of <= 31 tokens, no FULL switch)
+    { "LLAMA_FN_L19_TTFT_TAILFULL",     "512",    P_ALL }, // [TAG_FN_L19_TTFT_TAILFULL] the narrow tail of a split short prompt keeps FULL
+    { "LLAMA_FN_L19_CONVSTORE",         "1",      P_ALL }, // [TAG_FN_L19_CONVSTORE] with the four lines below: the assistant-turn checkpoint only (_OPENER auto)
+    { "LLAMA_FN_L19_CONVSTORE_N",       "4",      P_ALL }, //   4 conversations, as LLAMA_FN_L18_KEEPCTX
+    { "LLAMA_FN_L19_CONVSTORE_EVICT",   "0",      P_ALL }, //   least recently stored first, as before
+    { "LLAMA_FN_L19_CONVSTORE_CKPT",    "0",      P_ALL }, //   the checkpoint ring as before (no keeping rule, no disk checkpoints)
+    { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
