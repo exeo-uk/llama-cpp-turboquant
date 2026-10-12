@@ -11,8 +11,8 @@
 // pass_i: P(the drafter's top p passes p_min at position i | its decode ran); acc_i: P(the target accepts draft i | drafts
 // before it were accepted). Both are EWMAs (weight w_acc) over the rounds that reached position i.
 // tv[W]: EWMA of the time from the end of draft() to the next draft() when the verify had W rows (target decode, sampling,
-// accept); widths with few samples are priced from the nearest measured width plus row_us per row. td0 / td1: EWMA of the
-// first / a later draft decode, sampling included. Every `probe`-th round uses K + 1, so the deeper positions stay measured.
+// accept); a width with few samples is priced on the line through the two nearest measured widths (row_us per row when
+// only one is measured). td0 / td1: EWMA of the first / a later draft decode, sampling included. Every `probe`-th round uses K + 1, so the deeper positions stay measured.
 // Exact: only the draft length changes; the target verifies every draft (rejection sampling unchanged).
 // Pure arithmetic, no llama calls: tests/test-mtp-adapt.cpp drives it with simulated rounds.
 
@@ -100,17 +100,29 @@ struct common_mtp_adapt {
         if (tvn[W - 1] >= nmin) {
             return tv[W - 1];
         }
-        // the nearest width with enough samples, plus or minus row_us per row; else the prior line
-        for (int d = 1; d < W_MAX; ++d) {
-            const int lo = W - d, hi = W + d;
-            if (lo >= 1 && tvn[lo - 1] >= nmin) {
-                return tv[lo - 1] + row_us*d;
-            }
-            if (hi <= W_MAX && tvn[hi - 1] >= nmin) {
-                return std::max(1.0, tv[hi - 1] - (double) row_us*d);
+        // the nearest width with enough samples (a), and the line through it and the measured width nearest to a (b,
+        // slope >= 0); with one measured width row_us per row; with none the prior line
+        int a = 0;
+        for (int d = 1; d < W_MAX && a == 0; ++d) {
+            if (W - d >= 1 && tvn[W - d - 1] >= nmin) {
+                a = W - d;
+            } else if (W + d <= W_MAX && tvn[W + d - 1] >= nmin) {
+                a = W + d;
             }
         }
-        return tv0 + row_us*(W - 1);
+        if (a == 0) {
+            return tv0 + row_us*(W - 1);
+        }
+        int b = 0;
+        for (int d = 1; d < W_MAX && b == 0; ++d) {
+            if (a - d >= 1 && tvn[a - d - 1] >= nmin) {
+                b = a - d;
+            } else if (a + d <= W_MAX && tvn[a + d - 1] >= nmin) {
+                b = a + d;
+            }
+        }
+        const double slope = b == 0 ? (double) row_us : std::max(0.0, (tv[b - 1] - tv[a - 1])/(b - a));
+        return std::max(1.0, tv[a - 1] + slope*(W - a));
     }
 
     double t_d0() const { return td0n > 0 ? td0 : td0_us; }

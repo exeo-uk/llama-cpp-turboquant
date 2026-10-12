@@ -76,6 +76,19 @@ static void test_pieces() {
     TCHECK(ad.n_drop == nd + 1, "outlier not counted");
     TCHECK(ad.add_verify(2, 17000.0), "normal sample dropped");
 
+    // two measured widths: the others on their line
+    {
+        common_mtp_adapt e;
+        e.init_env();
+        for (int k = 0; k < 10; ++k) {
+            e.add_verify(2, 16000.0);
+            e.add_verify(3, 18000.0);
+        }
+        TCHECK(std::fabs(e.t_verify(4) - 20000.0) < 1e-6 && std::fabs(e.t_verify(5) - 22000.0) < 1e-6, "line up %.1f %.1f",
+               e.t_verify(4), e.t_verify(5));
+        TCHECK(std::fabs(e.t_verify(1) - 14000.0) < 1e-6, "line down %.1f", e.t_verify(1));
+    }
+
     // expect() == enumeration, for several states
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> U(0.05f, 0.99f);
