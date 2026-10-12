@@ -149,6 +149,9 @@ struct moe_cache {
     bool    hot       = false;
     int     hot_max_t = 0;
     int     hot_short_t = 0; // [TAG_FN_L4_MEM_PROMPT] LLAMA_FN_L4_PROMPT_HOT: graphs of up to this many tokens build the hot chain too
+    int     hot_prompt_t = 0; // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT: wider CPU-path prompt graphs (up to this) too
+    bool    phot_stats   = false; // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT_STATS=1: hit rate of each CPU-path prompt graph
+    uint64_t phot_n = 0, phot_hit = 0, phot_lent = 0, phot_layers = 0;
     uint64_t hot_steps = 0;
 
     // [TAG_FN_MOE_HOT_ADAPT] adaptive hot set: tables change only in step() of the owning context, after its compute
@@ -879,6 +882,39 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     const int64_t n_used   = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
     if (n_tokens > mc->hot_max_t) {
+        // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT_STATS: the share of a prompt graph's routed experts the hot set holds
+        // (the CPU skips those with PHOT); one line per graph, at its last host layer
+        if (mc->phot_stats) {
+            const int il_s = parse_layer_from_name(name);
+            for (auto & l : mc->layers) {
+                if (l.pub.il != il_s) {
+                    continue;
+                }
+                const int32_t * tbl = (const int32_t *) l.pub.host_table->data;
+                const int64_t n_exp = l.pub.host_table->ne[1];
+                const bool lent = l.cb_lent || l.kv_lent;
+                for (int64_t t = 0; t < n_tokens; ++t) {
+                    for (int64_t i = 0; i < n_used; ++i) {
+                        const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                        if (e < 0 || e >= n_exp) {
+                            continue;
+                        }
+                        mc->phot_n++;
+                        mc->phot_hit += !lent && tbl[e] != l.pub.n_slots;
+                    }
+                }
+                mc->phot_lent += lent;
+                mc->phot_layers++;
+                if (&l == &mc->layers.back()) {
+                    LLAMA_LOG_WARN("moe-hot: [TAG_FN_L19_TTFT_PHOT] prompt graph of %lld tokens: %.3f of %llu routed experts are "
+                            "hot (%llu of %llu host layers lent out)\n", (long long) n_tokens,
+                            mc->phot_n ? (double) mc->phot_hit/mc->phot_n : 0.0, (unsigned long long) mc->phot_n,
+                            (unsigned long long) mc->phot_lent, (unsigned long long) mc->phot_layers);
+                    mc->phot_n = mc->phot_hit = mc->phot_lent = mc->phot_layers = 0;
+                }
+                break;
+            }
+        }
         // [TAG_FN_R4_ADAPT_DECAY] prefill: the prompt's routing x LLAMA_MOE_HOT_SEED warms the decayed counts at the next
         // step; otherwise not counted, and the adaptive set stays frozen
         // [TAG_FN_L3_POLICY_SEED] with the seed node the graph reports every prompt ubatch, so the observer does not
@@ -2231,6 +2267,12 @@ int llama_moe_hot_graph_max_t() {
     return mc && mc->hot ? std::max(mc->hot_max_t, mc->hot_short_t) : 0;
 }
 
+// [TAG_FN_L19_TTFT_PHOT]
+int llama_moe_hot_prompt_max_t() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->hot ? mc->hot_prompt_t : 0;
+}
+
 namespace {
 
 // host-resident expert layers with a device-resident router (the same rule as the LRU cache). A context of a model
@@ -2916,6 +2958,15 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
     // the CPU computes only the cold experts of a short prompt; the decode accounting (prompt seed above max_t) is unchanged
     if (llama_fn_l3_flag(model, "LLAMA_FN_L4_PROMPT_HOT")) {
         mc->hot_short_t = 31;
+    }
+    // [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT=1 (or =<n>: graphs of up to n tokens): a prompt graph on the CPU path
+    // (wider than the graphs above, no prefill stream, below GGML_OP_OFFLOAD_MIN_BATCH) builds the hot chain as well, one
+    // row per routed (token, expert) so the batched kernels (MMQ) serve it; the CPU skips the hot experts. Off = 0
+    if (const int v = llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_PHOT", 0); v > 0) {
+        mc->hot_prompt_t = v == 1 ? INT32_MAX : v;
+        mc->phot_stats   = llama_fn_l3_flag(model, "LLAMA_FN_L19_TTFT_PHOT_STATS");
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L19_TTFT_PHOT] CPU-path prompt graphs of up to %d tokens compute the hot experts on "
+                "the GPU (one row per routed expert), the CPU only the others\n", mc->hot_prompt_t);
     }
 
     auto free_all = [&]() {

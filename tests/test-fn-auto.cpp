@@ -429,6 +429,27 @@ static void test_cbuf() {
     TCHECK(llama_fn_cbuf_small_t(31, 32, 0) == 31, "n_seqs 0 counts as 1");
     TCHECK(llama_fn_cbuf_small_t(31, 32, 40) == 40, "more sequences than 31: one token each (FULL - SMALL then decides)");
 
+    // [TAG_FN_L19_TTFT_EARLY] the short path's limit
+    TCHECK(llama_fn_cbuf_short_max(0, 0, true, 42, 31) == 0, "EARLY off: no short path (as before)");
+    TCHECK(llama_fn_cbuf_short_max(64, 0, true, 42, 31) == 64, "EARLY off: LLAMA_FN_L4_PROMPT stays");
+    TCHECK(llama_fn_cbuf_short_max(0, 256, true, 42, 31) == 256, "warm pass runs: a 42-token first message takes the short path");
+    TCHECK(llama_fn_cbuf_short_max(0, 256, false, 42, 31) == 0, "warm pass done: the normal path");
+    TCHECK(llama_fn_cbuf_short_max(0, 256, true, 300, 31) == 0, "wider than EARLY: the normal path");
+    TCHECK(llama_fn_cbuf_short_max(512, 256, true, 300, 31) == 512, "a larger LLAMA_FN_L4_PROMPT wins");
+    TCHECK(llama_fn_cbuf_short_max(0, 256, true, 20, 31) == 0, "a batch the SMALL reserve serves anyway: unchanged");
+
+    // [TAG_FN_L19_TTFT_TAILFULL] the last 4 tokens of a split 400-token turn keep FULL; nothing else does
+    TCHECK(llama_fn_cbuf_tail_full(512, true, false, 4, 1, 400, false, 31), "split short turn: the 4-token tail stays FULL");
+    TCHECK(!llama_fn_cbuf_tail_full(0, true, false, 4, 1, 400, false, 31), "off");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 4, 1, 900, false, 31), "a split of >= 512 tokens switches as upstream");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 3, 1, 4, true, 31), "an answer step after the tail returns to SMALL");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 3, 3, 400, true, 31), "an answer step after an unsplit prompt returns to SMALL");
+    TCHECK(!llama_fn_cbuf_tail_full(512, false, false, 4, 1, 400, false, 31), "SMALL state: nothing to keep");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, true, 4, 1, 400, false, 31), "the short path is SMALL by definition");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 4, 0, 400, false, 31), "a narrow part without outputs (mid-prompt) is not a tail");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 40, 1, 400, false, 31), "a wide batch is FULL anyway");
+    TCHECK(!llama_fn_cbuf_tail_full(512, true, false, 4, 1, 20, false, 31), "after a narrow part: switch");
+
     const size_t gran  = 2 * MiB;
     const size_t full  = (size_t) (3725.44 * MiB);
     const size_t small = 250 * MiB;

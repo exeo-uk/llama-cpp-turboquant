@@ -692,6 +692,19 @@ int llama_fn_cbuf_first_tail_layer(const std::vector<size_t> & layer_bytes, size
     return -1;
 }
 
+uint32_t llama_fn_cbuf_short_max(uint32_t short_max, uint32_t early, bool warm_running, uint32_t n_tokens, uint32_t small_t) {
+    if (early > 0 && warm_running && n_tokens > small_t && n_tokens <= early) {
+        return std::max(short_max, early);
+    }
+    return short_max;
+}
+
+bool llama_fn_cbuf_tail_full(uint32_t tailfull, bool state_full, bool short_path, uint32_t n_tokens, uint32_t n_outputs,
+        uint32_t prev_n, bool prev_out, uint32_t small_t) {
+    return tailfull > 0 && state_full && !short_path && n_tokens <= small_t && n_outputs > 0 && !prev_out &&
+           prev_n > small_t && prev_n < tailfull;
+}
+
 bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {
     const size_t need = tail + stream_lend + budget/32 + ((size_t) 64 << 20);
     return tail > 0 && budget >= need;

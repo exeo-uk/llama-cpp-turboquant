@@ -1733,6 +1733,14 @@ llama_context::llama_context(
             fa18_fit  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_FIT");
             fa18_ovl  = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_OVERLAP");
             fa18_warm = llama_fn_l3_flag(model, "LLAMA_FN_L18_FIRSTANS_WARM");
+            l19_hush  = llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_HUSH", 0); // [TAG_FN_L19_TTFT_HUSH]
+            l19_early = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_EARLY", 0)); // [TAG_FN_L19_TTFT_EARLY]
+            l19_tailfull = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_TAILFULL", 0)); // [TAG_FN_L19_TTFT_TAILFULL]
+            if (l19_hush != 0) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_HUSH] the warm pass and the saved state's read-ahead pause%s%s\n", __func__,
+                        (l19_hush & 1) ? " while a FULL compute reserve is made" : "",
+                        (l19_hush & 2) ? " while a prompt batch runs" : "");
+            }
             if (llama_moe_hot_fit_wanted(model) && llama_moe_hot_device(model) != nullptr) {
                 moe_hot_pending = true;
                 LLAMA_LOG_INFO("%s: moe-hot: the VRAM fit sizes the hot set at the first decode after every context of the "
@@ -3688,6 +3696,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         warm_go.small = true;
         llama_fn_warm_small_decode(true);
     }
+    // [TAG_FN_L19_TTFT_HUSH] bit 2: a prompt batch makes the warm pass and the saved state's read-ahead wait (its own pages
+    // and the driver's allocations first)
+    llama_fn_hush_scope hush_prompt((l19_hush & 2) != 0 && !warm_go.small && model.arch == LLM_ARCH_QWEN4EXP);
 
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);
@@ -3803,10 +3814,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (cbuf_state != CBUF_OFF) {
         cbuf_n_batch++;
         bool wide = n_tokens_all > cbuf_small_t;
+        // [TAG_FN_L19_TTFT_EARLY] while the warm pass runs, prompts up to l19_early tokens take the short path as well
+        const uint32_t short_max = llama_fn_cbuf_short_max(cbuf_short_max, l19_early, l19_early > 0 && llama_fn_warm_running(),
+                n_tokens_all, cbuf_small_t);
+        const bool     early     = short_max > cbuf_short_max;
         // [TAG_FN_L4_MEM_PROMPT] a short prompt between decodes stays SMALL (a FULL state of a running long prompt stays)
-        if (wide && cbuf_short_max > 0 && (uint32_t) n_tokens_all <= cbuf_short_max && cbuf_state == CBUF_SMALL && !cbuf_pinned) {
+        if (wide && short_max > 0 && (uint32_t) n_tokens_all <= short_max && cbuf_state == CBUF_SMALL && !cbuf_pinned) {
             wide       = false;
             cbuf_short = true;
+            if (early && n_tokens_all > cbuf_short_max && cbuf_n_early++ < 3) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_EARLY] the warm pass runs: a %d-token prompt batch stays SMALL (<= %u "
+                        "tokens), ubatches of <= %u tokens, no FULL reserve\n", __func__, (int) n_tokens_all, l19_early, cbuf_small_t);
+            }
             if (cbuf_n_short++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_PROMPT] a %d-token batch stays SMALL (<= %u tokens, LLAMA_FN_L4_PROMPT): "
                         "ubatches of <= %u tokens with the host experts on the CPU, no FULL switch, no stream\n", __func__,
@@ -3823,7 +3842,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             cbuf_full_at.clear();
             LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
         }
-        if (!cbuf_set(wide || cbuf_pinned)) {
+        // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
+        const bool tail_full = !wide && llama_fn_cbuf_tail_full(l19_tailfull, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
+                n_outputs_all, cbuf_prev_n, cbuf_prev_out, cbuf_small_t);
+        if (tail_full) {
+            if (cbuf_n_tailfull++ < 3) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_TAILFULL] the %d-token last part of a split prompt (%u tokens before it) stays "
+                        "FULL: the answer's first step returns to SMALL\n", __func__, (int) n_tokens_all, cbuf_prev_n);
+            }
+        }
+        cbuf_prev_n   = n_tokens_all;
+        cbuf_prev_out = n_outputs_all > 0;
+        if (!cbuf_set(wide || cbuf_pinned || tail_full)) {
             return -2;
         }
     }
@@ -6505,6 +6535,8 @@ bool llama_context::cbuf_set(bool full) {
     size_t released = 0;
     size_t trimmed  = 0;
     bool   restored = true;
+    // [TAG_FN_L19_TTFT_HUSH] bit 1: the FULL reserve's allocation without the warm pass's page faults beside it
+    llama_fn_hush_scope hush_full((l19_hush & 1) != 0 && full);
     if (full) {
         released           = llama_moe_hot_cbuf_release(this);
         cbuf_state         = CBUF_FULL;

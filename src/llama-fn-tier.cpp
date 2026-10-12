@@ -53,6 +53,11 @@ static std::atomic<size_t> g_warm_mark{0};
 static std::atomic<bool>   g_warm_late{false};
 static std::atomic<int>    g_warm_decodes{0};
 static std::vector<size_t> g_warm_layer_end;
+// [TAG_FN_L19_TTFT_HUSH] scopes that want the warm pass and the saved state's read-ahead to pause (a FULL compute reserve whose
+// allocation sat 7.4 s in the driver beside their page faults, a prompt that faults in its own experts); a stream that waits
+// for the warm pass (llama_fn_warm_wait_layer) lifts the pause, so the two never wait for each other
+static std::atomic<int>    g_fn_hush{0};
+static std::atomic<int>    g_warm_layer_waiters{0};
 
 namespace {
 
@@ -710,7 +715,8 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
             const size_t sub = (size_t) 2 << 20;
             for (size_t o0 = 0; o0 < rs[i].n; o0 += sub) {
                 while ((g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
-                        fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000) &&
+                        fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000 ||
+                        llama_fn_hushed()) && // [TAG_FN_L19_TTFT_HUSH]
                        WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
                     Sleep(2);
                 }
@@ -915,9 +921,11 @@ void llama_fn_warm_wait_layer(int il) {
         return;
     }
     const size_t need = g_warm_layer_end[il];
+    g_warm_layer_waiters.fetch_add(1); // [TAG_FN_L19_TTFT_HUSH] the pass reads on while a stream waits for it
     while (g_warm_running.load(std::memory_order_acquire) && g_warm_mark.load() < need) {
         Sleep(1);
     }
+    g_warm_layer_waiters.fetch_sub(1);
 #else
     GGML_UNUSED(il);
 #endif
@@ -970,6 +978,14 @@ void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & 
             const char * p = (const char *) ranges[i].first;
             const size_t n = ranges[i].second;
             for (size_t o = 0; o < n; o += 4096) {
+                // [TAG_FN_L19_TTFT_HUSH] every 2 MiB: wait while a hush scope runs
+                while ((o & ((2u << 20) - 1)) == 0 && llama_fn_hushed() && !(abort && abort->load(std::memory_order_relaxed))) {
+#ifdef _WIN32
+                    Sleep(2);
+#else
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+#endif
+                }
                 (void) *(volatile const char *) (p + o);
             }
             if (n > 0) {
@@ -1018,6 +1034,19 @@ void llama_fn_warm_small_decode(bool begin) {
 #else
     GGML_UNUSED(begin);
 #endif
+}
+
+// [TAG_FN_L19_TTFT_HUSH] see llama-fn-tier.h
+void llama_fn_hush(bool begin) {
+    if (begin) {
+        g_fn_hush.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_fn_hush.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+bool llama_fn_hushed() {
+    return g_fn_hush.load(std::memory_order_relaxed) > 0 && g_warm_layer_waiters.load(std::memory_order_relaxed) == 0;
 }
 
 // [TAG_FN_L16_PLEGATE] see llama-fn-tier.h

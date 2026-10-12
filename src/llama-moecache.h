@@ -208,6 +208,10 @@ int llama_moe_hot_max_t();
 // (qwen4exp: the short prompt path's ubatches); 0 when hot mode is off
 int llama_moe_hot_graph_max_t();
 
+// [TAG_FN_L19_TTFT_PHOT] LLAMA_FN_L19_TTFT_PHOT: the widest CPU-path prompt graph (wider than llama_moe_hot_graph_max_t, no
+// prefill stream, no op offload) that builds the hot chain in its one-row-per-routed-expert form; 0 when off
+int llama_moe_hot_prompt_max_t();
+
 // [TAG_FN_R1_PFS_LEND] the prefill stream borrows the top `bytes` of the hot set's device buffer as its VRAM banks while
 // a prompt streams (LLAMA_PREFILL_STREAM_LEND=1), so the banks cost the decode no hot slots. The caller must have
 // synchronized every graph of the owner context: the hot layers whose slots lie in the lent range leave both tables

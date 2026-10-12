@@ -461,6 +461,22 @@ private:
     bool     fa18_fit  = false; // LLAMA_FN_L18_FIRSTANS_FIT: the deferred hot set fit when the caller is ready, not in a prompt
     bool     fa18_ovl  = false; // LLAMA_FN_L18_FIRSTANS_OVERLAP: the prompt-end pass's copies overlap the host work after it
     bool     fa18_warm = false; // LLAMA_FN_L18_FIRSTANS_WARM: only answer steps make the experts' warm pass wait
+    // [TAG_FN_L19_TTFT_HUSH] LLAMA_FN_L19_TTFT_HUSH: bit 1 = the warm pass and the saved state's read-ahead pause while a FULL
+    // compute reserve is made, bit 2 = while a prompt batch (wider than an answer step) runs; 0 = off
+    int      l19_hush  = 0;
+    // [TAG_FN_L19_TTFT_EARLY] LLAMA_FN_L19_TTFT_EARLY=<n>: while the experts' warm pass runs (the first minute or so after a
+    // start), a prompt batch of up to n tokens stays SMALL (the LLAMA_FN_L4_PROMPT path: no FULL reserve, whose allocation
+    // sat 7.4 s in the driver beside the pass); 0 = off
+    uint32_t l19_early = 0;
+    uint64_t cbuf_n_early = 0;
+    // [TAG_FN_L19_TTFT_TAILFULL] LLAMA_FN_L19_TTFT_TAILFULL=<n>: the narrow last part of a split prompt (it asks for outputs, the
+    // batch before it was wider than SMALL, had none and fewer than n tokens) stays FULL; the answer's first step returns to
+    // SMALL, as after an unsplit prompt. With LLAMA_FN_L19_TTFT_CKPT_TAIL the server splits the last 4 tokens of short turns
+    // too, and their SMALL switch (~0.25 s) would otherwise move in front of the first token. 0 = off
+    uint32_t l19_tailfull  = 0;
+    uint32_t cbuf_prev_n   = 0;     // the previous batch of this context: tokens, and whether it asked for outputs
+    bool     cbuf_prev_out = true;
+    uint64_t cbuf_n_tailfull = 0;
     void     moe_hot_fit_try();
 
     // [TAG_FN_L3_HOST_STEP] LLAMA_FN_HOST_STEP=1 (qwen4exp): the owner's moe-cache / DMA step after a decode runs on a
