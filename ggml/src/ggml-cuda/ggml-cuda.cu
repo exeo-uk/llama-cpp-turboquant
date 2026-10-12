@@ -5260,8 +5260,13 @@ static void ggml_cuda_fn_l6_hc_deps(ggml_cgraph * cgraph, ggml_backend_graph_opt
         ggml_tensor * bo = post->src[0];
         ggml_tensor * b0 = bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[0] : nullptr;
         ggml_tensor * b1 = bo != nullptr && bo->op == GGML_OP_ADD ? bo->src[1] : nullptr;
-        // [TAG_FN_L18_GPUFLOOR_HCADD] an ADD operand of that ADD: its operands as well (K1 reads them when it folds it in)
+        // [TAG_FN_L18_GPUFLOOR_HCADD] an ADD operand of that ADD: its operands as well (K1 reads them when it folds it in);
+        // only in the decode graphs the fused mixer takes (T <= 4): a prompt graph would keep two [n_embd, ubatch] tensors
+        // longer for nothing (+126 MiB of the -ub 8192 compute buffer)
         ggml_tensor * bb = b0 != nullptr && b0->op == GGML_OP_ADD ? b0 : b1 != nullptr && b1->op == GGML_OP_ADD ? b1 : nullptr;
+        if (mul->ne[2] > 4) {
+            bb = nullptr;
+        }
         ggml_tensor * keep[] = { bo, post->src[1], s1->src[0], b0, b1,
                                  fn_l18_hcadd_enabled() && bb != nullptr ? bb->src[0] : nullptr,
                                  fn_l18_hcadd_enabled() && bb != nullptr ? bb->src[1] : nullptr };
