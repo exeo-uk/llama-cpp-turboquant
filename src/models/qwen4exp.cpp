@@ -1042,6 +1042,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         l6_presync_mmvq = ps && ps[0] == '2'; // 2: also the GDN qkv / z projections (measured slower)
         const char * hcc = llama_model_fn_env(&model, "LLAMA_FN_L6_HCCOMB"); // [TAG_FN_L6_HCCOMB]
         l6_hccomb = hcc && hcc[0] && hcc[0] != '0';
+        const char * go = llama_model_fn_env(&model, "LLAMA_FN_L18_GF_GDNOUT"); // [TAG_FN_L18_GPUFLOOR_GDNOUT]
+        l18_gdnout = go && go[0] && go[0] != '0';
+        const char * qz = llama_model_fn_env(&model, "LLAMA_FN_L18_GF_QKVZ"); // [TAG_FN_L18_GPUFLOOR_QKVZ]
+        l18_qkvz = qz && qz[0] && qz[0] != '0';
+        static std::atomic<bool> noted_qz{false};
+        if (l18_qkvz && !noted_qz.exchange(true)) {
+            LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L18_GPUFLOOR_QKVZ] the GDN z projection right after qkv (one CUDA launch)\n");
+        }
         static std::atomic<bool> noted_ps{false};
         if (l6_presync && !noted_ps.exchange(true)) {
             LLAMA_LOG_INFO("qwen4exp: [TAG_FN_L6_PRESYNC] hc mixer and router weights load before the PDL wait\n");
@@ -1618,6 +1626,16 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     }
     cb(z, "z", il);
 
+    // [TAG_FN_L18_GPUFLOOR_QKVZ] the two products of the layer input as two nodes in a row: CUDA computes them in one
+    // launch (the same sums per row); only the node order changes
+    ggml_tensor * qkv_mm = qkv_mixed->op == GGML_OP_RESHAPE ? qkv_mixed->src[0] : qkv_mixed;
+    if (l18_qkvz && n_seq_tokens*n_seqs <= 4 && l3.mmvd && qkv_mm->op == GGML_OP_MUL_MAT && z->op == GGML_OP_MUL_MAT &&
+            qkv_mm->src[1] == z->src[1]) {
+        ggml_fn_l4_qsa_add(qkv_mm, GGML_FN_L18_QKVZ);
+        ggml_build_forward_expand(gf, qkv_mm);
+        ggml_build_forward_expand(gf, z);
+    }
+
     return { qkv_mixed, z };
 }
 
@@ -1626,11 +1644,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // [TAG_FN_L18_GPUFLOOR_GDNOUT] the gate's producers first, so the four nodes below come in a row (only the order changes)
+    const bool gdnout = l18_gdnout && n_tokens <= 4;
+    if (gdnout) {
+        ggml_build_forward_expand(gf, gate);
+    }
+
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
-    return ggml_mul(ctx0, normalized, gated);
+    ggml_tensor * out = ggml_mul(ctx0, normalized, gated);
+    if (gdnout && normalized->op == GGML_OP_MUL && normalized->src[0]->op == GGML_OP_RMS_NORM) {
+        ggml_fn_l3_set(normalized->src[0], GGML_FN_L18_GDNOUT); // CUDA: norm, gate and the q8_1 copy in one launch
+    }
+    return out;
 }
 
 // QSA k-pool inputs, shared by the QSA layers: blocks of compress_ratio cells in sequence order, see llama_memory_hybrid_idx

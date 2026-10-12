@@ -25,6 +25,7 @@ bool ggml_cuda_fn_l4_mmvq_generic(int cc);
 // the tensors of one matched mixer; s1 == nullptr: no combine before it (the norm reads rms->src[0])
 struct ggml_cuda_fn_l4_hc_chain {
     const ggml_tensor * add    = nullptr; // ADD whose output is the combine's block_out (not written: K1 adds), or nullptr
+    const ggml_tensor * add0   = nullptr; // [TAG_FN_L18_GPUFLOOR_HCADD] ADD whose output is one operand of add (not written), or nullptr
     const ggml_tensor * s1     = nullptr; // SCALE 1/hc of the raw inject
     const ggml_tensor * s2     = nullptr; // SCALE 2 after the sigmoid
     ggml_tensor *       post   = nullptr; // DSV4_HC_POST (written)
@@ -44,6 +45,12 @@ struct ggml_cuda_fn_l4_hc_chain {
 // launches the three kernels; plain_mm computes a MUL_MAT node as the backend would (the inject when not fused)
 void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_l4_hc_chain & c, ggml_cgraph * cgraph,
         int i_first, int i_last, void (*plain_mm)(ggml_backend_cuda_context & ctx, ggml_tensor * dst));
+
+// [TAG_FN_L18_GPUFLOOR_GDNOUT] RMS_NORM (rms->src[0]: rows of ncols <= 256 values, a multiple of 32, rows and channels
+// in dims 1 and 2) * w -> sigmoid(z) * it into dst (contiguous, z the same shape); yq: also the q8_1 copy (bpr blocks per
+// channel), nullptr: none
+void ggml_cuda_fn_l18_gdnout_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * w,
+        const ggml_tensor * z, ggml_tensor * dst, block_q8_1 * yq, int64_t bpr);
 
 // [TAG_FN_L6_L2PF] lever round 6: prefetch byte ranges of device memory into L2 (one launch; no value changes).
 // Ranges: 16-byte aligned starts; each is cut to a multiple of 16 bytes.

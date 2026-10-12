@@ -10,6 +10,13 @@ bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op);
 
 void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_moe_host_wait(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// [TAG_FN_L18_GPUFLOOR_PFWAIT] GGML_CUDA_FN_L18_PFWAIT=1 (ggml-cuda.cu): the L2 prefetch of a marked bridge wait
+// (TAG_FN_L6_L2PF) is done by the wait launch itself, with real loads from extra blocks while it waits. ggml-cuda.cu hands
+// the ranges for the wait node right before it computes it (16-byte aligned starts); the wait launch takes them.
+#define GGML_CUDA_FN_L18_PF_MAX 64
+bool ggml_cuda_fn_l18_pfwait_enabled();
+void ggml_cuda_fn_l18_pf_set(int device, const ggml_tensor * wait, const char * const * p, const size_t * n, int nr);
 void ggml_cuda_op_moe_host_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst); // [TAG_FN_R4_BRIDGE_DMA]
 
 // [TAG_FN_L4_POST] the fused topk-moe nodes (ggml_cuda_op_topk_moe's arguments) and the MOE_HOST_POST `post` that reads

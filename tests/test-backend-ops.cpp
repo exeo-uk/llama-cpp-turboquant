@@ -12694,10 +12694,11 @@ struct test_fn_l4_hc : public test_case {
     const bool    marked;
     const bool    add;
     const bool    l6; // [TAG_FN_L6_PRESYNC] the round-6 bit on the marked mixer
+    const bool    add2; // [TAG_FN_L18_GPUFLOOR_HCADD] the block output is (hot + host) + shexp: two ADDs
     ggml_tensor * first[2] = { nullptr, nullptr };
 
     std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
-    std::string vars() override { return "l4hc," + VARS_TO_STR7(n_tokens, post, inject, q8, marked, add, l6); }
+    std::string vars() override { return "l4hc," + VARS_TO_STR8(n_tokens, post, inject, q8, marked, add, l6, add2); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
@@ -12710,8 +12711,8 @@ struct test_fn_l4_hc : public test_case {
     }
 
     test_fn_l4_hc(int64_t n_tokens = 3, bool post = true, bool inject = true, bool q8 = false, bool marked = true,
-            bool add = false, bool l6 = false)
-        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add), l6(l6) {}
+            bool add = false, bool l6 = false, bool add2 = false)
+        : n_tokens(n_tokens), post(post), inject(inject), q8(q8), marked(marked), add(add), l6(l6), add2(add2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_embd = 2560;
@@ -12737,6 +12738,11 @@ struct test_fn_l4_hc : public test_case {
             if (add) {
                 ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
                 ggml_set_name(shexp, "shexp");
+                if (add2) {
+                    ggml_tensor * host = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+                    ggml_set_name(host, "host");
+                    block_out = ggml_add(ctx, block_out, host);
+                }
                 block_out = ggml_add(ctx, block_out, shexp);
             }
             ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
@@ -12860,6 +12866,56 @@ struct test_fn_l3_gdnab : public test_case {
                 init_tensor_uniform(t, -1.0f, 1.0f);
             }
         }
+    }
+};
+
+// [TAG_FN_L18_GPUFLOOR_GDNOUT] the gated output norm of a GDN layer and its out projection: rms_norm(x) * gamma ->
+// sigmoid(z) * it -> q8_0 [6144 -> 2560] (one launch with the q8_1 copy when marked). The output also holds the gated
+// values themselves. strided: x is every other row of a wider tensor (the GDN output view).
+struct test_fn_l18_gdnout : public test_case {
+    const int64_t n_tokens;
+    const bool    marked;
+    const bool    strided;
+
+    std::string op_desc(ggml_tensor *) override { return "FN_L3_GPU"; }
+    std::string vars() override { return "gdnout," + VARS_TO_STR3(n_tokens, marked, strided); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_fn_l18_gdnout(int64_t n_tokens = 3, bool marked = true, bool strided = false)
+        : n_tokens(n_tokens), marked(marked), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 128;
+        const int64_t H = 48;
+        ggml_tensor * x;
+        if (strided) {
+            ggml_tensor * xw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*D, H, n_tokens);
+            ggml_set_name(xw, "xw");
+            x = ggml_view_3d(ctx, xw, D, H, n_tokens, xw->nb[1], xw->nb[2], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, n_tokens);
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(g, "gamma");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, n_tokens);
+        ggml_set_name(z, "z");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, D*H, 2560);
+        ggml_set_name(wo, "w_out");
+
+        ggml_tensor * r = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_tensor * n = ggml_mul(ctx, r, g);
+        ggml_tensor * m = ggml_mul(ctx, n, ggml_sigmoid(ctx, z));
+        if (marked) {
+            ggml_fn_l3_set(r, GGML_FN_L18_GDNOUT);
+        }
+        ggml_tensor * m2 = ggml_reshape_2d(ctx, m, D*H, n_tokens);
+        ggml_tensor * o  = ggml_mul_mat(ctx, wo, m2);
+        ggml_fn_l3_set(o, GGML_FN_L3_MMV);
+        ggml_tensor * out = ggml_concat(ctx, o, m2, 0);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -16389,6 +16445,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_fn_l3_zskip(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, t, false, m)); // [TAG_FN_L3_GPU_ZSKIP]
             test_cases.emplace_back(new test_fn_l3_gdnab(t, m)); // [TAG_FN_L3_GPU_GDNAB]
+            test_cases.emplace_back(new test_fn_l18_gdnout(t, m)); // [TAG_FN_L18_GPUFLOOR_GDNOUT]
             test_cases.emplace_back(new test_fn_l3_hcmix(t, m)); // [TAG_FN_L3_GPU]
             test_cases.emplace_back(new test_fn_l4_hc(t, true, true, true, m)); // [TAG_FN_L4_HC]
             for (int64_t np : { 8192, 32768, 61440 }) {
@@ -18639,6 +18696,9 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
         }
         // [TAG_FN_L3_GPU_GDNAB] the GDN gate inputs in one launch
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_gdnab(t, m)); }, false });
+        // [TAG_FN_L18_GPUFLOOR_GDNOUT]
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l18_gdnout(t, m, false)); }, false });
+        cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l18_gdnout(t, m, true)); }, false });
         // [TAG_FN_L3_GPU] a whole hc mixer with every mark
         cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l3_hcmix(t, m)); }, false });
     }
@@ -18710,6 +18770,10 @@ static bool run_fn_l3_gpu(ggml_backend_t backend, ggml_backend_t backend_ref, co
                 continue;
             }
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va)); }, false });
+            if (va) {
+                // [TAG_FN_L18_GPUFLOOR_HCADD] two ADDs before the combine
+                cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va, false, true)); }, false });
+            }
             // [TAG_FN_L6_PRESYNC]
             cases.push_back({ [=](bool m) { return std::unique_ptr<test_case>(new test_fn_l4_hc(t, vp, vi, vq, m, va, true)); }, false });
         }

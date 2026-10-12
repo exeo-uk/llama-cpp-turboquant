@@ -26,6 +26,7 @@ enum ggml_fn_l4_qsa_bit {
     GGML_FN_L4_QSA_POOL    = 0x0008, // the layer's k-pool update (raw key rows, new pooled keys) in one launch (on its FILL)
     GGML_FN_L4_QSA_LIST    = 0x0010, // on the QSA_MASK: the mask at the selected cells only, plus the sparse FA's index lists
     GGML_FN_L4_QSA_QKV     = 0x0020, // on the q projection (MUL_MAT): it and the k and v projections after it in one launch
+    GGML_FN_L18_QKVZ       = 0x0040, // [TAG_FN_L18_GPUFLOOR_QKVZ] on a GDN qkv projection (MUL_MAT): it and the z projection right after it in one launch
     GGML_FN_L4_QSA_IDXDEP  = 0x0100, // backend: the IDXQ8 gather's indices stay allocated until the indexer ran
     GGML_FN_L4_QSA_SELDEP  = 0x0200, // backend: the SEL nodes' inputs and outputs stay allocated until the last one ran
     GGML_FN_L4_QSA_LISTOK  = 0x0400, // backend: the QSA_MASK writes the lists of its FA (layout in op_params 10..12)

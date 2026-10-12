@@ -27,6 +27,19 @@ static bool fn_l6_k3pre() {
     return on;
 }
 
+// [TAG_FN_L18_GPUFLOOR_HCINJ] GGML_CUDA_FN_L18_HCINJ=1: the fused inject of the down launch takes 10 K iterations per pass
+static bool fn_l18_hcinj() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_HCINJ");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L18_GPUFLOOR_HCINJ] hc down: the inject's loads 10 iterations per pass\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 bool ggml_cuda_fn_l4_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FN_L4");
@@ -86,6 +99,7 @@ static __device__ __forceinline__ void fn_l6_copy16(int4 * dst, const int4 * src
 struct fn_l4_norm_args {
     const float * bo;  int64_t sb0, sb1;         // block_out [n_embd, T]
     const float * bo2; int64_t sb20, sb21;       // with an ADD before the combine: block_out = bo + bo2 (op_add)
+    const float * bo1; int64_t sb10, sb11;       // [TAG_FN_L18_GPUFLOOR_HCADD] the ADD before it too: block_out = (bo + bo1) + bo2
     const float * res; int64_t sr0, sr1, sr2;    // residual [n_embd, hc, T]
     const float * inj; int     inj_hc;            // raw inject [hc, T], contiguous
     float         s1, b1, s2, b2;                 // the two SCALE ops
@@ -123,6 +137,9 @@ static __global__ void k_fn_l4_hc_norm(const fn_l4_norm_args a) {
             const int col = tid + k*block_size;
             if (col < ncols) {
                 float xb = a.bo[col*a.sb0 + channel*a.sb1];
+                if (a.bo1) {
+                    xb = xb + a.bo1[col*a.sb10 + channel*a.sb11]; // [TAG_FN_L18_GPUFLOOR_HCADD]
+                }
                 if (a.bo2) {
                     xb = xb + a.bo2[col*a.sb20 + channel*a.sb21];
                 }
@@ -191,7 +208,9 @@ struct fn_l4_down_args {
 
 #define FN_L4_DOWN_AHEAD 10
 
-template <int ncols_dst>
+// [TAG_FN_L18_GPUFLOOR_HCINJ] inj_ahead: the inject's K iterations per pass (4 before round 18): a thread's sums keep their
+// order, so the same bits; 10 issues the loads of half the row at once (2 passes of 10 instead of 5 of 4 at hc 4 x 2560)
+template <int ncols_dst, int inj_ahead = 4>
 __launch_bounds__(4*WARP_SIZE, 1)
 static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
     ggml_cuda_pdl_lc();
@@ -240,7 +259,7 @@ static __global__ void k_fn_l4_hc_down(const fn_l4_down_args a) {
 
         float sumf[ncols_dst] = {0.0f};
 
-        constexpr int ahead = 4;
+        constexpr int ahead = inj_ahead;
         int col2 = c0;
         int kk   = 0; // (col2 - c0)/bs
         for (; col2 + (ahead - 1)*bs < ncols2; col2 += ahead*bs, kk += ahead) {
@@ -509,6 +528,247 @@ static __global__ void k_fn_l4_hc_up(const fn_l4_up_args a) {
     }
 }
 
+// [TAG_FN_L18_GPUFLOOR_HCUP] K3 with its loads issued early: the block's rows of wu (rows of at most 64 q8_0 blocks, so
+// the terms of the original block's warps 0 and 1) before the PDL wait, and the norm values of the epilogue right after
+// it, next to the low rank's. The sums, the reductions and the epilogue are k_fn_l4_hc_up's, in the same order: the same
+// bits. No PRESYNC copy (the rows are in registers).
+template <int ncols_dst, int rows_per_warp>
+__launch_bounds__(WARP_SIZE*(WARP_SIZE*FN_L4_HC/rows_per_warp), 1)
+static __global__ void k_fn_l18_hc_up(const fn_l4_up_args a) {
+    constexpr int nw   = WARP_SIZE*FN_L4_HC/rows_per_warp;
+    constexpr int qk   = QK8_0;
+    constexpr int qi   = QI8_0;
+    constexpr int vdr  = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int nwarps_mmvq = 4;
+    constexpr int nwu  = 2; // warps of the original block with terms (the launcher checks the row length)
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+
+    __shared__ block_q8_1 s_y[ncols_dst][WARP_SIZE];
+    __shared__ float      s_gate[WARP_SIZE*FN_L4_HC][ncols_dst];
+
+    ggml_cuda_pdl_lc();
+
+    const int  blocks_per_row_x = a.lr / qk;
+    const bool main_blk = (int) blockIdx.x < a.n_main;
+    const int  i0b = blockIdx.x*WARP_SIZE;
+
+    // the q8_0 values and scales of this lane's terms, before the wait (the weights do not change)
+    int  pv[rows_per_warp][nwu][vdr];
+    half pd[rows_per_warp][nwu];
+#pragma unroll
+    for (int rr = 0; rr < rows_per_warp; ++rr) {
+#pragma unroll
+        for (int w = 0; w < nwu; ++w) {
+#pragma unroll
+            for (int l = 0; l < vdr; ++l) {
+                pv[rr][w][l] = 0;
+            }
+            pd[rr][w] = __float2half(0.0f);
+        }
+    }
+    if (main_blk) {
+#pragma unroll
+        for (int rr = 0; rr < rows_per_warp; ++rr) {
+            const int rl  = warp*rows_per_warp + rr;
+            const int row = (rl / WARP_SIZE)*a.n_embd + i0b + rl % WARP_SIZE;
+#pragma unroll
+            for (int w = 0; w < nwu; ++w) {
+                const int tid = WARP_SIZE*w + lane;
+                const int kbx = tid / (qi/vdr);
+                const int kqs = vdr * (tid % (qi/vdr));
+                if (kbx < blocks_per_row_x) {
+                    const block_q8_0 * bq = (const block_q8_0 *) a.wu + row*a.stride_row_x + kbx;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        pv[rr][w][l] = get_int_b2(bq->qs, kqs + l);
+                    }
+                    pd[rr][w] = bq->d;
+                }
+            }
+        }
+    }
+
+    ggml_cuda_pdl_sync();
+
+    if (!main_blk) {
+        // the inject: buf_iw of mul_mat_vec_f holds the warp sums, zeros after them; warp 0 reduces it
+        if (warp == 0) {
+            for (int r = 0; r < a.inj_rows; ++r) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    float v = lane < a.nvw ? a.part[(int64_t(r)*a.nvw + lane)*ncols_dst + j] : 0.0f;
+                    v = warp_reduce_sum<WARP_SIZE>(v);
+                    if (lane == 0) {
+                        a.inj[j*a.inj_s1 + r] = v;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // the epilogue's norm values, loaded now (K1 wrote them before K2 ran)
+    float xv[FN_L4_HC] = {0.0f};
+    if (warp < ncols_dst) {
+#pragma unroll
+        for (int ih = 0; ih < FN_L4_HC; ++ih) {
+            xv[ih] = a.xn[i0b + lane + ih*a.n_embd + warp*(int64_t) a.hc*a.n_embd];
+        }
+    }
+
+    // the low rank as q8_1 (one block per warp and pass)
+    const int nb = a.lr / QK8_1;
+    for (int idx = warp; idx < ncols_dst*nb; idx += nw) {
+        const int j  = idx / nb;
+        const int kb = idx - j*nb;
+        const float t = a.s_lo * a.lo[j*a.lr + kb*QK8_1 + lane] + a.b_lo;
+        const float v = ggml_cuda_op_silu_single(t);
+        fn_l4_q8_1_store(v, &s_y[j][kb], lane);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int rr = 0; rr < rows_per_warp; ++rr) {
+        const int rl = warp*rows_per_warp + rr;
+
+        float tmp[ncols_dst];
+#pragma unroll
+        for (int w = 0; w < nwarps_mmvq; ++w) {
+            const int tid = WARP_SIZE*w + lane;
+            const int kbx = tid / (qi/vdr);
+            float part[ncols_dst];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                part[j] = a.zero;
+            }
+            if (w < nwu && kbx < blocks_per_row_x) {
+                const int kby = kbx * (qk/QK8_1);
+                const int kqs = vdr * (tid % (qi/vdr));
+                const int ww  = w < nwu ? w : 0;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const block_q8_1 * by = &s_y[j][kby];
+                    int u[vdr];
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        u[l] = get_int_b4(by->qs, kqs + l);
+                    }
+                    const float d8_0 = pd[rr][ww];
+                    const float d8_1 = __low2half(by->ds);
+                    part[j] += vec_dot_q8_0_q8_1_impl<float, vdr>(pv[rr][ww], u, d8_0, d8_1);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmp[j] = w == 0 ? part[j] : tmp[j] + part[j];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] = warp_reduce_sum<WARP_SIZE>(tmp[j]);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                s_gate[rl][j] = tmp[j];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (warp >= ncols_dst) {
+        return;
+    }
+    const int j  = warp;
+    const int i0 = i0b + lane;
+    float sum = 0.0f;
+#pragma unroll
+    for (int ih = 0; ih < FN_L4_HC; ++ih) {
+        float wv;
+        wv = 1.0f / (1.0f + expf(-s_gate[ih*WARP_SIZE + lane][j]));
+        sum += xv[ih] * wv;
+    }
+    const float v = a.scale * sum;
+    a.mixed[i0*a.sd0 + j*a.sd1] = v;
+    if (a.mq) {
+        fn_l4_q8_1_store(v, a.mq + (int64_t) j*a.mq_bpr + i0/QK8_1, lane);
+    }
+}
+
+// [TAG_FN_L18_GPUFLOOR_GDNOUT] the gated output norm of a GDN layer in one launch: block (row h, channel t) of
+// rms_norm_f32<256, true>'s launch (rows of at most 256 values, one per thread) computes the norm * gamma as that kernel
+// does, then unary_gated's sigmoid(z) * it, and the q8_1 copy of the result (warp w holds q8_1 block w of the row).
+// Each value by the same operations in the same order as the three unfused kernels: the same bits.
+static __device__ __forceinline__ float fn_l18_op_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static __global__ void k_fn_l18_gdnout(const float * x, const int64_t sx_row, const int64_t sx_ch, const float * w,
+        const float * z, float * dst, const int ncols, const float eps, block_q8_1 * yq, const int64_t bpr) {
+    constexpr int block_size = 256;
+    ggml_cuda_pdl_lc();
+    const int nrows   = gridDim.x;
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int tid     = threadIdx.x;
+
+    x += channel*sx_ch + row*sx_row;
+    const int64_t o = ((int64_t) channel*nrows + row)*ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    float xi = 0.0f;
+    if (tid < ncols) {
+        xi = x[tid];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    if (tid < ncols) {
+        const float n = scale * xi * w[tid];
+        const float v = fn_l18_op_sigmoid(z[o + tid]) * n;
+        dst[o + tid] = v;
+        if (yq) {
+            fn_l4_q8_1_store(v, yq + (int64_t) channel*bpr + (row*ncols + tid)/QK8_1, tid % WARP_SIZE);
+        }
+    }
+}
+
+void ggml_cuda_fn_l18_gdnout_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * w,
+        const ggml_tensor * z, ggml_tensor * dst, block_q8_1 * yq, int64_t bpr) {
+    const ggml_tensor * x = rms->src[0];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const int     ncols  = (int) x->ne[0];
+    const int64_t sx_row = x->nb[1]/sizeof(float);
+    const int64_t sx_ch  = x->nb[2]/sizeof(float);
+    const dim3 grid((unsigned) x->ne[1], (unsigned) x->ne[2], 1);
+    const ggml_cuda_kernel_launch_params lp(grid, dim3(256, 1, 1), 32*sizeof(float), ctx.stream());
+    ggml_cuda_kernel_launch(k_fn_l18_gdnout, lp, (const float *) x->data, sx_row, sx_ch, (const float *) w->data,
+            (const float *) z->data, (float *) dst->data, ncols, eps, yq, bpr);
+}
+
+// [TAG_FN_L18_GPUFLOOR_HCUP] GGML_CUDA_FN_L18_HCUP=1: K3 with its weight and norm loads issued early (k_fn_l18_hc_up)
+static bool fn_l18_hcup() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L18_HCUP");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_INFO("ggml_cuda: [TAG_FN_L18_GPUFLOOR_HCUP] hc up: the weight rows before the PDL wait, the norm values next to the low rank\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 
 static float fn_l4_op_f32(const ggml_tensor * t, int slot) {
@@ -565,13 +825,20 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
         a.ncols = (int) n_embd;
         const bool has_post = c.s1 != nullptr;
         if (has_post) {
-            const ggml_tensor * bo  = c.add ? c.add->src[0] : c.post->src[0];
+            // [TAG_FN_L18_GPUFLOOR_HCADD] with add0 (one operand of add): bo + bo1 = add0's operands, bo2 = add's other one
+            const ggml_tensor * bo  = c.add0 ? c.add0->src[0] : c.add ? c.add->src[0] : c.post->src[0];
             const ggml_tensor * res = c.post->src[1];
             a.bo  = (const float *) bo->data;
             a.sb0 = bo->nb[0]/sizeof(float);
             a.sb1 = bo->nb[1]/sizeof(float);
+            if (c.add0) {
+                const ggml_tensor * bo1 = c.add0->src[1];
+                a.bo1  = (const float *) bo1->data;
+                a.sb10 = bo1->nb[0]/sizeof(float);
+                a.sb11 = bo1->nb[1]/sizeof(float);
+            }
             if (c.add) {
-                const ggml_tensor * bo2 = c.add->src[1];
+                const ggml_tensor * bo2 = c.add0 ? (c.add->src[0] == c.add0 ? c.add->src[1] : c.add->src[0]) : c.add->src[1];
                 a.bo2  = (const float *) bo2->data;
                 a.sb20 = bo2->nb[0]/sizeof(float);
                 a.sb21 = bo2->nb[1]/sizeof(float);
@@ -660,12 +927,23 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
             }
         }
         const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (n_inj_blocks + lr), 1, 1), dim3(WARP_SIZE, 4, 1), smem, stream);
-        switch (T) {
-            case 1: ggml_cuda_kernel_launch(k_fn_l4_hc_down<1>, lp, a); break;
-            case 2: ggml_cuda_kernel_launch(k_fn_l4_hc_down<2>, lp, a); break;
-            case 3: ggml_cuda_kernel_launch(k_fn_l4_hc_down<3>, lp, a); break;
-            case 4: ggml_cuda_kernel_launch(k_fn_l4_hc_down<4>, lp, a); break;
-            default: GGML_ABORT("fatal error");
+        if (inj_fused && fn_l18_hcinj()) {
+            // [TAG_FN_L18_GPUFLOOR_HCINJ]
+            switch (T) {
+                case 1: ggml_cuda_kernel_launch(k_fn_l4_hc_down<1, 10>, lp, a); break;
+                case 2: ggml_cuda_kernel_launch(k_fn_l4_hc_down<2, 10>, lp, a); break;
+                case 3: ggml_cuda_kernel_launch(k_fn_l4_hc_down<3, 10>, lp, a); break;
+                case 4: ggml_cuda_kernel_launch(k_fn_l4_hc_down<4, 10>, lp, a); break;
+                default: GGML_ABORT("fatal error");
+            }
+        } else {
+            switch (T) {
+                case 1: ggml_cuda_kernel_launch(k_fn_l4_hc_down<1>, lp, a); break;
+                case 2: ggml_cuda_kernel_launch(k_fn_l4_hc_down<2>, lp, a); break;
+                case 3: ggml_cuda_kernel_launch(k_fn_l4_hc_down<3>, lp, a); break;
+                case 4: ggml_cuda_kernel_launch(k_fn_l4_hc_down<4>, lp, a); break;
+                default: GGML_ABORT("fatal error");
+            }
         }
     }
 
@@ -742,12 +1020,23 @@ void ggml_cuda_fn_l4_hc_run(ggml_backend_cuda_context & ctx, const ggml_cuda_fn_
         const auto up_smem = [&](auto kern) {
             ggml_cuda_kernel_launch(kern, lp, a);
         };
-        switch (T) {
-            case 1: up_smem(k_fn_l4_hc_up<1, rpw>); break;
-            case 2: up_smem(k_fn_l4_hc_up<2, rpw>); break;
-            case 3: up_smem(k_fn_l4_hc_up<3, rpw>); break;
-            case 4: up_smem(k_fn_l4_hc_up<4, rpw>); break;
-            default: GGML_ABORT("fatal error");
+        // [TAG_FN_L18_GPUFLOOR_HCUP] rows of at most 64 q8_0 blocks (2 warps of terms), hc 4, no PRESYNC copy
+        if (fn_l18_hcup() && smem == 0 && a.hc == FN_L4_HC && lr/QK8_0 <= 2*WARP_SIZE*VDR_Q8_0_Q8_1_MMVQ/QI8_0) {
+            switch (T) {
+                case 1: ggml_cuda_kernel_launch(k_fn_l18_hc_up<1, rpw>, lp, a); break;
+                case 2: ggml_cuda_kernel_launch(k_fn_l18_hc_up<2, rpw>, lp, a); break;
+                case 3: ggml_cuda_kernel_launch(k_fn_l18_hc_up<3, rpw>, lp, a); break;
+                case 4: ggml_cuda_kernel_launch(k_fn_l18_hc_up<4, rpw>, lp, a); break;
+                default: GGML_ABORT("fatal error");
+            }
+        } else {
+            switch (T) {
+                case 1: up_smem(k_fn_l4_hc_up<1, rpw>); break;
+                case 2: up_smem(k_fn_l4_hc_up<2, rpw>); break;
+                case 3: up_smem(k_fn_l4_hc_up<3, rpw>); break;
+                case 4: up_smem(k_fn_l4_hc_up<4, rpw>); break;
+                default: GGML_ABORT("fatal error");
+            }
         }
     }
     fn_l4_trace_step("K3");
