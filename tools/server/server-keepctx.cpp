@@ -516,6 +516,45 @@ bool server_keepctx::selftest(std::string & err) {
         err = "data differs";
         return false;
     }
+
+    // [TAG_FN_L19_CONVSTORE_SPILL] a checkpoint through the writer thread and back, then written at once and back
+    for (int async = 1; async >= 0; --async) {
+        common_prompt_checkpoint c;
+        c.n_tokens = 1234;
+        c.pos_min  = 1233;
+        c.pos_max  = 1233;
+        c.data_tgt .resize(KC_BLOCK + 12345);
+        c.data_dft .resize(4097);
+        c.data_spec.resize(17);
+        for (size_t i = 0; i < c.data_tgt.size(); ++i) {
+            c.data_tgt[i] = (uint8_t) ((i * 2654435761u) >> 11);
+        }
+        for (size_t i = 0; i < c.data_dft.size(); ++i) {
+            c.data_dft[i] = (uint8_t) (i * 7 + async);
+        }
+        for (size_t i = 0; i < c.data_spec.size(); ++i) {
+            c.data_spec[i] = (uint8_t) (255 - i);
+        }
+        const auto rt = c.data_tgt;
+        const auto rd = c.data_dft;
+        const auto rs = c.data_spec;
+        server_keepctx_spill sp;
+        std::string info;
+        if (!spill_write(sp, c, 42, async != 0, info) || sp.list.size() != 1) {
+            err = "spill write: " + info;
+            return false;
+        }
+        common_prompt_checkpoint r;
+        if (!spill_read(sp.list[0], r, info)) {
+            err = "spill read: " + info;
+            return false;
+        }
+        if (r.data_tgt != rt || r.data_dft != rd || r.data_spec != rs || r.n_tokens != 1234 || r.pos_max != 1233 ||
+            (!async && c.data_tgt != rt)) {
+            err = async ? "spilled checkpoint differs (writer thread)" : "spilled checkpoint differs (at once)";
+            return false;
+        }
+    }
     return true;
 }
 
