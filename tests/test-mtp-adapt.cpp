@@ -146,11 +146,11 @@ static void test_pieces() {
         common_mtp_adapt c;
         c.init_env();
         c.w_acc = 1.0f; // the last observation
-        c.observe(3, 2, 1);
+        c.observe(3, 2, 2, 1);
         TCHECK(c.pass[0] == 1.0f && c.pass[1] == 1.0f && c.pass[2] == 0.0f, "pass %.2f %.2f %.2f", c.pass[0], c.pass[1], c.pass[2]);
         TCHECK(c.acc[0] == 1.0f && c.acc[1] == 0.0f, "acc %.2f %.2f", c.acc[0], c.acc[1]);
         TCHECK(c.acc[2] == c.acc0, "acc 3 untouched %.2f", c.acc[2]); // never verified
-        c.observe(1, 0, 0); // first draft failed p_min
+        c.observe(1, 0, 0, 0); // first draft failed p_min
         TCHECK(c.pass[0] == 0.0f && c.acc[0] == 1.0f, "empty round");
     }
 }
@@ -199,7 +199,7 @@ static double run(const scenario & sc, int fixed_k, uint32_t seed, common_mtp_ad
         t += tv;
         if (pol) {
             pol->add_verify(W, tv);
-            pol->observe(dec, prop, acc);
+            pol->observe(dec, prop, prop, acc);
         }
         tok += 1.0 + acc;
         us  += t;
@@ -258,15 +258,23 @@ struct scenario_p {
     float tv1, row2, row3, row4, td0, td1;
 };
 
-static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mtp_adapt * pol) {
+// one round the way the driver runs it (common/speculative.cpp keep_token, [TAG_FN_L20_DRAFTFIX]): p_min (or the floor)
+// stops a draft, a draft that passes counts in npass, the cut (and below p_min the floor's cost rule) may drop it
+// cold > 0: the first `cold` rounds cost 2.5x (the first answer after a start: cold experts) and the 11th one 55 ms (the
+// round-19 trace); the rate is taken over the rounds after them
+static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mtp_adapt * pol, int cold = 0,
+                    double * frac_draft = nullptr) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> U(0.0, 1.0);
     std::normal_distribution<double>       N(0.0, 1.0);
     const float rows[common_mtp_adapt::W_MAX + 1] = { 0.0f, 0.0f, sc.row2, sc.row3, sc.row4, sc.row4 }; // W <= kmax + 1
+    const float pmin = 0.5f;
     double tok = 0.0, us = 0.0;
-    for (int r = 0; r < 6000; ++r) {
+    int64_t n_r = 0, n_d = 0;
+    for (int r = 0; r < 6000 + cold; ++r) {
         const int K = pol ? pol->choose() : fixed_k;
-        int    dec = 0, prop = 0;
+        const bool fl = pol && pol->cut > 0 && pol->floor_p >= 0.0f && pol->floor_p < pmin;
+        int    dec = 0, npass = 0, prop = 0;
         double t = 0.0, P = 1.0;
         float  ps[4] = {};
         for (int i = 1; i <= K; ++i) {
@@ -277,20 +285,22 @@ static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mt
                 pol->add_decode(i == 1, td);
             }
             const float p = (float) (sc.lo + (sc.hi - sc.lo)*U(rng));
-            if (p < 0.5f) {
+            if (p < (fl ? pol->floor_p : pmin)) {
                 break;
             }
-            if (pol && !pol->keep(i - 1, P, p)) {
-                break;
-            }
-            if (pol) {
+            npass++;
+            const bool below = p < pmin;
+            if (pol && (pol->cut > 0 || below)) {
+                if (!pol->keep(i - 1, P, p, below)) {
+                    break;
+                }
                 P *= pol->acc_p(i - 1, p);
             }
             ps[prop++] = p;
         }
         int acc = 0;
         while (acc < prop) {
-            const double a = sc.a_lo + (0.97 - sc.a_lo)*(ps[acc] - 0.5)/0.5;
+            const double a = std::max(0.02, sc.a_lo + (0.97 - sc.a_lo)*(ps[acc] - 0.5)/0.5);
             if (U(rng) >= a) {
                 break;
             }
@@ -302,16 +312,26 @@ static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mt
             tv += rows[w];
         }
         tv *= 1.0 + 0.08*N(rng);
+        if (r < cold) {
+            tv *= r == 10 ? 55000.0/sc.tv1 : 2.5;
+        }
         t += tv;
         if (pol) {
             pol->add_verify(W, tv);
-            pol->observe(dec, prop, acc);
+            pol->observe(dec, npass, prop, acc);
             for (int k = 0; k < std::min(prop, acc + 1); ++k) {
                 pol->observe_p(k, ps[k], k < acc);
             }
         }
-        tok += 1.0 + acc;
-        us  += t;
+        if (r >= cold) {
+            tok += 1.0 + acc;
+            us  += t;
+            n_r++;
+            n_d += prop > 0 ? 1 : 0;
+        }
+    }
+    if (frac_draft) {
+        *frac_draft = n_r > 0 ? (double) n_d/(double) n_r : 0.0;
     }
     return tok/us*1000.0;
 }
@@ -347,24 +367,124 @@ static void test_cut() {
         { "flat costs",             0.30f, 1.0f, 0.60f, 12000, 1500, 1500, 1500, 720, 720 },
     };
     for (const auto & sc : scs) {
-        double fix2 = 0.0, ad = 0.0, adc = 0.0;
-        const int n_seed = 4;
-        for (int s = 0; s < n_seed; ++s) {
-            fix2 += run_p(sc, 2, 300 + s, nullptr);
-            common_mtp_adapt a;
-            a.init_env();
-            ad += run_p(sc, 0, 300 + s, &a);
-            common_mtp_adapt b;
-            b.init_env();
-            b.cut = 1;
-            adc += run_p(sc, 0, 300 + s, &b);
+        // [TAG_FN_L20_DRAFTFIX] every arm also after a cold start (the first 40 rounds 2.5x, one 55 ms step): round 19's
+        // policy locked in there (the cut dropped every first draft for the rest of the session)
+        for (int cold : { 0, 40 }) {
+            double fix2 = 0.0, ad = 0.0, adc = 0.0, adcf = 0.0, fd = 0.0, fdc = 0.0;
+            const int n_seed = 4;
+            for (int s = 0; s < n_seed; ++s) {
+                fix2 += run_p(sc, 2, 300 + s, nullptr, cold);
+                common_mtp_adapt a;
+                a.init_env();
+                ad += run_p(sc, 0, 300 + s, &a, cold);
+                common_mtp_adapt b;
+                b.init_env();
+                b.cut = 1;
+                double f = 0.0;
+                adc += run_p(sc, 0, 300 + s, &b, cold, &f);
+                fdc += f;
+                common_mtp_adapt c;
+                c.init_env();
+                c.cut     = 1;
+                c.floor_p = 0.2f;
+                adcf += run_p(sc, 0, 300 + s, &c, cold, &f);
+                fd += f;
+            }
+            fix2 /= n_seed; ad /= n_seed; adc /= n_seed; adcf /= n_seed; fd /= n_seed; fdc /= n_seed;
+            printf("  %-22s cold %2d: fixed K=2 %.4f, adaptive %.4f (%+.1f %%), + cut %.4f (%+.1f %%, rounds with a draft "
+                   "%.0f %%), + floor 0.2 %.4f (%+.1f %%, %.0f %%)\n", sc.name, cold, fix2, ad, 100.0*(ad/fix2 - 1.0), adc,
+                   100.0*(adc/fix2 - 1.0), 100.0*fdc, adcf, 100.0*(adcf/fix2 - 1.0), 100.0*fd);
+            TCHECK(adc >= 0.99*ad, "%s cold %d: the cut lost %.4f vs %.4f", sc.name, cold, adc, ad);
+            // probes (1/16 rounds at K + 1) and estimate noise cost up to ~1.5 % where K = 2 beats K = 3 by only ~2 %
+            TCHECK(ad >= 0.985*fix2, "%s cold %d: adaptive lost %.4f vs fixed 2 %.4f", sc.name, cold, ad, fix2);
+            TCHECK(adc >= 0.98*fix2, "%s cold %d: adaptive + cut lost %.4f vs fixed 2 %.4f", sc.name, cold, adc, fix2);
+            TCHECK(adcf >= 0.99*adc, "%s cold %d: the floor lost %.4f vs %.4f", sc.name, cold, adcf, adc);
+            TCHECK(fdc >= 0.5, "%s cold %d: the cut left drafts in only %.1f %% of the rounds", sc.name, cold, 100.0*fdc);
         }
-        fix2 /= n_seed; ad /= n_seed; adc /= n_seed;
-        printf("  %-22s fixed K=2 %.4f, adaptive %.4f (%+.1f %%), adaptive + cut %.4f (%+.1f %%)\n", sc.name, fix2, ad,
-               100.0*(ad/fix2 - 1.0), adc, 100.0*(adc/fix2 - 1.0));
-        TCHECK(adc >= 0.99*ad, "%s: the cut lost %.4f vs %.4f", sc.name, adc, ad);
-        // probes (1/16 rounds at K + 1) and EWMA noise cost up to ~1 % where K = 2 beats K = 3 by only ~2 %
-        TCHECK(ad >= 0.985*fix2, "%s: adaptive lost %.4f vs fixed 2 %.4f", sc.name, ad, fix2);
+    }
+}
+
+// [TAG_FN_L20_DRAFTFIX] the four round-19 defects, one check each
+static void test_draftfix() {
+    // 1. the width-2 samples of the round-19 trace (the first one from the cold first answer): the old EWMA priced width
+    //    2 at 44.1 ms after them; the median of the ring is ~16 ms
+    {
+        common_mtp_adapt a;
+        a.init_env();
+        const double w2[] = { 55380, 31162, 14883, 15782, 16357, 15222, 18677, 15017 };
+        for (double x : w2) {
+            a.add_verify(2, x);
+        }
+        TCHECK(a.tvn[1] == 8 && a.t_raw(2) > 15000.0 && a.t_raw(2) < 17000.0, "width 2 median %.0f", a.t_raw(2));
+        // the ring forgets: 40 cold samples, then 32 warm ones
+        common_mtp_adapt b;
+        b.init_env();
+        for (int k = 0; k < 40; ++k) {
+            b.add_verify(1, 30000.0);
+        }
+        for (int k = 0; k < 32; ++k) {
+            b.add_verify(1, 12000.0 + 10.0*k);
+        }
+        TCHECK(b.t_raw(1) < 12400.0, "the cold samples left the ring: %.0f", b.t_raw(1));
+        // the decode-time EWMA averages its first samples evenly
+        b.add_decode(true, 29572.0);
+        for (int k = 0; k < 19; ++k) {
+            b.add_decode(true, 640.0);
+        }
+        TCHECK(b.t_d0() < 0.1*29572.0, "first decode sample faded: %.0f", b.t_d0());
+    }
+    // 2. a probe round runs without the cut
+    {
+        common_mtp_adapt c;
+        c.init_env();
+        c.cut = 1;
+        for (int k = 0; k < 20; ++k) {
+            c.add_verify(1, 12000.0);
+            c.add_verify(2, 24000.0); // priced high: the cut drops every first draft
+        }
+        int n_keep = 0, n_probe = 0;
+        for (int r = 1; r <= 64; ++r) {
+            c.choose();
+            n_probe += c.probing ? 1 : 0;
+            n_keep  += c.keep(0, 1.0, 0.6f) ? 1 : 0;
+        }
+        TCHECK(n_probe == 64/c.probe && n_keep == n_probe, "probes %d, kept %d", n_probe, n_keep);
+    }
+    // 3. a draft the cut dropped passed p_min: pass_1 rises, acc_1 untouched
+    {
+        common_mtp_adapt d;
+        d.init_env();
+        d.w_acc = 1.0f;
+        d.observe(1, 1, 0, 0);
+        TCHECK(d.pass[0] == 1.0f && d.acc[0] == d.acc0, "pass %.2f acc %.2f", d.pass[0], d.acc[0]);
+        d.observe(2, 2, 1, 1); // the second passed, the cut dropped it
+        TCHECK(d.pass[1] == 1.0f && d.acc[0] == 1.0f && d.acc[1] == d.acc0, "pass2 %.2f acc %.2f %.2f", d.pass[1], d.acc[0],
+               d.acc[1]);
+    }
+    // 4. prices never fall with the width; one more row never above a 1-row step
+    {
+        common_mtp_adapt e;
+        e.init_env();
+        for (int k = 0; k < 20; ++k) {
+            e.add_verify(1, 12040.0);
+            e.add_verify(2, 42750.0);
+            e.add_verify(4, 32220.0);
+        }
+        for (int w = 2; w <= common_mtp_adapt::W_MAX; ++w) {
+            TCHECK(e.t_verify(w) >= e.t_verify(w - 1) - 1e-9, "monotone at %d: %.0f < %.0f", w, e.t_verify(w), e.t_verify(w - 1));
+            TCHECK(e.t_verify(w) - e.t_verify(w - 1) <= e.t_verify(1) + 1e-9, "row bound at %d", w);
+        }
+        TCHECK(e.t_verify(2) <= 2*12040.0 + 1e-9, "width 2 bounded %.0f", e.t_verify(2));
+    }
+    // the floor: without a rate (no choose() yet) a draft below p_min is not proposed; on a probe round it is
+    {
+        common_mtp_adapt f;
+        f.init_env();
+        f.cut = 1;
+        f.floor_p = 0.2f;
+        TCHECK(!f.keep(0, 1.0, 0.3f, true) && f.keep(0, 1.0, 0.6f, false), "floor without a rate");
+        f.probing = true;
+        TCHECK(f.keep(0, 1.0, 0.3f, true), "floor on a probe round");
     }
 }
 
@@ -373,6 +493,7 @@ int main() {
     printf("pieces: %d checks, %d failed\n", g_checks, g_fail);
     test_sim();
     test_cut();
+    test_draftfix();
     printf("total: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

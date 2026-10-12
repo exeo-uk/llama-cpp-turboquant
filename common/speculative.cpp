@@ -3534,7 +3534,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_mtp_adapt ad;
     int32_t          ad_cap       = 0;     // this round's cap
     int32_t          ad_dec       = 0;     // its draft decodes
+    int32_t          ad_npass     = 0;     // [TAG_FN_L20_DRAFTFIX] its drafts that passed the p_min rule (or the floor)
     int32_t          ad_prop      = 0;     // its proposed drafts
+    int32_t          ad_mode      = 0;     // [TAG_FN_L20_DRAFTFIX_MEASURE] 1 = adaptive, 2 = measure only (n_max / p_min as off)
     bool             ad_open      = false; // a round waits for accept()
     int64_t          ad_t_end     = 0;     // end of the last draft() in us (0 = no step to time)
     int32_t          ad_rows      = 0;     // verify rows it planned
@@ -3713,11 +3715,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (int k = 1; k <= ad.kmax; ++k) {
             h += string_format("%s%lld", k > 1 ? " " : "", (long long) ad.hist[k]);
         }
-        LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] %s: pass/acc per position {%s}, verify ms per width {%s} (* = priced from "
+        LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] %s%s: pass/acc per position {%s}, verify ms per width {%s} (* = priced from "
                 "a neighbour), draft decode ms %.2f / %.2f, caps chosen {%s} (probes %lld), rounds %lld, dropped samples %lld, "
-                "cost cut %s (%lld tokens), rate %.4f tok/ms\n",
-                __func__, when, pa.c_str(), tv.c_str(), ad.t_d0()/1000.0, ad.t_d1()/1000.0, h.c_str(), (long long) ad.n_probe,
-                (long long) ad.n_round, (long long) ad.n_drop, ad.cut > 0 ? "on" : "off", (long long) ad.n_cut, ad.lam*1000.0);
+                "cost cut %s (%lld tokens), floor %.2f (%lld tokens below p_min), rate %.4f tok/ms\n",
+                __func__, ad_mode == 2 ? "[measure only] " : "", when, pa.c_str(), tv.c_str(), ad.t_d0()/1000.0,
+                ad.t_d1()/1000.0, h.c_str(), (long long) ad.n_probe, (long long) ad.n_round, (long long) ad.n_drop,
+                ad.cut > 0 ? "on" : "off", (long long) ad.n_cut, ad.floor_p, (long long) ad.n_ext, ad.lam*1000.0);
         if (ad_trace) {
             fflush(ad_trace);
         }
@@ -3846,8 +3849,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // [TAG_FN_L19_DRAFT_ADAPT] the cap replaces n_max as the bound on a round's drafts (common_speculative_mtp_adapt_kmax
         // also raised the target's rollback ring to it)
-        if (is_qwen4exp && n_seq == 1 && !is_mem_shared && !chain_heads &&
-                llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT", 0) != 0) {
+        const int32_t ad_sw = is_qwen4exp && n_seq == 1 && !is_mem_shared && !chain_heads ?
+                (int32_t) llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT", 0) : 0;
+        if (ad_sw == 2) {
+            // [TAG_FN_L20_DRAFTFIX_MEASURE] the fixed n_max / p_min rule with the adaptive length's trace and summaries:
+            // every round's cap is n_max, no cut, no probe, the target's ring and outputs as off; only clocks and the trace
+            const char * ec = getenv("SPEC_MTP_COST");
+            if (ec && ec[0] != '\0' && ec[0] != '0') {
+                LOG_WRN("%s: [TAG_FN_L20_DRAFTFIX_MEASURE] off: SPEC_MTP_COST=%s picks the draft length\n", __func__, ec);
+            } else {
+                ad.init_env();
+                ad.kmax  = std::min<int>(common_mtp_adapt::K_MAX, std::max<int>(1, this->params.n_max));
+                ad.cut   = 0;
+                ad.probe = 0;
+                ad.floor_p = -1.0f;
+                ad_on    = true;
+                ad_mode  = 2;
+                if (const char * tp = getenv("LLAMA_FN_L19_DRAFT_ADAPT_TRACE"); tp && tp[0]) {
+                    ad_trace = fopen(tp, "a");
+                }
+                LOG_INF("%s: [TAG_FN_L20_DRAFTFIX_MEASURE] draft length measured only: n_max %d, p_min %.2f as off\n",
+                        __func__, this->params.n_max, this->params.p_min);
+            }
+        } else if (ad_sw == 1) {
             const char * ec = getenv("SPEC_MTP_COST");
             const uint32_t n_rs = llama_n_rs_seq(ctx_tgt);
             if (ec && ec[0] != '\0' && ec[0] != '0') {
@@ -3868,16 +3892,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             ad.kmax, std::max(1, lim));
                     ad.kmax = std::max(1, lim);
                 }
+                // [TAG_FN_L20_DRAFTFIX_FLOOR] the floor from the qwen4exp profile as well; only with the cut, below p_min
+                {
+                    const char * ef = getenv("LLAMA_FN_L19_DRAFT_ADAPT_FLOOR");
+                    if (!(ef && ef[0])) {
+                        const int32_t fm = (int32_t) llama_fn_l4_int(llama_get_model(ctx_dft), "LLAMA_FN_L19_DRAFT_ADAPT_FLOOR_PCT", -1);
+                        ad.floor_p = fm >= 0 ? (float) fm/100.0f : -1.0f;
+                    }
+                    if (ad.cut <= 0 || !(ad.floor_p >= 0.0f) || !(ad.floor_p < this->params.p_min)) {
+                        ad.floor_p = -1.0f;
+                    }
+                }
                 ad_on              = true;
+                ad_mode            = 1;
                 this->params.n_max = ad.kmax;
                 this->n_max        = ad.kmax;
                 if (const char * tp = getenv("LLAMA_FN_L19_DRAFT_ADAPT_TRACE"); tp && tp[0]) {
                     ad_trace = fopen(tp, "a");
                 }
                 LOG_INF("%s: [TAG_FN_L19_DRAFT_ADAPT] adaptive draft length on: cap 1..%d per round from E[tokens] / E[us] "
-                        "(acceptance and p_min pass rate per position, EWMA %.2f; verify time per width, EWMA %.2f), probe "
-                        "every %d, the p_min %.2f rule inside the cap; rollback ring %u\n", __func__, ad.kmax, ad.w_acc,
-                        ad.w_t, ad.probe, this->params.p_min, n_rs);
+                        "(acceptance and p_min pass rate per position, EWMA %.2f; verify time per width, median of the last "
+                        "%d), probe every %d (K + 1, no cut), the p_min %.2f rule inside the cap, cost cut %s, floor %.2f; "
+                        "rollback ring %u [TAG_FN_L20_DRAFTFIX]\n", __func__, ad.kmax, ad.w_acc, common_mtp_adapt::N_RING,
+                        ad.probe, this->params.p_min, ad.cut > 0 ? "on" : "off", ad.floor_p, n_rs);
             }
         }
 
@@ -4454,7 +4491,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (ad_on) {
             const int64_t t0 = ggml_time_us();
             if (ad_open && ad_prop == 0) {
-                ad.observe(ad_dec, 0, 0);
+                ad.observe(ad_dec, ad_npass, 0, 0); // [TAG_FN_L20_DRAFTFIX] a first draft the cut dropped passed p_min
             }
             ad_open = false;
             double tv_us = -1.0; // the round's verify step, -1 when it is no sample
@@ -4475,7 +4512,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int w = 1; w <= common_mtp_adapt::W_MAX; ++w) {
                     fprintf(ad_trace, ",%.0f", ad.t_verify(w));
                 }
-                fprintf(ad_trace, "%s", "\n");
+                // [TAG_FN_L20_DRAFTFIX] drafts that passed p_min (or the floor), a probe round, the rate lambda (tok/ms)
+                fprintf(ad_trace, ",%d,%d,%.5f\n", ad_npass, ad.probing ? 1 : 0, ad.lam*1000.0);
                 fflush(ad_trace); // the harness may stop the server without an exit
             }
             ad_acc   = -1;
@@ -4484,10 +4522,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ad_t_end  = 0;
             ad_n_proc = 0;
             ad_dec    = 0;
+            ad_npass  = 0;
             ad_prop   = 0;
-            ad_cap    = dparams[0].drafting ? ad.choose() : 0;
-            if (ad_cap > 0 && dparams[0].n_max > 0) {
-                ad_cap = std::min(ad_cap, dparams[0].n_max); // the server's cap (context or n_predict end)
+            if (ad_mode == 2) {
+                // [TAG_FN_L20_DRAFTFIX_MEASURE] the cap of the off path (n_max; the server truncates to its own cap)
+                ad_cap      = dparams[0].drafting ? this->params.n_max : 0;
+                ad.probing  = false;
+                ad.n_round += ad_cap > 0 ? 1 : 0;
+            } else {
+                ad.probing = false;
+                ad_cap     = dparams[0].drafting ? ad.choose() : 0;
+                if (ad_cap > 0 && dparams[0].n_max > 0) {
+                    ad_cap = std::min(ad_cap, dparams[0].n_max); // the server's cap (context or n_predict end)
+                }
             }
         }
 
@@ -4595,16 +4642,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (use_policy) {
                 return cost_keep(s, conf, d, n);
             }
-            if (conf < pmin_at(pos)) {
-                return false;
-            }
-            // [TAG_FN_L19_DRAFT_ADAPT] the cost cut on top of p_min: the token must pay for its verify row
-            if (ad_on && ad.cut > 0 && s == 0) {
-                if (!ad.keep(pos, ad_P, conf)) {
-                    ad.n_cut++;
+            const float pm = pmin_at(pos);
+            // [TAG_FN_L19_DRAFT_ADAPT] the cost cut on top of p_min: the token must pay for its verify row.
+            // [TAG_FN_L20_DRAFTFIX] the drafts that pass p_min are counted apart from those proposed (pass_i learns p_min
+            // only), a probe round runs without the cut (ad.keep), and [TAG_FN_L20_DRAFTFIX_FLOOR] with the floor a draft
+            // below p_min down to it is proposed when the cost rule says it pays
+            if (ad_mode == 1 && s == 0) {
+                const bool  fl  = ad.cut > 0 && ad.floor_p >= 0.0f && ad.floor_p < pm;
+                if (conf < (fl ? ad.floor_p : pm)) {
                     return false;
                 }
-                ad_P *= ad.acc_p(pos, conf);
+                ad_npass++;
+                const bool below = conf < pm;
+                if (ad.cut > 0 || below) {
+                    if (!ad.keep(pos, ad_P, conf, below)) {
+                        ad.n_cut += below ? 0 : 1;
+                        return false;
+                    }
+                    ad.n_ext += below ? 1 : 0;
+                    ad_P *= ad.acc_p(pos, conf);
+                }
+                return true;
+            }
+            if (conf < pm) {
+                return false;
+            }
+            if (ad_mode == 2 && s == 0) {
+                ad_npass++; // [TAG_FN_L20_DRAFTFIX_MEASURE]
             }
             return true;
         };
@@ -5004,7 +5068,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // [TAG_FN_L19_DRAFT_ADAPT] what the target kept of this round's drafts
         if (ad_on && ad_open && seq_id == 0) {
-            ad.observe(ad_dec, ad_prop, n_accepted);
+            ad.observe(ad_dec, ad_npass, ad_prop, n_accepted); // [TAG_FN_L20_DRAFTFIX] p_min passes apart from proposals
             ad_open = false;
             ad_acc  = n_accepted;
             for (int k = 0; k < std::min<int>({ ad_prop, (int) n_accepted + 1, common_mtp_adapt::K_MAX }); ++k) {
@@ -5786,8 +5850,8 @@ int32_t common_speculative_mtp_adapt_kmax(const llama_model * model, const commo
     const auto & types = params.speculative.types;
     if (model == nullptr || params.n_parallel != 1 ||
             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == types.end() ||
-            llama_fn_l4_int(model, "LLAMA_FN_L19_DRAFT_ADAPT", 0) == 0) {
-        return 0; // llama_fn_l4_int reads the switch on qwen4exp only
+            llama_fn_l4_int(model, "LLAMA_FN_L19_DRAFT_ADAPT", 0) != 1) {
+        return 0; // llama_fn_l4_int reads the switch on qwen4exp only; 2 measures only ([TAG_FN_L20_DRAFTFIX_MEASURE])
     }
     const char * ec = getenv("SPEC_MTP_COST");
     if (ec && ec[0] != '\0' && ec[0] != '0') {
