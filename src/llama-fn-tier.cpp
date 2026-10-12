@@ -949,6 +949,40 @@ void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>>
 #endif
 }
 
+// [TAG_FN_L18_FIRSTANS_STATE] see llama-fn-tier.h
+void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges, int n_threads, const std::atomic<bool> * abort) {
+    if (ranges.empty()) {
+        return;
+    }
+    std::atomic<size_t> next{0};
+    auto run = [&]() {
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+        for (size_t i = next.fetch_add(1); i < ranges.size(); i = next.fetch_add(1)) {
+            if (abort && abort->load(std::memory_order_relaxed)) {
+                return;
+            }
+            const char * p = (const char *) ranges[i].first;
+            const size_t n = ranges[i].second;
+            for (size_t o = 0; o < n; o += 4096) {
+                (void) *(volatile const char *) (p + o);
+            }
+            if (n > 0) {
+                (void) *(volatile const char *) (p + n - 1);
+            }
+        }
+    };
+    std::vector<std::thread> th;
+    for (int k = 1; k < std::max(1, n_threads); ++k) {
+        th.emplace_back(run);
+    }
+    run();
+    for (auto & t : th) {
+        t.join();
+    }
+}
+
 // [TAG_FN_L18_FIRSTANS_STALL] see llama-fn-tier.h
 int llama_fn_warm_state(size_t * mark) {
 #ifdef _WIN32

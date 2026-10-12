@@ -13,6 +13,7 @@
 // is unlocked. Nothing is copied or charged to commit, and the load does not prefetch those ranges.
 // A no-op on other architectures and other platforms.
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -55,6 +56,10 @@ int llama_fn_warm_state(size_t * mark);
 // [TAG_FN_L18_FIRSTANS_STATE] asks the OS to read these mapped ranges in (asynchronous, PrefetchVirtualMemory); a no-op
 // elsewhere. Nothing is locked or copied.
 void llama_fn_prefetch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges);
+
+// [TAG_FN_L18_FIRSTANS_STATE] reads one byte of every page of these mapped ranges with n_threads threads (lowest priority), so
+// they are in the working set when this returns
+void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & ranges, int n_threads, const std::atomic<bool> * abort = nullptr);
 
 // [TAG_FN_L16_PLEGATE] the calling thread at THREAD_PRIORITY_HIGHEST (the MoE pool's level with --prio 2); a no-op elsewhere
 void llama_fn_thread_priority_highest();

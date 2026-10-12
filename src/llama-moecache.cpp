@@ -329,7 +329,9 @@ struct moe_cache {
     // set's start (their pages read ahead first) instead of one synchronous refill; each lands and is published at an owner
     // step like any admission. The counts of what is still in flight (owner's step / wmtx)
     bool                  fa18_state       = false;
-    std::thread           fa18_pf_th; // the read-ahead of the saved residents' pages (PrefetchVirtualMemory can block)
+    std::thread           fa18_pf_th; // the read-ahead of the saved residents' pages, then their uploads are queued
+    std::vector<upload_job> fa18_st_jobs; // in flight in the bookkeeping, not queued yet (until their pages are in)
+    std::atomic<bool>     fa18_pf_abort{false}; // the stop: the read-ahead ends at its next range
     size_t                fa18_st_left     = 0;
     size_t                fa18_st_n        = 0;
     size_t                fa18_st_bytes    = 0;
@@ -362,6 +364,7 @@ void hot_state_save(moe_cache * mc); // [TAG_FN_L3_POLICY_STATE]
 void hot_state_load(moe_cache * mc);
 std::string hot_state_cache_path(const std::string & model_path); // [TAG_FN_L18_FIRSTANS_STATE]
 void hot_turn_join(moe_cache * mc, bool wait = true); // [TAG_FN_L18_FIRSTANS_OVERLAP]
+void hot_state_queue(moe_cache * mc); // [TAG_FN_L18_FIRSTANS_STATE]
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -3797,6 +3800,37 @@ std::string hot_state_cache_path(const std::string & model_path) {
     return (dir / (fs::u8path(model_path).filename().u8string() + ".hotstate")).u8string();
 }
 
+// [TAG_FN_L18_FIRSTANS_STATE] the saved residents' uploads into the worker's queue (their pages are in by now); a layer or slot
+// that is out now drops its job as hot_drain_out drops a queued one (a tail slot keeps the expert for its restore)
+void hot_state_queue(moe_cache * mc) {
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    std::lock_guard<std::mutex> lk(mc->wmtx);
+    size_t n_q = 0;
+    for (const auto & j : mc->fa18_st_jobs) {
+        layer_state & ls = mc->layers[j.layer_idx];
+        const bool sl_o = !ls.slot_out.empty() && ls.slot_out[j.slot];
+        if (mc->stop || ls.out() || sl_o) {
+            ls.slot_in_flight[j.slot]     = false;
+            ls.expert_in_flight[j.expert] = false;
+            if (!mc->stop && (ls.cb_lent || ls.kv_lent) && !sl_o) {
+                ls.slot_expert[j.slot]   = j.expert;
+                ls.expert_slot[j.expert] = j.slot;
+            } else if (ls.pool >= 0) {
+                mc->pools[ls.pool].slot_layer[j.slot] = -1;
+            }
+            if (mc->fa18_st_left > 0) {
+                mc->fa18_st_left--;
+            }
+            continue;
+        }
+        mc->todo.push_back(j);
+        n_q++;
+    }
+    mc->fa18_st_jobs.clear();
+    mc->wcv.notify_all();
+    llama_fn_stall_mark("saved state: uploads queued (jobs)", (int64_t) n_q); // [TAG_FN_L18_FIRSTANS_STALL]
+}
+
 // the file format is llama_moe_hotstate_format / _parse (llama-moe-decay.h, tests/test-moe-decay.cpp)
 void hot_state_save(moe_cache * mc) {
     if (mc->st_path.empty() || mc->layers.empty() || !mc->dc_on) {
@@ -3974,22 +4008,29 @@ void hot_state_load(moe_cache * mc) {
                 bytes += sz;
             }
         }
-        if (!mc->fa18_pf_th.joinable()) {
-            mc->fa18_pf_th = std::thread([r = std::move(ranges)]() {
-                llama_fn_thread_name("state-readahead"); // [TAG_FN_L18_FIRSTANS_STALL]
-                llama_fn_prefetch_ranges(r);
-            });
-        }
+        // the pages first (read-ahead, then every page touched), then the uploads: the worker's copies never fault a page in
+        // from the disk (a 64 MiB batch that did took 9.4 s beside the warm pass, and a FULL switch's drain waited for it)
         {
             std::lock_guard<std::mutex> lk(mc->wmtx);
             for (const auto & u : ups) {
-                mc->todo.push_back(u.second);
+                mc->fa18_st_jobs.push_back(u.second);
             }
             mc->fa18_st_left  += ups.size();
             mc->fa18_st_n      = ups.size();
             mc->fa18_st_bytes  = bytes;
             mc->fa18_st_t0     = t0;
-            mc->wcv.notify_all();
+        }
+        if (!mc->fa18_pf_th.joinable()) {
+            mc->fa18_pf_th = std::thread([mc, r = std::move(ranges)]() {
+                llama_fn_thread_name("state-readahead"); // [TAG_FN_L18_FIRSTANS_STALL]
+                const int64_t t1 = ggml_time_us();
+                llama_fn_prefetch_ranges(r);
+                llama_fn_touch_ranges(r, 8, &mc->fa18_pf_abort);
+                const int64_t t2 = ggml_time_us();
+                hot_state_queue(mc);
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_FIRSTANS_STATE] the saved residents' pages were read in %.0f ms, their uploads "
+                        "are queued\n", (t2 - t1)/1000.0);
+            });
         }
         llama_fn_stall_mark("saved state queued (residents, MiB)", (int64_t) ups.size(), (int64_t) (bytes >> 20)); // [TAG_FN_L18_FIRSTANS_STALL]
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_FIRSTANS_STATE] %s: %zu residents in %zu layers (%.2f GiB) queued for the upload "
@@ -4577,7 +4618,8 @@ void llama_moe_hot_stop(const void * owner) {
         hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP]
     }
     if (mc->fa18_pf_th.joinable()) {
-        mc->fa18_pf_th.join(); // [TAG_FN_L18_FIRSTANS_STATE]
+        mc->fa18_pf_abort.store(true);
+        mc->fa18_pf_th.join(); // [TAG_FN_L18_FIRSTANS_STATE] its jobs are queued (or dropped) before the worker stops
     }
     {
         std::lock_guard<std::mutex> lk(mc->wmtx);
