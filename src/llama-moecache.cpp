@@ -891,8 +891,7 @@ void hot_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     }
     if (mc->l18_ab > 0) { // [TAG_FN_L18_CHURN_AB] the window that ends now ran in this mode; the next one in the other
         const int m = mc->l18_ab_mode.load(std::memory_order_relaxed);
-        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_AB] window %" PRIu64 " ran in mode %d
-", mc->hot_steps/256, m);
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L18_CHURN_AB] window %" PRIu64 " ran in mode %d\n", mc->hot_steps/256, m);
         mc->l18_ab_mode.store(m ^ 1, std::memory_order_relaxed);
     }
     uint64_t h = 0, t = 0;
