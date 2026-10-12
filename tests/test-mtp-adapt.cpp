@@ -262,7 +262,7 @@ static double run_p(const scenario_p & sc, int fixed_k, uint32_t seed, common_mt
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> U(0.0, 1.0);
     std::normal_distribution<double>       N(0.0, 1.0);
-    const float rows[5] = { 0.0f, 0.0f, sc.row2, sc.row3, sc.row4 };
+    const float rows[common_mtp_adapt::W_MAX + 1] = { 0.0f, 0.0f, sc.row2, sc.row3, sc.row4, sc.row4 }; // W <= kmax + 1
     double tok = 0.0, us = 0.0;
     for (int r = 0; r < 6000; ++r) {
         const int K = pol ? pol->choose() : fixed_k;
