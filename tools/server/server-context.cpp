@@ -3206,6 +3206,8 @@ private:
     //   LLAMA_FN_L18_KEEPCTX_N         conversations kept (default 4)
     //   LLAMA_FN_L18_KEEPCTX_MIN       tokens a conversation must lose to be stored, and gain to be restored (default 512)
     //   LLAMA_FN_L18_KEEPCTX_VERIFY=1  tests: after a restore, compare the restored states with the stored bytes (logged)
+    //   LLAMA_FN_L18_KEEPCTX_HOT=1     [TAG_FN_L18_KEEPCTX_HOT] the MoE hot set's decayed counts are stored with the
+    //                                  conversation and put back with it, so the next passes move the set back to its experts
     void keepctx_init() {
         keepctx.reset();
         const char * on = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX");
@@ -3231,6 +3233,7 @@ private:
         kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
         kp.n_max    = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_N", 4));
         kp.verify   = env_ll("LLAMA_FN_L18_KEEPCTX_VERIFY", 0) != 0;
+        kp.hot      = env_ll("LLAMA_FN_L18_KEEPCTX_HOT", 0) != 0;
         keepctx_min = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_MIN", 512));
         auto kc = std::make_unique<server_keepctx>(kp);
         if (!kc->ok()) {
@@ -3239,7 +3242,7 @@ private:
         }
         keepctx = std::move(kc);
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
-                "from %d tokens)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min);
+                "from %d tokens%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "");
     }
 
     // [TAG_FN_L18_KEEPCTX] the tokens of p that a prompt sharing lcp tokens with it can keep: all of a continuation; for a

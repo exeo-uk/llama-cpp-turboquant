@@ -563,6 +563,11 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     common_speculative_get_carry(spec, seq_id, e.carry);
 
+    // [TAG_FN_L18_KEEPCTX_HOT] the counts before the new prompt fades them
+    if (params_.hot) {
+        llama_moe_hot_counts_get_ext(ctx_tgt, e.hot);
+    }
+
     e.prompt.tokens = prompt.tokens.clone();
     for (const auto & c : prompt.checkpoints) {
         common_prompt_checkpoint m;
@@ -635,6 +640,12 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
 
     const double ms = kc_ms_since(t0);
 
+    // [TAG_FN_L18_KEEPCTX_HOT] the next pass moves the set back toward this conversation's experts
+    std::string hot;
+    if (!e.hot.empty()) {
+        hot = llama_moe_hot_counts_set_ext(ctx_tgt, e.hot) ? ", hot-set counts back" : ", hot-set counts NOT set";
+    }
+
     // the states as the contexts hold them now must be the bytes that were stored
     std::string ver;
     if (params_.verify) {
@@ -650,8 +661,8 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         const bool vd = !ctx_dft || (state_hash(ctx_dft, hd) && hd == e.hash_dft);
         ver = string_format(", verify: target %s, draft %s", vt ? "identical" : "DIFFERS", ctx_dft ? (vd ? "identical" : "DIFFERS") : "none");
     }
-    info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, store %zu conversations / %.1f MiB%s",
+    info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, store %zu conversations / %.1f MiB%s%s",
                          prompt.n_tokens(), prompt.checkpoints.size(), e.n_bytes/1048576.0, ms, e.n_bytes/(ms*1e6),
-                         entries.size(), n_bytes()/1048576.0, ver.c_str());
+                         entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
     return true;
 }

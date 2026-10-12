@@ -8006,6 +8006,15 @@ bool llama_moe_bridge_last_ext(const llama_context * ctx, int32_t * n_tokens, ui
     return ctx != nullptr && llama_moe_bridge_last(ctx->get_moe_bridge(), n_tokens, cold, n, serial);
 }
 
+// [TAG_FN_L18_KEEPCTX_HOT]
+bool llama_moe_hot_counts_get_ext(llama_context * ctx, std::vector<float> & out) {
+    return ctx != nullptr && llama_moe_hot_counts_get(ctx, out);
+}
+
+bool llama_moe_hot_counts_set_ext(llama_context * ctx, const std::vector<float> & in) {
+    return ctx != nullptr && llama_moe_hot_counts_set(ctx, in);
+}
+
 uint32_t llama_memory_attn_swa_ext(llama_context * ctx) {
     llama_memory_i * mem = ctx ? ctx->get_memory() : nullptr;
     llama_kv_cache * kv  = dynamic_cast<llama_kv_cache *>(mem);

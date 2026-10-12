@@ -28,6 +28,7 @@ struct server_keepctx_params {
     uint64_t    budget = 0;   // bytes on disk for all conversations
     int32_t     n_max  = 4;   // conversations kept
     bool        verify = false; // after a restore, compare a hash of the restored states with the stored bytes (tests)
+    bool        hot    = false; // [TAG_FN_L18_KEEPCTX_HOT] the MoE hot set's counts go with the conversation
 };
 
 class server_keepctx_file;
@@ -46,6 +47,8 @@ struct server_keepctx_entry {
 
     uint64_t hash_tgt = 0;              // params.verify: hashes of the stored target and draft state bytes
     uint64_t hash_dft = 0;
+
+    std::vector<float> hot;             // params.hot: the MoE hot set's decayed counts when it left the slot
 
     std::shared_ptr<server_keepctx_file> file;
 };
