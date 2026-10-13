@@ -741,6 +741,14 @@ uint32_t llama_fn_l20_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n
     return big ? n_ubatch : base_ub;
 }
 
+uint32_t llama_fn_l21_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens, int64_t after) {
+    if (base_ub == 0 || base_ub >= n_ubatch) {
+        return n_ubatch;
+    }
+    const bool big = after >= 0 ? (int64_t) n_tokens + after > (int64_t) n_ubatch : n_tokens >= n_ubatch;
+    return big ? n_ubatch : base_ub;
+}
+
 bool llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after) {
     return base_ub > 0 && !wide && !short_path && state_full && after > 0;
 }

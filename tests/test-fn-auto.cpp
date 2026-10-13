@@ -462,6 +462,15 @@ static void test_cbuf() {
     TCHECK(llama_fn_l20_full_width(8192, 16384, 6000, 2500) == 16384, "6000 + 2500 after it: big");
     TCHECK(llama_fn_l20_full_width(8192, 16384, 6000, 2192) == 8192, "6000 + 2192 = 8192: the command's width");
     TCHECK(llama_fn_l20_full_width(8192, 16384, 9000, -1) == 16384, "no hint, a 9000-token batch: big");
+    // [TAG_FN_L21_BIGUB] the big width only above 16K prompts
+    TCHECK(llama_fn_l21_full_width(0, 8192, 9000, -1) == 8192, "l21 off: n_ubatch");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 16384, 16388) == 16384, "l21: the first 16K of a 32K prompt: big");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 16384, 1) == 16384, "l21: 16385 tokens: big");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 16384, 0) == 8192, "l21: exactly 16384: the command's width");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 12000, 0) == 8192, "l21: a 12K paste: the command's width");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 7647, 8000) == 8192, "l21: a 15.6K prompt's first part: the command's width");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 9000, -1) == 8192, "l21: no hint, a 9000-token batch: the command's width");
+    TCHECK(llama_fn_l21_full_width(8192, 16384, 16384, -1) == 16384, "l21: no hint, a full 16K batch: big");
     TCHECK(llama_fn_l20_full_width(8192, 16384, 5000, -1) == 8192, "no hint, 5000: the command's width");
     TCHECK(llama_fn_l20_full_width(16384, 16384, 20000, -1) == 16384, "base = n_ubatch: n_ubatch");
     TCHECK(llama_fn_l20_keep_full(8192, false, false, true, 16388), "a 23-token part between two big ones keeps FULL");

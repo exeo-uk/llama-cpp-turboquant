@@ -141,6 +141,9 @@ LLAMA_API size_t   llama_fn_cbuf_part_lo(size_t lo, size_t hi, size_t seg, size_
 // [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve's width for a wide batch of n_tokens with `after` prompt tokens after it (-1:
 // not known): the big ubatch when the batch or the batch plus the rest is wider than the command's ubatch base_ub
 LLAMA_API uint32_t llama_fn_l20_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens, int64_t after);
+// [TAG_FN_L21_BIGUB] the same with LLAMA_FN_L21_BIGUB: the big ubatch only when the prompt is wider than it (the batch plus
+// the rest above n_ubatch; with no hint, a batch of the full n_ubatch), else the command's width
+LLAMA_API uint32_t llama_fn_l21_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens, int64_t after);
 // [TAG_FN_L20_BIGPROMPT_UB] a narrow batch (no wider than the SMALL reserve) keeps the FULL state when the switch is on
 // (base_ub > 0), the state is FULL, it is not on the short path and its prompt goes on after it (after > 0)
 LLAMA_API bool     llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after);

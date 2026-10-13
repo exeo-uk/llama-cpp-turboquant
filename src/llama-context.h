@@ -559,6 +559,14 @@ private:
     bool     dft_wide      = false;
     uint64_t dft_n_wide    = 0;
     size_t   l20_dft_extra = 0;     // the target: device bytes the draft's wide reserve adds
+    // [TAG_FN_L21_BIGUB] LLAMA_FN_L21_BIGUB=1 (qwen4exp profile lookup) with LLAMA_FN_L20_BIGPROMPT_UB: the tail is sized for
+    // the command's width (the hot set's layout and its KV slot lend as without the 16K switch); the 16K reserve's extra
+    // (l21_extra) comes from borrow segments in the KV lend layers' base slots, out only while a 16K FULL runs; the 16K
+    // width only for prompts above n_ubatch tokens (llama_fn_l21_full_width). No borrow placed: the command's width always
+    bool     l21_bigub     = false;
+    bool     l21_big_off   = false;
+    size_t   l21_extra     = 0;
+    uint64_t l21_n_borrow  = 0, l21_n_fallback = 0;
     bool     dft_set_wide(bool wide);
     llama_context * l20_draft() const;
     bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored);
