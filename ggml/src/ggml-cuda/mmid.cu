@@ -20,6 +20,35 @@ struct mm_ids_helper_store {
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
 
 // the generic path passes 0, which needs no padding since it never groups lanes by token
+// [TAG_FN_L21_DUPID] sum over the lanes of a width-wide segment (warp_reduce_sum<width> reduces the whole warp on Ampere+)
+template <int width>
+static __device__ __forceinline__ int mm_ids_seg_sum(int x) {
+    if constexpr (width == 1) {
+        return x;
+    } else if (width == ggml_cuda_get_physical_warp_size()) {
+        return warp_reduce_sum<width>(x);
+    } else {
+#pragma unroll
+        for (int offset = width/2; offset > 0; offset >>= 1) {
+            x += __shfl_xor_sync(0xFFFFFFFF, x, offset, width);
+        }
+        return x;
+    }
+}
+
+// [TAG_FN_L21_DUPID] inclusive prefix sum over the lanes of the warp
+static __device__ __forceinline__ int mm_ids_warp_incl_scan(int x) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+#pragma unroll
+    for (int offset = 1; offset < warp_size; offset <<= 1) {
+        const int t = __shfl_up_sync(0xFFFFFFFF, x, offset, warp_size);
+        if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+            x += t;
+        }
+    }
+    return x;
+}
+
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
 template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
@@ -45,16 +74,19 @@ static __global__ void mm_ids_helper(
 
     int nex_prev   = 0; // Number of columns for experts with a lower index.
     int it_compact = 0; // Running index for the compact slice of this expert.
+    int dup        = 0; // [TAG_FN_L21_DUPID] a token of this lane used the expert in more than one slot
 
     if constexpr (n_expert_used_template == 0) {
         // Generic implementation:
         for (int it = 0; it < n_tokens; ++it) {
             int iex_used = -1; // The index at which the expert is used, if any.
+            int n_uses   = 0;  // [TAG_FN_L21_DUPID] how often this lane's slots use it
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
                 nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
+                    n_uses++;
                 }
             }
 
@@ -62,7 +94,9 @@ static __global__ void mm_ids_helper(
                 store[it_compact] = mm_ids_helper_store(it, iex_used);
             }
 
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
+            const int n_uses_it = warp_reduce_sum<warp_size>(n_uses);
+            dup |= n_uses_it > 1;
+            if (n_uses_it > 0) {
                 it_compact++;
             }
         }
@@ -80,7 +114,10 @@ static __global__ void mm_ids_helper(
             nex_prev += expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+            // [TAG_FN_L21_DUPID] counted, so a token that names the expert in several slots is seen (the dup pass below)
+            const int n_uses_it = mm_ids_seg_sum<neu_padded>(iex_used != -1);
+            const int it_compact_add_self = n_uses_it > 0;
+            dup |= n_uses_it > 1;
 
             // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
             int it_compact_add_lower = 0;
@@ -103,6 +140,52 @@ static __global__ void mm_ids_helper(
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
     ggml_cuda_syncwarp();
 
+    // [TAG_FN_L21_DUPID] some token named this expert in more than one slot (upstream #29998's case; ids the caller remaps,
+    // e.g. every miss to one zero slot, repeat within a row): the pass above kept one compact row per token, so the other
+    // slots' dst rows were never written and their ids_src1 entries (the quantizer's scatter map) were never set (wrong
+    // results; an illegal address in the scatter). A second pass gives every (token, slot) that uses the expert its own
+    // compact row, in token-major, slot-minor order. It runs only for such experts; without repeats nothing changes.
+    if (warp_reduce_any<warp_size>(dup)) {
+        int n_rows = 0;
+        auto put = [&](const int pos, const int it, const int iex) {
+            ids_dst[nex_prev + pos] = it*n_expert_used + iex;
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex] = nex_prev + pos;
+            } else {
+                ids_src1[nex_prev + pos] = it*sis1 + iex % nchannels_y;
+            }
+        };
+        if constexpr (n_expert_used_template == 0) {
+            for (int it = 0; it < n_tokens; ++it) {
+                int c = 0;
+                for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+                    c += ids[it*si1 + iex] == expert;
+                }
+                const int incl = mm_ids_warp_incl_scan(c);
+                int pos = n_rows + incl - c;
+                for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+                    if (ids[it*si1 + iex] == expert) {
+                        put(pos++, it, iex);
+                    }
+                }
+                n_rows += __shfl_sync(0xFFFFFFFF, incl, warp_size - 1, warp_size);
+            }
+        } else {
+            for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
+                const int it  = it0 + threadIdx.x / neu_padded;
+                const int iex = threadIdx.x % neu_padded;
+                const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+                    ids[it*si1 + iex] : INT_MAX;
+                const int u    = expert_used == expert;
+                const int incl = mm_ids_warp_incl_scan(u);
+                if (u) {
+                    put(n_rows + incl - 1, it, iex);
+                }
+                n_rows += __shfl_sync(0xFFFFFFFF, incl, warp_size - 1, warp_size);
+            }
+        }
+        it_compact = n_rows;
+    } else
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
         const mm_ids_helper_store store_it = store[itc];
         const int it       = store_it.it();
