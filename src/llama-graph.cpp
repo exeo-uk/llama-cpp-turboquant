@@ -4624,7 +4624,14 @@ ggml_tensor * llm_graph_context::build_rs(
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    // [TAG_FN_L19_RS_FILL] qwen4exp: the cleared state is written as zeros (fill), not scaled by 0 - a cell that once held a
+    // non-finite value kept it through every later clear (NaN * 0 = NaN), so one bad prompt poisoned the sequence's recurrent
+    // state for good (every later answer of the slot decoded and drafted NaN until a restart). Other models keep the scale.
+    if (arch == LLM_ARCH_QWEN4EXP && states->type == GGML_TYPE_F32) {
+        ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+    } else {
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

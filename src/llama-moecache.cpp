@@ -3992,6 +3992,13 @@ void llama_moe_hot_unlend(const void * owner) {
             }
         }
     }
+    // [TAG_FN_L19_UNLEND_CLEAR] the whole range reads 0 before the residents come back, as after the tail's and the KV lend's
+    // remap: the stream left its bank bytes in the empty slots, and the batched kernels of the CPU-path prompt graphs
+    // ([TAG_FN_L19_TTFT_PHOT], MMQ) read past the last row of each slot into the next one (the last K iteration loads
+    // ITER_K/qk blocks, e.g. 24 of the 20 blocks of a 640-wide Q5_1 down row, against zero-padded activations). A NaN or Inf
+    // scale in those bytes times 0 gave NaN in the expert's last output feature; the hidden state, then the recurrent state
+    // went NaN and every later answer of the slot drafted nothing (the l19 MTP draft collapse after a streamed prompt).
+    ggml_backend_tensor_memset(g_lend.raw, 0, 0, ggml_nbytes(g_lend.raw));
     const size_t bytes = hot_refill(mc, jobs);
     std::vector<const ggml_tensor *> zeroed; // [TAG_FN_L3_POLICY_POOL] the layers of a pool share their tensors
     for (auto & ls : mc->layers) {
