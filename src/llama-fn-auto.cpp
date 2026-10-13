@@ -244,7 +244,9 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L21_MTP_ROWS",          "1",      P_ALL }, // [TAG_FN_L21_MTP_ROWS] MTP catch-up rows stop after their K/V (no MoE / hc / head)
     { "LLAMA_FN_L21_MTP_STATE",         "1",      P_ALL }, // [TAG_FN_L21_MTP_STATE] context checkpoints carry the MTP h / fused rows (#30141)
     { "LLAMA_FN_L21_MEDIA_CKPT",        "1",      P_ALL }, // [TAG_FN_L21_MEDIA_CKPT] a checkpoint right after the last media chunk (#30201)
-    { "LLAMA_FN_L21_VRAM_DXGI",         "2",      P_ALL }, // [TAG_FN_L21_VRAM_DXGI] log CUDA vs DXGI free VRAM at hot-set sizing (1 = use the min)
+    // [TAG_FN_L21_VRAM_DXGI] the smoke read CUDA 23,803 = DXGI 23,803 MiB free (budget 31,419, this process 7,616) with
+    // nothing else on the card, so the min changes nothing then and only shrinks the fit when another process holds VRAM
+    { "LLAMA_FN_L21_VRAM_DXGI",         "1",      P_ALL }, // [TAG_FN_L21_VRAM_DXGI] the hot set's fit from min(CUDA free, DXGI budget - usage)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
