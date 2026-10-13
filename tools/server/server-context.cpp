@@ -7060,6 +7060,16 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start) || user_start_merged;
                     const bool is_last_user_message = n_tokens_start == last_user_pos || user_start_merged_is_last;
 
+                    // [TAG_FN_L21_MEDIA_CKPT] LLAMA_FN_L21_MEDIA_CKPT (qwen4exp profile: 1, else the environment, default
+                    // 0): the text batch right after the prompt's last media chunk may take a checkpoint (upstream #30201),
+                    // so an edit or a regenerate after an image restores it instead of re-reading the image
+                    static const bool media_ckpt_on = [this]() {
+                        const char * v = llama_model_fn_env(model_tgt, "LLAMA_FN_L21_MEDIA_CKPT");
+                        return v != nullptr && atoi(v) != 0;
+                    }();
+                    const bool is_after_last_media = media_ckpt_on && has_mtmd &&
+                            slot.task->tokens.find_next_media_chunk(n_tokens_start).first == nullptr;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -7076,7 +7086,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_after_last_media) {
                             do_checkpoint = false;
                         }
                     }
@@ -7091,7 +7101,7 @@ private:
                     }
 
                     // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    do_checkpoint = do_checkpoint && (!has_mtmd || is_after_last_media); // [TAG_FN_L21_MEDIA_CKPT]
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (

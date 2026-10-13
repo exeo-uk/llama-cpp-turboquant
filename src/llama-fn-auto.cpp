@@ -241,6 +241,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L21_MTP_VISION",        "1",      P_ALL }, // [TAG_FN_L21_MTP_VISION] the MTP draft decodes image rows (upstream #30257 + #30397)
     { "LLAMA_FN_L21_MTP_ROWS",          "1",      P_ALL }, // [TAG_FN_L21_MTP_ROWS] MTP catch-up rows stop after their K/V (no MoE / hc / head)
     { "LLAMA_FN_L21_MTP_STATE",         "1",      P_ALL }, // [TAG_FN_L21_MTP_STATE] context checkpoints carry the MTP h / fused rows (#30141)
+    { "LLAMA_FN_L21_MEDIA_CKPT",        "1",      P_ALL }, // [TAG_FN_L21_MEDIA_CKPT] a checkpoint right after the last media chunk (#30201)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
