@@ -136,10 +136,39 @@ static __device__ __forceinline__ void topk_hist_pass(
     __syncthreads();
 }
 
+// [TAG_FN_L21_TOPKSCAN] the inclusive scan of c over the calling warp (threads 0..255 only, whole warps); the warp's
+// total goes to wsum[warp]. topk_sel_block_off (after a __syncthreads): the totals of the warps before this thread's
+static __device__ __forceinline__ int topk_sel_warp_scan(const int c, int * wsum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    int v = c;
+#pragma unroll
+    for (int o = 1; o < WARP_SIZE; o <<= 1) {
+        const int n = __shfl_up_sync(0xFFFFFFFFu, v, o);
+        if (lane >= o) {
+            v += n;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        wsum[threadIdx.x / WARP_SIZE] = v;
+    }
+    return v;
+}
+
+static __device__ __forceinline__ int topk_sel_block_off(const int * wsum) {
+    int off = 0;
+    for (int w = 0; w < (int) (threadIdx.x / WARP_SIZE); ++w) {
+        off += wsum[w];
+    }
+    return off;
+}
+
 template <int k_max, bool vec4, bool ordered>
 static __global__ void __launch_bounds__(TOPK_SELECT_THREADS)
-k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int ncols, const int k) {
+k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int ncols, const int k, const int scan) {
     const int tid = threadIdx.x;
+    // [TAG_FN_L21_TOPKSCAN] scan != 0: each radix digit is picked by the first 256 threads (one bin each) with a block
+    // prefix scan instead of thread 0 walking the 256 bins (Strata #2016); the same bin, need and tie count in every case
+    __shared__ int s_wsum[256 / WARP_SIZE];
     x   += (size_t) blockIdx.x * ncols;
     dst += (size_t) blockIdx.x * k;
 
@@ -159,7 +188,23 @@ k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int n
     for (int pass = 0; pass < 4; ++pass) {
         const int shift = 24 - 8*pass;
         topk_hist_pass<true, vec4>(x, ncols, pmask, prefix, 0u, 0u, shift, lhist, hist);
-        if (tid == 0) {
+        if (scan) {
+            // thread t owns bin 255 - t: its exclusive prefix counts the keys in the higher bins (the walk's acc); the
+            // walk stops at the first bin from the top with acc + c >= need, or at bin 0
+            int c = 0, v = 0;
+            if (tid < 256) {
+                c = hist[255 - tid];
+                v = topk_sel_warp_scan(c, s_wsum);
+            }
+            __syncthreads();
+            if (tid < 256) {
+                const int above = topk_sel_block_off(s_wsum) + v - c;
+                const int bin   = 255 - tid;
+                if (above < need && (bin == 0 || above + c >= need)) {
+                    s_need = need - above; s_prefix = prefix | ((uint32_t) bin << shift); s_eq = c;
+                }
+            }
+        } else if (tid == 0) {
             int acc = 0, b = 255;
             for (; b > 0; --b) { const int c = hist[b]; if (acc + c >= need) { break; } acc += c; }
             s_need = need - acc; s_prefix = prefix | ((uint32_t) b << shift); s_eq = hist[b];
@@ -177,7 +222,22 @@ k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int n
         for (int pass = 0; pass < 4; ++pass) {
             const int shift = 24 - 8*pass;
             topk_hist_pass<false, vec4>(x, ncols, 0u, prefix, imask, iprefix, shift, lhist, hist);
-            if (tid == 0) {
+            if (scan) {
+                // [TAG_FN_L21_TOPKSCAN] thread t owns bin t (ascending): the walk stops at the first bin with
+                // acc + c >= ineed, or at bin 255
+                int c = 0, v = 0;
+                if (tid < 256) {
+                    c = hist[tid];
+                    v = topk_sel_warp_scan(c, s_wsum);
+                }
+                __syncthreads();
+                if (tid < 256) {
+                    const int below = topk_sel_block_off(s_wsum) + v - c;
+                    if (below < ineed && (tid == 255 || below + c >= ineed)) {
+                        s_need = ineed - below; s_prefix = iprefix | ((uint32_t) tid << shift);
+                    }
+                }
+            } else if (tid == 0) {
                 int acc = 0, b = 0;
                 for (; b < 255; ++b) { const int c = hist[b]; if (acc + c >= ineed) { break; } acc += c; }
                 s_need = ineed - acc; s_prefix = iprefix | ((uint32_t) b << shift);
@@ -264,6 +324,11 @@ k_top_k_select(const float * __restrict__ x, int * __restrict__ dst, const int n
 
 // [TAG_SYNC_TOPK] the fork's launcher must stay outside upstream's HIP-only radix block below.
 static void top_k_select_cuda(const float * x, int * dst, const int64_t ncols, const int64_t nrows, const int64_t k, const bool ordered, cudaStream_t stream) {
+    // [TAG_FN_L21_TOPKSCAN] LLAMA_FN_L21_TOPKSCAN=1 (the qwen4exp profile): the radix digits by a block prefix scan
+    static const int scan = [] {
+        const char * e = getenv("LLAMA_FN_L21_TOPKSCAN");
+        return e != nullptr && atoi(e) != 0 ? 1 : 0;
+    }();
     // float4 row reads need 16-byte aligned rows: base pointer and row pitch both multiples of 16
     const bool vec4 = (ncols % 4 == 0) && (((uintptr_t) x) % 16 == 0);
     // [TAG_TOPK_UNORDERED] k_max is only the size of the rank-sort staging arrays, so the unordered
@@ -271,15 +336,15 @@ static void top_k_select_cuda(const float * x, int * dst, const int64_t ncols, c
     // to the histograms alone - that is what lets k run into the thousands.
     if (ordered) {
         if (vec4) {
-            k_top_k_select<TOPK_SELECT_MAX_K, true,  true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+            k_top_k_select<TOPK_SELECT_MAX_K, true,  true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k, scan);
         } else {
-            k_top_k_select<TOPK_SELECT_MAX_K, false, true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+            k_top_k_select<TOPK_SELECT_MAX_K, false, true><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k, scan);
         }
     } else {
         if (vec4) {
-            k_top_k_select<1, true,  false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+            k_top_k_select<1, true,  false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k, scan);
         } else {
-            k_top_k_select<1, false, false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k);
+            k_top_k_select<1, false, false><<<(unsigned) nrows, TOPK_SELECT_THREADS, 0, stream>>>(x, dst, (int) ncols, (int) k, scan);
         }
     }
 }
