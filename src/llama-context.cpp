@@ -6283,7 +6283,7 @@ void llama_context::moe_hot_fit_try() {
         vram_account("fit SMALL");
     }
     size_t mem_free = 0, mem_total = 0;
-    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    fn_l21_dev_memory(&model, dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI] the hot set's fit
 
     constexpr double MiB = 1024.0*1024.0;
     size_t m_model = 0, m_kv = 0, m_compute = 0;

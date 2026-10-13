@@ -35,7 +35,7 @@
 #endif
 
 // [TAG_FN_L21_VRAM_DXGI] defined at the end of this file (the Windows headers stay out of the code above)
-void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
+void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
 
 namespace {
 
@@ -2906,7 +2906,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
             size_t mem_free = 0, mem_total = 0;
             if (dev) {
-                fn_l21_dev_memory(dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI]
+                fn_l21_dev_memory(&model, dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI]
             }
             budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
             // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
@@ -5157,9 +5157,11 @@ static IDXGIAdapter3 * fn_l21_dxgi_adapter(size_t mem_total) {
     return ad;
 }
 
-void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
+void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
     ggml_backend_dev_memory(dev, mem_free, mem_total);
-    static const int mode = [] { const char * e = getenv("LLAMA_FN_L21_VRAM_DXGI"); return e ? atoi(e) : 0; }();
+    // a LLAMA_FN_ name is a profile lookup (never put into the environment): the model's profile, else the environment
+    const char * e    = model ? llama_fn_env(*model, "LLAMA_FN_L21_VRAM_DXGI") : getenv("LLAMA_FN_L21_VRAM_DXGI");
+    const int    mode = e && e[0] ? atoi(e) : 0;
     if (mode <= 0) {
         return;
     }
@@ -5177,7 +5179,8 @@ void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_t
     }
 }
 #else
-void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
+void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
+    (void) model;
     ggml_backend_dev_memory(dev, mem_free, mem_total);
 }
 #endif
