@@ -725,6 +725,25 @@ bool llama_fn_cbuf_tail_full(uint32_t tailfull, bool state_full, bool short_path
            prev_n > small_t && prev_n < tailfull;
 }
 
+size_t llama_fn_cbuf_part_lo(size_t lo, size_t hi, size_t seg, size_t need) {
+    if (need == 0 || seg == 0 || hi <= lo || need >= hi - lo) {
+        return lo;
+    }
+    return lo + (hi - lo - need) / seg * seg;
+}
+
+uint32_t llama_fn_l20_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens, int64_t after) {
+    if (base_ub == 0 || base_ub >= n_ubatch) {
+        return n_ubatch;
+    }
+    const bool big = n_tokens > base_ub || (after > 0 && (int64_t) n_tokens + after > (int64_t) base_ub);
+    return big ? n_ubatch : base_ub;
+}
+
+bool llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after) {
+    return base_ub > 0 && !wide && !short_path && state_full && after > 0;
+}
+
 bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {
     const size_t need = tail + stream_lend + budget/32 + ((size_t) 64 << 20);
     return tail > 0 && budget >= need;

@@ -2845,6 +2845,14 @@ int llama_perplexity(int argc, char ** argv) {
         params.n_ctx += params.ppl_stride/2;
     }
 
+    // [TAG_FN_L20_BIGPROMPT_UB] LLAMA_PPL_OUTPUTS_MAX=<n>: the most logits rows one batch asks for (the context reserves its
+    // graphs for that many instead of n_batch). With the KLD's first scored position at n_ctx/2, n_ctx/2 lets a whole
+    // 16384-token chunk run as one ubatch (logits for 8192 rows) where n_batch rows would not fit in VRAM. 0/unset = as before
+    if (const char * e = getenv("LLAMA_PPL_OUTPUTS_MAX"); e && atoi(e) > 0) {
+        params.n_outputs_max = atoi(e);
+        LOG_INF("%s: [TAG_FN_L20_BIGPROMPT_UB] at most %d logits rows per batch (LLAMA_PPL_OUTPUTS_MAX)\n", __func__, params.n_outputs_max);
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 

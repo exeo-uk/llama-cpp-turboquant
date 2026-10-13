@@ -190,6 +190,17 @@ LLAMA_API void llama_quiesce_ext(struct llama_context * ctx);
 // prompt, and with LLAMA_FN_L18_FIRSTANS_WARMLATE the experts' warm pass starts now. A no-op otherwise. Outputs never change.
 LLAMA_API void llama_fn_ready_ext(struct llama_context * ctx);
 
+// [TAG_FN_L20_BIGPROMPT_UB] Before a decode: how many prompt tokens come after this batch (the most of any sequence in it;
+// 0 = this batch ends its prompts, -1 = not known). Read once by the next decode of ctx; it only picks qwen4exp's compute
+// reserve width with LLAMA_FN_L20_BIGPROMPT_UB. Outputs never change.
+LLAMA_API void llama_fn_prompt_after_ext(struct llama_context * ctx, int32_t n_after);
+
+// [TAG_FN_L20_BIGPROMPT_PLEPRE] Before a decode: the NEXT prompt batch of seq_id, toks[i_first..n) at positions pos0 + i_first..
+// (toks[0..i_first) the tokens before it, up to 16, for the n-gram context; pos0 = the position of toks[0]). qwen4exp reads
+// their PLE rows ahead (llama_ple_prefetch_ext) once this decode's first ubatch has set its inputs. Outputs never change.
+LLAMA_API void llama_fn_ple_next_ext(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const llama_token * toks,
+        int32_t n, int32_t i_first);
+
 // [TAG_FN_L3_MTP_HEADPROMPT] qwen4exp with a MTP draft vocabulary and LLAMA_MTP_HEAD_PROMPT=<cap>: the drafts also score
 // these prompt tokens where the vocabulary leaves them out (the first cap such ids in the given order replace the last
 // set). Returns how many were taken, -1 when the model has no such list. Only drafts change; verify uses the full head.

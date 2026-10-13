@@ -5958,7 +5958,17 @@ common_speculative_init_result::common_speculative_init_result(
     // behaviour exactly.
     {
         const char * e_du = getenv("SPEC_DFT_UBATCH");
-        const int v_du = e_du ? atoi(e_du) : 0;
+        int v_du = e_du ? atoi(e_du) : 0;
+        // [TAG_FN_L20_BIGPROMPT_DFTUB] LLAMA_FN_L20_BIGPROMPT_DFTUB=<n> (the qwen4exp profile or the environment; 0 = off): the
+        // MTP draft context's ubatch instead of SPEC_DFT_UBATCH (the profile's 128 ran a 32K prompt's draft rows in 256 graphs).
+        // The drafts verify against the target, so the target's tokens never change.
+        if (spec_mtp) {
+            const int v20 = llama_fn_l4_int(model_tgt, "LLAMA_FN_L20_BIGPROMPT_DFTUB", 0);
+            if (v20 > 0) {
+                LOG_INF("%s: [TAG_FN_L20_BIGPROMPT_DFTUB] MTP draft context ubatch %d (SPEC_DFT_UBATCH %d)\n", __func__, v20, v_du);
+                v_du = v20;
+            }
+        }
         if (v_du > 0) {
             if ((uint32_t) v_du < cparams.n_ubatch) { cparams.n_ubatch = (uint32_t) v_du; }
             if ((uint32_t) v_du < cparams.n_batch ) { cparams.n_batch  = (uint32_t) v_du; }

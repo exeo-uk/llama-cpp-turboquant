@@ -7060,6 +7060,52 @@ private:
             skip_extract = !extract_all && common_speculative_prefill_will_skip(spec.get(), batch.view);
         }
 
+        // [TAG_FN_L20_BIGPROMPT_UB] the prompt tokens after this batch (the most of any slot whose prompt runs): qwen4exp with
+        // LLAMA_FN_L20_BIGPROMPT_UB picks its compute reserve width by them; nothing else reads it
+        {
+            int32_t n_after_all = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task && !slot.parked) {
+                    n_after_all = std::max<int32_t>(n_after_all, (int32_t) slot.task->n_tokens() - (int32_t) slot.prompt.n_tokens());
+                }
+            }
+            llama_fn_prompt_after_ext(ctx_tgt, n_after_all);
+
+            // [TAG_FN_L20_BIGPROMPT_PLEPRE] LLAMA_FN_L20_BIGPROMPT_PLEPRE (qwen4exp profile or environment, default off): the next
+            // prompt batch's text tokens (up to the first media chunk) for the PLE read-ahead during this batch
+            static const bool ple_next_on = [this]() {
+                const char * v = llama_model_fn_env(model_tgt, "LLAMA_FN_L20_BIGPROMPT_PLEPRE");
+                return v != nullptr && atoi(v) != 0;
+            }();
+            if (ple_next_on && n_after_all > 0) {
+                for (const auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING_PROMPT || !slot.task || slot.parked) {
+                        continue;
+                    }
+                    const int32_t done  = (int32_t) slot.prompt.n_tokens();
+                    const int32_t total = (int32_t) slot.task->n_tokens();
+                    if (total <= done) {
+                        continue;
+                    }
+                    const int32_t n_next = std::min<int32_t>(total - done, llama_n_batch(ctx_tgt));
+                    const int32_t start  = std::max<int32_t>(0, done - 16);
+                    std::vector<llama_token> toks;
+                    toks.reserve((size_t) (done + n_next - start));
+                    for (int32_t i = start; i < done + n_next; ++i) {
+                        const llama_token t = slot.task->tokens[i];
+                        if (t == LLAMA_TOKEN_NULL) {
+                            break; // a media chunk: the rows after it are not known as text
+                        }
+                        toks.push_back(t);
+                    }
+                    if ((int32_t) toks.size() > done - start) {
+                        llama_fn_ple_next_ext(ctx_tgt, slot.id, (llama_pos) start, toks.data(), (int32_t) toks.size(), done - start);
+                    }
+                    break; // one slot's next batch (one read-ahead at a time)
+                }
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;

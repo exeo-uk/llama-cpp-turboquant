@@ -134,6 +134,16 @@ LLAMA_API uint32_t llama_fn_cbuf_short_max(uint32_t short_max, uint32_t early, b
 // was wider than small_t, asked for none and had fewer than tailfull tokens
 LLAMA_API bool     llama_fn_cbuf_tail_full(uint32_t tailfull, bool state_full, bool short_path, uint32_t n_tokens, uint32_t n_outputs,
         uint32_t prev_n, bool prev_out, uint32_t small_t);
+// [TAG_FN_L20_BIGPROMPT_TAIL] the lowest tail offset a release of need bytes from the top of [lo, hi) gives back, with the
+// tail mapped in segments of seg bytes from lo (an unmap takes whole segments): the highest segment start a with hi - a >=
+// need; lo (the whole tail) for need 0, seg 0, or need beyond the segments above lo
+LLAMA_API size_t   llama_fn_cbuf_part_lo(size_t lo, size_t hi, size_t seg, size_t need);
+// [TAG_FN_L20_BIGPROMPT_UB] the FULL reserve's width for a wide batch of n_tokens with `after` prompt tokens after it (-1:
+// not known): the big ubatch when the batch or the batch plus the rest is wider than the command's ubatch base_ub
+LLAMA_API uint32_t llama_fn_l20_full_width(uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens, int64_t after);
+// [TAG_FN_L20_BIGPROMPT_UB] a narrow batch (no wider than the SMALL reserve) keeps the FULL state when the switch is on
+// (base_ub > 0), the state is FULL, it is not on the short path and its prompt goes on after it (after > 0)
+LLAMA_API bool     llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool state_full, int64_t after);
 // the hot-set budget with the lend: the fit's budget plus pool_extra (LLAMA_FN_CBUF_POOL_MIB, also in the tail), never
 // above budget_max nor above free - 256 MiB (unless the fit's budget already is)
 LLAMA_API size_t   llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max);

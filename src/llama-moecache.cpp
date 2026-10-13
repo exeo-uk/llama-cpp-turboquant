@@ -268,6 +268,12 @@ struct moe_cache {
     size_t                cb_lo    = 0;
     size_t                cb_hi    = 0;
     bool                  cb_out   = false;
+    // [TAG_FN_L20_BIGPROMPT_TAIL] while out, [cb_rel, cb_hi) has no VRAM (cb_lo after a whole release; a part from the top
+    // for a prompt that needs a smaller compute reserve), at a boundary of the tail's mapped segments (cb_seg from cb_lo)
+    size_t                cb_rel   = 0;
+    size_t                cb_gran  = 0;
+    size_t                cb_seg   = 0;
+    uint64_t              cb_n_part = 0;
     ggml_context *        cb_ctx   = nullptr;
     ggml_tensor *         cb_raw   = nullptr; // I8 over the tail: one clear after it is mapped again
     bool                  cb_async = false;   // LLAMA_FN_CBUF_ASYNC=1: the refill through the upload worker ([TAG_FN_L4_EXIT] off by default)
@@ -2703,6 +2709,9 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
     mc->cb_lo    = lo;
     mc->cb_hi    = total;
     mc->cb_out   = false;
+    mc->cb_rel   = total;                                               // [TAG_FN_L20_BIGPROMPT_TAIL]
+    mc->cb_gran  = gran;
+    mc->cb_seg   = std::max(gran, ((size_t) 1 << 30) / gran * gran);    // the segments vmm.map makes (ggml-cuda: <= 1 GiB)
     mc->cb_map   = vmm.map;
     mc->cb_unmap = vmm.unmap;
     if (const char * e = getenv("LLAMA_FN_CBUF_ASYNC")) {
@@ -4632,37 +4641,67 @@ bool llama_moe_hot_cbuf_out() {
     return mc && mc->cb_buf && mc->cb_out;
 }
 
-size_t llama_moe_hot_cbuf_release(const void * owner) {
+size_t llama_moe_hot_cbuf_release(const void * owner, size_t need) {
     moe_cache * mc = g_cache;
-    if (!mc || !mc->cb_buf || mc->cb_out) {
+    if (!mc || !mc->cb_buf) {
         return 0;
     }
     if (mc->adapt && owner != mc->owner) {
         return 0;
     }
+    // [TAG_FN_L20_BIGPROMPT_TAIL] need > 0: only the top of the tail, at least need bytes (whole mapped segments); a later
+    // call for more (need 0: the whole tail) gives back the rest. Already out at or below that offset: nothing to do
+    const size_t a    = llama_fn_cbuf_part_lo(mc->cb_lo, mc->cb_hi, mc->cb_seg, need);
+    const size_t prev = mc->cb_out ? mc->cb_rel : mc->cb_hi;
+    if (prev <= a) {
+        return 0;
+    }
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
     hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
+    // a layer is lent when any of its bytes lie at or above a minus one granule (a kernel that reads a little past a slot's
+    // end never reaches the range that goes out); the whole tail: every tail layer, as before
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(mc->cb_buf);
+    const size_t    lim  = a > mc->cb_lo + mc->cb_gran ? a - mc->cb_gran : mc->cb_lo;
+    std::vector<layer_state *> newly;
     for (auto & ls : mc->layers) {
-        if (ls.cb_tail) {
+        if (!ls.cb_tail || ls.cb_lent) {
+            continue;
+        }
+        size_t end = 0;
+        for (const ggml_tensor * t : { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c }) {
+            end = std::max(end, (size_t) ((const uint8_t *) t->data - base) + ggml_nbytes(t));
+        }
+        if (a == mc->cb_lo || end > lim) {
             ls.cb_lent = true;
+            newly.push_back(&ls);
         }
     }
     hot_drain_out(mc);
     mc->cb_async_left = 0; // the refill jobs not uploaded yet were dropped; their slots keep the expert for the next restore
-    for (auto & ls : mc->layers) {
-        if (ls.cb_lent) {
-            hot_write_tables(mc, ls);
-        }
+    for (layer_state * ls : newly) {
+        hot_write_tables(mc, *ls);
     }
-    const size_t bytes = mc->cb_hi - mc->cb_lo;
-    if (!mc->cb_unmap(mc->cb_buf, mc->cb_lo, bytes)) {
-        // nothing was given back: the tail layers stay out until the restore (which then maps nothing new)
+    const size_t bytes = prev - a;
+    const bool   more  = mc->cb_out;
+    if (!mc->cb_unmap(mc->cb_buf, a, bytes)) {
+        // nothing was given back: the lent layers stay out until the restore (which then maps nothing new)
         LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] the tail could not give its VRAM back - its layers sit out this prompt\n");
         mc->cb_out = true;
+        mc->cb_rel = std::min(prev, a);
         return 0;
     }
+    if (a > mc->cb_lo || more) {
+        mc->cb_n_part++;
+        if (mc->cb_n_part <= 3 || mc->cb_n_part % 64 == 0) {
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L20_BIGPROMPT_TAIL] tail release %" PRIu64 ": %.0f MiB %sfrom +%.0f MiB (%zu layers lent "
+                    "now, %.0f of %.0f MiB of the tail out, %.0f MiB asked)\n", mc->cb_n_part, bytes/1048576.0, more ? "more " : "",
+                    (a - mc->cb_lo)/1048576.0, newly.size(), (mc->cb_hi - a)/1048576.0, (mc->cb_hi - mc->cb_lo)/1048576.0,
+                    need/1048576.0);
+        }
+    }
     mc->cb_out = true;
+    mc->cb_rel = a;
     mc->cb_n_rel++;
     mc->cb_rel_ms += (ggml_time_us() - t0)/1000.0;
     return bytes;
@@ -4952,11 +4991,13 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     }
     const int64_t t0 = ggml_time_us();
-    const size_t  n  = mc->cb_hi - mc->cb_lo;
+    // [TAG_FN_L20_BIGPROMPT_TAIL] the part that is out: [cb_rel, cb_hi) (the whole tail unless a prompt took only its top)
+    const size_t  r0 = mc->cb_rel < mc->cb_hi && mc->cb_rel >= mc->cb_lo ? mc->cb_rel : mc->cb_lo;
+    const size_t  n  = mc->cb_hi - r0;
     // a failed release may have left a part mapped, and map() refuses a mapped range: give that back first (nothing
     // reads the tail while it is out; unmap skips what is not mapped)
-    (void) mc->cb_unmap(mc->cb_buf, mc->cb_lo, n);
-    if (!mc->cb_map(mc->cb_buf, mc->cb_lo, n)) {
+    (void) mc->cb_unmap(mc->cb_buf, r0, n);
+    if (!mc->cb_map(mc->cb_buf, r0, n)) {
         mc->cb_n_fail++;
         if (mc->cb_n_fail == 1 || mc->cb_n_fail % 64 == 0) {
             LLAMA_LOG_WARN("moe-hot: [TAG_FN_L3_VRAM_CBUF] mapping the tail again failed (%" PRIu64 " times): its layers stay "
@@ -4965,7 +5006,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         return false;
     }
     // fresh memory: zero slots, padding and empty slots read 0, then the resident experts come back
-    ggml_backend_tensor_memset(mc->cb_raw, 0, 0, ggml_nbytes(mc->cb_raw));
+    ggml_backend_tensor_memset(mc->cb_raw, 0, r0 - mc->cb_lo, n); // [TAG_FN_L20_BIGPROMPT_TAIL] the part mapped again
     size_t bytes = 0;
     const bool async = mc->adapt && mc->cb_async;
     if (async) {
@@ -4974,7 +5015,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         for (size_t li = 0; li < mc->layers.size(); ++li) {
             layer_state & ls = mc->layers[li];
-            if (!ls.cb_tail) {
+            if (!ls.cb_lent) { // [TAG_FN_L20_BIGPROMPT_TAIL] the lent tail layers (every tail layer after a whole release)
                 continue;
             }
             const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
@@ -5001,7 +5042,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
     } else {
         std::vector<refill_job> jobs;
         for (auto & ls : mc->layers) {
-            if (!ls.cb_tail) {
+            if (!ls.cb_lent) { // [TAG_FN_L20_BIGPROMPT_TAIL]
                 continue;
             }
             ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
@@ -5028,12 +5069,13 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
         bytes = hot_refill(mc, jobs, n_threads);
     }
     for (auto & ls : mc->layers) {
-        if (ls.cb_tail) {
+        if (ls.cb_lent) { // [TAG_FN_L20_BIGPROMPT_TAIL] (every tail layer after a whole release)
             ls.cb_lent = false;
             hot_write_tables(mc, ls);
         }
     }
     mc->cb_out = false;
+    mc->cb_rel = mc->cb_hi;
     if (async) {
         mc->wcv.notify_one();
     }

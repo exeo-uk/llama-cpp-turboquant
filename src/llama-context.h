@@ -67,6 +67,11 @@ struct llama_context {
     // [TAG_FN_L18_FIRSTANS_FIT] the caller's model and contexts are loaded and no request has come yet (a server that is
     // about to listen): with LLAMA_FN_L18_FIRSTANS_FIT the deferred hot set is sized now instead of in the first prompt
     void fn_ready();
+    // [TAG_FN_L20_BIGPROMPT_UB] the caller's prompt tokens after the next decode's batch (-1: not known), read once by it
+    void fn_prompt_after(int32_t n) { l20_prompt_after = n; }
+    // [TAG_FN_L20_BIGPROMPT_PLEPRE] the next prompt batch's tokens (with up to 16 before them for the n-gram context): their
+    // PLE rows are read ahead once this decode's first ubatch has its inputs
+    void fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first);
 
     void set_layer_inp_extract(bool enable);
 
@@ -525,7 +530,33 @@ private:
     void     cbuf_note_full();
     size_t   cbuf_prepare(ggml_backend_dev_t dev);
     void     cbuf_off();
-    bool     cbuf_set(bool full);
+    bool     cbuf_set(bool full, uint32_t width = 0);
+    // [TAG_FN_L20_BIGPROMPT_UB] LLAMA_FN_L20_BIGPROMPT_UB=<n> (qwen4exp profile lookup, 0 = off): with the compute-buffer lend,
+    // a target context whose -b and -ub are equal (>= 4096) takes n for both. A prompt whose batch or rest (the server's
+    // hint) is wider than the command's ubatch runs FULL at n tokens per ubatch (the hot set's whole tail lent); any other
+    // wide batch runs FULL at the command's width (only the tail's top part lent, l20_base_need bytes). The width is chosen
+    // at the switch to FULL and kept until SMALL. A narrow part of a prompt that goes on (hint > 0) keeps the FULL state.
+    uint32_t l20_base_ub      = 0;  // the command's n_ubatch (0: the switch is off or did not apply)
+    uint32_t cbuf_full_t      = 0;  // the width of the FULL reserve now (0: n_ubatch)
+    size_t   l20_base_need    = 0;  // tail bytes a FULL reserve at l20_base_ub needs given back
+    size_t   l20_full_base_b  = 0;
+    int32_t  l20_prompt_after = -1;
+    // [TAG_FN_L20_BIGPROMPT_PLEPRE] the pending read-ahead (empty toks: none)
+    llama_seq_id             l20_ple_seq   = -1;
+    llama_pos                l20_ple_pos0  = 0;
+    int32_t                  l20_ple_first = 0;
+    std::vector<llama_token> l20_ple_toks;
+    uint64_t                 l20_ple_n     = 0;
+    uint64_t l20_n_big = 0, l20_n_base = 0, l20_n_keep = 0;
+    // [TAG_FN_L20_BIGPROMPT_DFTUB] the MTP draft context with LLAMA_FN_L20_BIGPROMPT_DFTUB: n_ubatch = the wide width, but its
+    // compute reserve (and its ubatches) stay at dft_narrow (SPEC_DFT_UBATCH) except while the target runs a prompt at its
+    // big ubatch: the target's tail then also holds the draft's extra (l20_dft_extra, measured at the target's fit)
+    uint32_t dft_narrow    = 0;     // 0: no two widths
+    bool     dft_wide      = false;
+    uint64_t dft_n_wide    = 0;
+    size_t   l20_dft_extra = 0;     // the target: device bytes the draft's wide reserve adds
+    bool     dft_set_wide(bool wide);
+    llama_context * l20_draft() const;
     bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored);
     void     cbuf_retry_restore();
     void     cbuf_free_compute();
