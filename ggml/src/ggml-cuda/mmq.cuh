@@ -369,15 +369,29 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, has_ids, prec_src1));
 }
 
-static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const bool has_ids, const int cc, const int64_t ne11) {
+// [TAG_FN_L21_MMQ_YPAD] prec_src1 is passed through (upstream #30168: the host helpers used the Q8 config only)
+static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const bool has_ids, const int cc, const int64_t ne11,
+        const ggml_prec prec_src1 = GGML_PREC_Q8) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
     for (;ret > 0; ret -= 8) {
-        if (ggml_cuda_mmq_get_config(type, ret, fallback, has_ids, cc).type != GGML_TYPE_COUNT) {
+        if (ggml_cuda_mmq_get_config(type, ret, fallback, has_ids, cc, prec_src1).type != GGML_TYPE_COUNT) {
             return ret;
         }
     }
     return ret;
+}
+
+// [TAG_FN_L21_MMQ_YPAD] LLAMA_FN_L21_MMQ_YPAD (default 1; upstream #29953 + #30168): the q8_1 y buffer's padding in
+// block_q8_1_mmq units. The y tiles of the last K block read up to J - 1 columns past the last one, and the tile picker
+// (mul_mat_q_switch_J) rounds UP (J up to 128: 100 columns -> J = 104 / 112) while J_max rounds DOWN (0 below 8 columns,
+// 8 for 9). The padding is at least 128 blocks (~18 KiB), so no J the picker can choose reads past the buffer. Only the
+// allocation grows; the layout, the launch and the results are the same. 0 = J_max as before.
+static __host__ int64_t ggml_cuda_mmq_get_y_pad(const ggml_type type, const bool fallback, const bool has_ids, const int cc, const int64_t ne11,
+        const ggml_prec prec_src1) {
+    static const bool on = [] { const char * e = getenv("LLAMA_FN_L21_MMQ_YPAD"); return !(e && e[0] && atoi(e) == 0); }();
+    const int64_t j_max = ggml_cuda_mmq_get_J_max(type, fallback, has_ids, cc, ne11, on ? prec_src1 : GGML_PREC_Q8);
+    return on ? std::max<int64_t>(j_max, 128) : j_max;
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback, bool has_ids) {
