@@ -160,6 +160,7 @@ struct llama_moe_bridge {
     pool_run_t            pool_run            = nullptr;
     pool_park_t           pool_park           = nullptr;
     pool_park_t           pool_wake           = nullptr;
+    void               (* pool_where)(ggml_cpu_moe_pool *, const char *) = nullptr; // [TAG_FN_L22_POOLDIAG]
 
     // [TAG_FN_R2_BRIDGE_PF] next-layer prefetch (LLAMA_MOE_BRIDGE_PF=1, spin mode): after a layer's job the pool
     // predicts the next layer's experts from its router and pulls the cold ones into the CPU caches, while the device
@@ -814,6 +815,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     br->pool_run            = (pool_run_t)            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_run");
     br->pool_park           = (pool_park_t)           ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_park");
     br->pool_wake           = (pool_park_t)           ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_wake");
+    br->pool_where          = (void (*)(ggml_cpu_moe_pool *, const char *)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_where_dump");
     auto layer_supported    = (layer_supported_t)     ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_layer_supported");
     if (!br->pool_params_default || !br->pool_new || !br->pool_free || !br->pool_run || !br->pool_park || !br->pool_wake || !layer_supported) {
         return give_up("the CPU backend has no MoE pool");
@@ -1832,6 +1834,17 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     ggml_moe_bridge_stats s;
     br->fn_get_stats(br->gb, &s);
     const int il = s.error_chan >= 0 && s.error_chan < (int) br->chans.size() ? br->chans[s.error_chan].il : -1;
+    if (br->pool_where) { // [TAG_FN_L22_POOLDIAG] a no-op unless LLAMA_FN_L22_POOLDIAG
+        ggml_cpu_moe_pool * pool = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(br->mtx);
+            pool = br->pool;
+        }
+        char why[128];
+        snprintf(why, sizeof(why), "MoE bridge %d: %s at layer %d", br->bid,
+                err == GGML_MOE_BRIDGE_ERR_TIMEOUT ? "wait timeout" : "host job failed", il);
+        br->pool_where(pool, why);
+    }
     if (llama_fn_stall_on()) { // [TAG_FN_L18_FIRSTANS_STALL]
         char why[128];
         snprintf(why, sizeof(why), "MoE bridge %d: %s at layer %d", br->bid,

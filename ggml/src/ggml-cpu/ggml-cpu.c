@@ -2214,7 +2214,11 @@ struct ggml_fn_moe_ctx {
     int32_t *         df_gu;     // [TAG_FN_L4_MEM_POOLBAR] or NULL: per active expert, its gate / up pieces done
     int32_t *         df_dn;     // [TAG_FN_L4_MEM_POOLBAR] or NULL: per block of GGML_FN_MOE_PD down rows, its pieces done
     int64_t           np3;       // gate / up pieces per expert
+    volatile int64_t * wh;       // [TAG_FN_L22_POOLDIAG] or NULL: this thread's words
 };
+
+// [TAG_FN_L22_POOLDIAG]
+#define GGML_FN_MOE_WH(wh, i, v) do { if (wh) { (wh)[(i)] = (int64_t) (v); } } while (0)
 
 // [TAG_FN_L4_MEM_POOLBAR] the counters of a dataflow job: add returns the new value (acquire + release), load acquires
 static inline int32_t ggml_fn_moe_df_add(int32_t * w) {
@@ -2249,8 +2253,18 @@ static size_t ggml_fn_moe_piece_gu(const struct ggml_fn_moe_ctx * c, int kk, int
     float gv[GGML_CPU_FN_MR_MAX_NC*256];
     float uv[GGML_CPU_FN_MR_MAX_NC*256];
     float hv[256];
+    if (c->wh) { // [TAG_FN_L22_POOLDIAG]
+        c->wh[GGML_FN_MOE_WH_AT]   = ((int64_t) 0 << 48) | ((int64_t) kk << 24) | pp;
+        c->wh[GGML_FN_MOE_WH_AK]   = ((int64_t) ak[0] << 32) | (uint32_t) ak[2];
+        c->wh[GGML_FN_MOE_WH_AK1]  = (int64_t) (uintptr_t) wg_e;
+        c->wh[GGML_FN_MOE_WH_TICK] = (int64_t) ggml_fn_moe_tick();
+        c->wh[GGML_FN_MOE_WH_PIECES]++;
+    }
     for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
         const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+        if (c->wh) {
+            c->wh[GGML_FN_MOE_WH_DOTS]++;
+        }
         const void * cu[GGML_CPU_FN_MR_MAX_NC];
         const void * cg[GGML_CPU_FN_MR_MAX_NC];
         int32_t sl[GGML_CPU_FN_MR_MAX_NC];
@@ -2279,8 +2293,18 @@ static size_t ggml_fn_moe_piece_down(const struct ggml_fn_moe_ctx * c, int kk, i
     const int64_t nr = MIN(pd, c->n_embd - r0);
     const char * wd_e = (const char *) c->wd->data + (size_t) ak[0]*c->wd->nb[2] + (size_t) r0*c->wd->nb[1];
     float dv[GGML_CPU_FN_MR_MAX_NC*GGML_FN_MOE_PD];
+    if (c->wh) { // [TAG_FN_L22_POOLDIAG]
+        c->wh[GGML_FN_MOE_WH_AT]   = ((int64_t) 1 << 48) | ((int64_t) kk << 24) | pp;
+        c->wh[GGML_FN_MOE_WH_AK]   = ((int64_t) ak[0] << 32) | (uint32_t) ak[2];
+        c->wh[GGML_FN_MOE_WH_AK1]  = (int64_t) (uintptr_t) wd_e;
+        c->wh[GGML_FN_MOE_WH_TICK] = (int64_t) ggml_fn_moe_tick();
+        c->wh[GGML_FN_MOE_WH_PIECES]++;
+    }
     for (int j = 0; j < ak[2]; j += GGML_CPU_FN_MR_MAX_NC) {
         const int nc = MIN(GGML_CPU_FN_MR_MAX_NC, ak[2] - j);
+        if (c->wh) {
+            c->wh[GGML_FN_MOE_WH_DOTS]++;
+        }
         const void * cd[GGML_CPU_FN_MR_MAX_NC];
         int32_t sl[GGML_CPU_FN_MR_MAX_NC];
         for (int q = 0; q < nc; ++q) {
@@ -2339,6 +2363,7 @@ static size_t ggml_fn_moe_piece_dfl(const struct ggml_fn_moe_ctx * c, int phase,
     }
     const int32_t * g = c->df_gu + (size_t) kk*GGML_FN_MOE_DFLOW_STRIDE;
     if (ggml_fn_moe_df_load(g) < c->np3) {
+        GGML_FN_MOE_WH(c->wh, GGML_FN_MOE_WH_STAGE, 40 + kk*1000); // [TAG_FN_L22_POOLDIAG] waits for expert kk's gate / up
         const uint64_t t0 = ggml_fn_moe_tick();
         while (ggml_fn_moe_df_load(g) < c->np3) {
             ggml_thread_cpu_relax();
@@ -2455,6 +2480,7 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
     if (claim == NULL) {
         return;
     }
+    GGML_FN_MOE_WH(c->wh, GGML_FN_MOE_WH_STAGE, 20 + phase); // [TAG_FN_L22_POOLDIAG] stealing
 
     // then the free pieces of the other threads, from the end of their lists (their owners work from the front, where
     // their prefetched pieces are); every owner walks its whole list, so each piece is computed exactly once, and a
@@ -2495,6 +2521,16 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     uint64_t * ts = a->ts ? a->ts + (size_t) ith*GGML_FN_MOE_TS_N : NULL; // [TAG_FN_L3_CPU_STATS]
     if (ts) {
         ts[GGML_FN_MOE_TS_START] = ggml_fn_moe_tick();
+    }
+    volatile int64_t * wh = a->where ? a->where + (size_t) ith*GGML_FN_MOE_WH_N : NULL; // [TAG_FN_L22_POOLDIAG]
+    if (wh) {
+        wh[GGML_FN_MOE_WH_STAGE]  = 1;
+        wh[GGML_FN_MOE_WH_PIECES] = 0;
+        wh[GGML_FN_MOE_WH_DOTS]   = 0;
+        wh[GGML_FN_MOE_WH_AT]     = -1;
+        wh[GGML_FN_MOE_WH_TN]     = ((int64_t) a->n_tokens << 32) | (uint32_t) a->n_used;
+        wh[GGML_FN_MOE_WH_EPOCH]  = a->epoch;
+        wh[GGML_FN_MOE_WH_TICK]   = (int64_t) ggml_fn_moe_tick();
     }
 
     const int64_t n_embd = wu->ne[0];
@@ -2555,6 +2591,7 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     }
 
     // 2. routing: the (slot, token) entries computed here, grouped by expert in expert order (counting sort)
+    int64_t n_skip1 = 0, n_skip2 = 0; // [TAG_FN_L22_POOLDIAG]
     memset(cnt, 0, sizeof(int32_t)*(size_t) (n_exp + 1));
     for (int t = 0; t < T; ++t) {
         for (int slot = 0; slot < n_used; ++slot) {
@@ -2562,6 +2599,8 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
             GGML_ASSERT(e >= 0 && e < n_exp);
             if (!GGML_FN_MOE_SKIP(e)) {
                 cnt[e + 1]++;
+            } else {
+                n_skip1++;
             }
         }
     }
@@ -2580,6 +2619,8 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
             const int32_t e = GGML_FN_MOE_ID(slot, t);
             if (!GGML_FN_MOE_SKIP(e)) {
                 ent[cnt[e]++] = slot + n_used*t;
+            } else {
+                n_skip2++;
             }
         }
     }
@@ -2650,7 +2691,18 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     c.df_gu  = dfl ? a->dflow : NULL;
     c.df_dn  = dfl && a->w ? a->dflow + (size_t) n_used*T*GGML_FN_MOE_DFLOW_STRIDE : NULL;
     c.np3    = (n_ff + c.pr - 1)/c.pr;
+    c.wh     = wh;
     GGML_ASSERT(c.pr <= 256);
+    if (wh) { // [TAG_FN_L22_POOLDIAG]
+        int64_t asum = 0;
+        for (int kk = 0; kk < n_act; ++kk) {
+            asum += (int64_t) (kk + 1)*act[3*kk];
+        }
+        wh[GGML_FN_MOE_WH_NACT]  = ((int64_t) nth << 32) | (uint32_t) n_act;
+        wh[GGML_FN_MOE_WH_SKIP]  = (n_skip1 << 32) | n_skip2;
+        wh[GGML_FN_MOE_WH_ASUM]  = asum;
+        wh[GGML_FN_MOE_WH_STAGE] = 2;
+    }
 
     uint64_t acc[4] = { 0, 0, 0, 0 };
 
@@ -2661,8 +2713,10 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     }
 
     if (!dfl) {
+        GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 3); // [TAG_FN_L22_POOLDIAG] barrier 1
         barrier(barrier_ctx);
     }
+    GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 4);
     if (ts) {
         ts[GGML_FN_MOE_TS_B1] = ggml_fn_moe_tick();
     }
@@ -2695,7 +2749,9 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
 
     // 5. weighted sum over the slots computed here, in slot order
     if (a->w && !dfl) {
+        GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 5); // [TAG_FN_L22_POOLDIAG] barrier 2
         barrier(barrier_ctx);
+        GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 6);
         if (ts) {
             ts[GGML_FN_MOE_TS_B2] = ggml_fn_moe_tick();
         }
@@ -2723,6 +2779,7 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
         ts[GGML_FN_MOE_TS_NACT]  = (uint64_t) n_act;
         ts[GGML_FN_MOE_TS_END]   = ggml_fn_moe_tick();
     }
+    GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 9); // [TAG_FN_L22_POOLDIAG] done
 
 #undef GGML_FN_MOE_ID
 #undef GGML_FN_MOE_SKIP

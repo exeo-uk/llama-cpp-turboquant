@@ -76,6 +76,28 @@ struct ggml_fn_moe_args {
     int32_t *       dflow;              // [TAG_FN_L4_MEM_POOLBAR] or NULL: ggml_fn_moe_dflow_words() words, zero at the job's
                                         // start. No barrier: a down piece waits for its expert's gate / up pieces, and the
                                         // thread that ends a block of down rows sums it (weighted mode). Same values.
+    volatile int64_t * where;           // [TAG_FN_L22_POOLDIAG] or NULL: GGML_FN_MOE_WH_N words per thread (where + ith*N)
+};
+
+// [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: the "where am I" words of each thread of a pool job
+enum {
+    GGML_FN_MOE_WH_SEQ    = 0,  // the pool's post number of the job
+    GGML_FN_MOE_WH_STAGE  = 1,  // see ggml_fn_moe_compute / moe-pool.cpp
+    GGML_FN_MOE_WH_NACT   = 2,  // nth << 32 | n_act
+    GGML_FN_MOE_WH_PIECES = 3,  // pieces computed in this job
+    GGML_FN_MOE_WH_DOTS   = 4,  // dot groups computed in this job
+    GGML_FN_MOE_WH_AT     = 5,  // phase << 48 | kk << 24 | pp of the current piece
+    GGML_FN_MOE_WH_AK     = 6,  // expert << 32 | entries of the current piece
+    GGML_FN_MOE_WH_AK1    = 7,  // first entry of the current piece
+    GGML_FN_MOE_WH_TICK   = 8,  // tick of the last stage change / piece start
+    GGML_FN_MOE_WH_BAR    = 9,  // barrier: gen seen << 32 | arrival index
+    GGML_FN_MOE_WH_TN     = 10, // n_tokens << 32 | n_used
+    GGML_FN_MOE_WH_SKIP   = 11, // entries skipped (table) in the count pass << 32 | in the fill pass
+    GGML_FN_MOE_WH_EPOCH  = 12, // claim epoch
+    GGML_FN_MOE_WH_BTICK  = 13, // tick of the barrier arrival
+    GGML_FN_MOE_WH_KIND   = 14, // job kind << 32 | worker index
+    GGML_FN_MOE_WH_ASUM   = 15, // sum of (kk + 1) * expert over the act list (threads must agree)
+    GGML_FN_MOE_WH_N      = 16,
 };
 
 // [TAG_FN_L4_MEM_POOLBAR] one dataflow counter per cache line

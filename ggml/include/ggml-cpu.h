@@ -240,6 +240,8 @@ extern "C" {
     // [TAG_MOE_BRIDGE] park: idle workers sleep now instead of spinning (other CPU work is about to run on their
     // cores); wake: sleeping workers spin again for spin_us (a job is about to come). A job un-parks the pool.
     GGML_BACKEND_API void                           ggml_cpu_moe_pool_park(struct ggml_cpu_moe_pool * pool);
+    // [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: log where every pool thread is (from any thread; no-op otherwise)
+    GGML_BACKEND_API void                           ggml_cpu_moe_pool_where_dump(struct ggml_cpu_moe_pool * pool, const char * why);
     GGML_BACKEND_API void                           ggml_cpu_moe_pool_wake(struct ggml_cpu_moe_pool * pool);
     // [TAG_MOE_BRIDGE] true if ggml_cpu_moe_run takes jobs of this layer (weight types and shapes)
     GGML_BACKEND_API bool                           ggml_cpu_moe_layer_supported(const struct ggml_cpu_moe_layer * layer);

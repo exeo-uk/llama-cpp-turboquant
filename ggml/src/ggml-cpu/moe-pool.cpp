@@ -450,7 +450,83 @@ struct ggml_cpu_moe_pool {
     bool                    st_pf_pending = false;
     bool                    st_pf_stopped = false;
     uint64_t                st_pf_stop_t  = 0;     // ticks the caller waited for the stopped prefetch
+
+    // [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: GGML_FN_MOE_WH_N words per worker (0: the caller), dumped once a wait of
+    // a job passes 200 ms (and again at 700 ms)
+    bool                    where_on = false;
+    std::vector<int64_t>    where_buf;
+    volatile int64_t *      where = nullptr;
+    std::atomic<int64_t>    where_last{-1};
+    uint64_t                where_t_post = 0;  // tick of the last post
+    uint64_t                where_f_post = 0;  // process page faults at the last post
+#if defined(_WIN32)
+    std::vector<HANDLE>     where_th;          // per worker (0: the caller), for GetThreadTimes
+#endif
 };
+
+// [TAG_FN_L22_POOLDIAG]
+static thread_local int moe_tl_slot = 0;
+
+static void moe_pool_where_dump(ggml_cpu_moe_pool * p, const char * who, int level, uint64_t waited) {
+    const uint64_t now = ggml_fn_moe_tick();
+    const double   tpm = p->tick_per_us*1000.0;
+    GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG] dump %d by %s (slot %d, waited %.1f ms): seq %u kind %d solo %d n_threads %d "
+            "n_done %d bar %d/%d pf_bar %d/%d pf_inflight %d pf_stop %d pf_given %d pf_n %d epoch %u parked %d sleeping %d\n",
+            level, who, moe_tl_slot, waited/tpm, p->seq.load(), p->kind.load(), (int) p->solo, p->n_threads, p->n_done.load(),
+            p->bar_count.load(), p->bar_gen.load(), p->pf_bar_count.load(), p->pf_bar_gen.load(), (int) p->pf_inflight,
+            (int) p->pf_stop, (int) p->pf_given, p->pf_n, p->epoch, (int) p->parked.load(), p->n_sleeping.load());
+    for (int k = 0; k < p->n_threads; ++k) {
+        const volatile int64_t * w = p->where + (size_t) k*GGML_FN_MOE_WH_N;
+        const int64_t at = w[GGML_FN_MOE_WH_AT];
+        GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG]   slot %2d: kind %d seq %lld stage %lld nth %d n_act %d pieces %lld dots %lld "
+                "at %lld/%lld/%lld ak e%lld n%lld f%lld age %.1f ms bar gen %lld idx %lld age %.1f ms T %lld used %lld skip %lld/%lld "
+                "epoch %lld asum %lld\n", k, (int) (w[GGML_FN_MOE_WH_KIND] >> 32), (long long) w[GGML_FN_MOE_WH_SEQ],
+                (long long) w[GGML_FN_MOE_WH_STAGE], (int) (w[GGML_FN_MOE_WH_NACT] >> 32), (int) (uint32_t) w[GGML_FN_MOE_WH_NACT],
+                (long long) w[GGML_FN_MOE_WH_PIECES], (long long) w[GGML_FN_MOE_WH_DOTS],
+                at < 0 ? -1LL : (long long) (at >> 48), at < 0 ? -1LL : (long long) ((at >> 24) & 0xffffff), at < 0 ? -1LL : (long long) (at & 0xffffff),
+                (long long) (w[GGML_FN_MOE_WH_AK] >> 32), (long long) (uint32_t) w[GGML_FN_MOE_WH_AK], (long long) w[GGML_FN_MOE_WH_AK1],
+                w[GGML_FN_MOE_WH_TICK] ? (now - (uint64_t) w[GGML_FN_MOE_WH_TICK])/tpm : -1.0,
+                (long long) (w[GGML_FN_MOE_WH_BAR] >> 32), (long long) (uint32_t) w[GGML_FN_MOE_WH_BAR],
+                w[GGML_FN_MOE_WH_BTICK] ? (now - (uint64_t) w[GGML_FN_MOE_WH_BTICK])/tpm : -1.0,
+                (long long) (w[GGML_FN_MOE_WH_TN] >> 32), (long long) (uint32_t) w[GGML_FN_MOE_WH_TN],
+                (long long) (w[GGML_FN_MOE_WH_SKIP] >> 32), (long long) (uint32_t) w[GGML_FN_MOE_WH_SKIP],
+                (long long) w[GGML_FN_MOE_WH_EPOCH], (long long) w[GGML_FN_MOE_WH_ASUM]);
+    }
+}
+
+// [TAG_FN_L22_POOLDIAG] a spinning wait of the pool: dumps the words once it passes 200 ms, and again at 700 ms
+struct moe_spin_watch {
+    ggml_cpu_moe_pool * p;
+    const char *        who;
+    uint64_t            t0 = 0;
+    uint32_t            n  = 0;
+    int                 level = 0;
+    moe_spin_watch(ggml_cpu_moe_pool * p_, const char * who_) : p(p_), who(who_) {
+        if (p->where_on) {
+            t0 = ggml_fn_moe_tick();
+        }
+    }
+    inline void step() {
+        if (!p->where_on || (++n & 0x3fff) != 0 || level >= 2) {
+            return;
+        }
+        const uint64_t w = ggml_fn_moe_tick() - t0;
+        if ((double) w < (level == 0 ? 200.0 : 700.0)*1000.0*p->tick_per_us) {
+            return;
+        }
+        level++;
+        const int64_t key = (int64_t) p->seq.load(std::memory_order_relaxed)*4 + level;
+        if (p->where_last.exchange(key) != key) {
+            moe_pool_where_dump(p, who, level, w);
+        }
+    }
+};
+
+static inline void moe_pool_where_set(ggml_cpu_moe_pool * p, int i, int64_t v) {
+    if (p->where) {
+        p->where[(size_t) moe_tl_slot*GGML_FN_MOE_WH_N + i] = v;
+    }
+}
 
 static void moe_pool_barrier(void * ctx) {
     auto * p = (ggml_cpu_moe_pool *) ctx;
@@ -458,13 +534,20 @@ static void moe_pool_barrier(void * ctx) {
         return;
     }
     const int gen = p->bar_gen.load(std::memory_order_acquire);
-    if (p->bar_count.fetch_add(1, std::memory_order_acq_rel) == p->n_threads - 1) {
+    const int idx = p->bar_count.fetch_add(1, std::memory_order_acq_rel);
+    if (p->where) { // [TAG_FN_L22_POOLDIAG]
+        moe_pool_where_set(p, GGML_FN_MOE_WH_BAR, ((int64_t) gen << 32) | (uint32_t) idx);
+        moe_pool_where_set(p, GGML_FN_MOE_WH_BTICK, (int64_t) ggml_fn_moe_tick());
+    }
+    if (idx == p->n_threads - 1) {
         p->bar_count.store(0, std::memory_order_relaxed);
         p->bar_gen.fetch_add(1, std::memory_order_acq_rel);
         return;
     }
+    moe_spin_watch sw(p, "barrier");
     while (p->bar_gen.load(std::memory_order_acquire) == gen) {
         moe_pool_relax();
+        sw.step();
     }
 }
 
@@ -474,13 +557,20 @@ static void moe_pool_pf_barrier(ggml_cpu_moe_pool * p, int nw) {
         return;
     }
     const int gen = p->pf_bar_gen.load(std::memory_order_acquire);
-    if (p->pf_bar_count.fetch_add(1, std::memory_order_acq_rel) == nw - 1) {
+    const int idx = p->pf_bar_count.fetch_add(1, std::memory_order_acq_rel);
+    if (p->where) { // [TAG_FN_L22_POOLDIAG]
+        moe_pool_where_set(p, GGML_FN_MOE_WH_BAR, ((int64_t) (gen | 0x40000000) << 32) | (uint32_t) idx);
+        moe_pool_where_set(p, GGML_FN_MOE_WH_BTICK, (int64_t) ggml_fn_moe_tick());
+    }
+    if (idx == nw - 1) {
         p->pf_bar_count.store(0, std::memory_order_relaxed);
         p->pf_bar_gen.fetch_add(1, std::memory_order_acq_rel);
         return;
     }
+    moe_spin_watch sw(p, "pf_barrier");
     while (p->pf_bar_gen.load(std::memory_order_acquire) == gen) {
         moe_pool_relax();
+        sw.step();
     }
 }
 
@@ -603,6 +693,7 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
     if (rec) {
         rec->t0 = rec->t1 = ggml_fn_moe_tick();
     }
+    moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, p->pf_given ? 34 : 30); // [TAG_FN_L22_POOLDIAG]
     if (p->pf_given) {
         moe_pool_prefetch_pull(p, ith, rec); // [TAG_FN_L3_CPU_DEVPRED] the caller ranked the given list: no router, no barrier
         return;
@@ -621,7 +712,9 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
             }
         }
     }
+    moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, 31); // [TAG_FN_L22_POOLDIAG]
     moe_pool_pf_barrier(p, nw);
+    moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, 32);
 
     if (w == 0) {
         int n = 0;
@@ -664,7 +757,9 @@ static void moe_pool_prefetch_part(ggml_cpu_moe_pool * p, int ith) {
         p->pf_experts.fetch_add((uint64_t) n, std::memory_order_relaxed);
         p->pf_list_gen.store(p->pf_gen, std::memory_order_release); // [TAG_FN_L3_HOST_EXEC] the caller may read the list
     }
+    moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, 33); // [TAG_FN_L22_POOLDIAG]
     moe_pool_pf_barrier(p, nw);
+    moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, 34);
     if (rec) {
         rec->t1 = ggml_fn_moe_tick();
     }
@@ -684,8 +779,10 @@ static void moe_pool_prefetch_finish(ggml_cpu_moe_pool * p) {
         p->pf_stop = 1;
         stopped = true;
         p->pf_stopped.fetch_add(1, std::memory_order_relaxed);
+        moe_spin_watch sw(p, "prefetch_finish"); // [TAG_FN_L22_POOLDIAG]
         while (p->n_done.load(std::memory_order_acquire) != p->n_threads - 1) {
             moe_pool_relax();
+            sw.step();
         }
         t_stop = p->stats ? ggml_fn_moe_tick() - t0 : 0;
     }
@@ -757,6 +854,12 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
     }
     set_current_thread_prio(p->prio);
     moe_pool_name_thread(ith); // [TAG_FN_L18_FIRSTANS_STALL]
+    moe_tl_slot = ith;         // [TAG_FN_L22_POOLDIAG]
+#if defined(_WIN32)
+    if (p->where_on) {
+        p->where_th[ith] = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+    }
+#endif
 
     uint32_t last = 0;
     for (;;) {
@@ -800,6 +903,11 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
         }
         last = s;
         const int kind = p->kind.load(std::memory_order_acquire);
+        if (p->where) { // [TAG_FN_L22_POOLDIAG]
+            moe_pool_where_set(p, GGML_FN_MOE_WH_SEQ, s);
+            moe_pool_where_set(p, GGML_FN_MOE_WH_KIND, ((int64_t) kind << 32) | (uint32_t) ith);
+            moe_pool_where_set(p, GGML_FN_MOE_WH_TICK, (int64_t) ggml_fn_moe_tick());
+        }
         if (kind == 1) { // [TAG_FN_R2_BRIDGE_PF]
             moe_pool_prefetch_part(p, ith);
         } else if (kind == 2) {
@@ -807,6 +915,7 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
         } else {
             ggml_fn_moe_compute(&p->args, ith, p->n_threads, moe_pool_barrier, p);
         }
+        moe_pool_where_set(p, GGML_FN_MOE_WH_STAGE, 99); // [TAG_FN_L22_POOLDIAG] left the job
         p->n_done.fetch_add(1, std::memory_order_acq_rel);
     }
 }
@@ -891,6 +1000,29 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
             pin_current_thread(list[0]);
         }
         set_current_thread_prio(p->prio);
+    }
+    { // [TAG_FN_L22_POOLDIAG]
+        const char * e = getenv("LLAMA_FN_L22_POOLDIAG");
+        p->where_on = e != nullptr && atoi(e) > 0;
+        if (p->where_on) {
+            p->where_buf.assign((size_t) (p->n_threads + 1)*GGML_FN_MOE_WH_N, 0);
+            int64_t * w = p->where_buf.data();
+            w += ((64 - ((uintptr_t) w & 63)) & 63)/sizeof(int64_t);
+            p->where = w;
+#if defined(_WIN32)
+            p->where_th.assign((size_t) p->n_threads, nullptr);
+            p->where_th[0] = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId()); // the caller
+#endif
+            GGML_LOG_INFO("%s: [TAG_FN_L22_POOLDIAG] the pool's waits dump every thread's position after 200 ms\n", __func__);
+        }
+    }
+    if (p->stats || p->where_on) {
+        const auto     t0 = std::chrono::steady_clock::now();
+        const uint64_t k0 = ggml_fn_moe_tick();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const uint64_t k1 = ggml_fn_moe_tick();
+        const double   us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        p->tick_per_us = us > 0.0 && k1 > k0 ? (double) (k1 - k0)/us : 1.0;
     }
     if (p->stats) { // [TAG_FN_L3_CPU_STATS]
         p->ts.resize(p->n_threads);
@@ -1097,6 +1229,12 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
 
     const bool solo = p->solo && p->n_threads >= 2; // [TAG_FN_R2_BRIDGE_PF]
     const int  nth  = solo ? p->n_threads - 1 : p->n_threads;
+    if (p->where) { // [TAG_FN_L22_POOLDIAG] slot k = worker k (0: this thread)
+        a.where = p->where + (solo ? GGML_FN_MOE_WH_N : 0);
+        p->where[GGML_FN_MOE_WH_SEQ]   = (int64_t) p->seq.load(std::memory_order_relaxed) + 1;
+        p->where[GGML_FN_MOE_WH_KIND]  = (int64_t) (solo ? 2 : 0) << 32;
+        p->where[GGML_FN_MOE_WH_STAGE] = solo ? 50 : 1;
+    }
 
     // [TAG_FN_L3_CPU_SPLIT] the split, the claim words of a stealing job, and the last prefetch's order when it
     // predicted this layer
@@ -1170,6 +1308,10 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     }
 
     const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
+    if (p->where) { // [TAG_FN_L22_POOLDIAG]
+        p->where_t_post = ggml_fn_moe_tick();
+        p->where_f_post = moe_proc_faults();
+    }
     const uint64_t t_pub = p->stats ? ggml_fn_moe_tick() : 0;
     p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
     p->n_done.store(0, std::memory_order_relaxed);
@@ -1186,8 +1328,13 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         ggml_fn_moe_compute(&a, 0, p->n_threads, moe_pool_barrier, p);
     }
 
+    moe_spin_watch sw(p, "job n_done"); // [TAG_FN_L22_POOLDIAG]
     while (p->n_done.load(std::memory_order_acquire) != p->n_threads - 1) {
         moe_pool_relax();
+        sw.step();
+    }
+    if (p->where) {
+        p->where[GGML_FN_MOE_WH_STAGE] = 99;
     }
     if (score_learn) {
         moe_pool_score_learn(p, l, job->ids, n_used*T, l->up->ne[2]);
@@ -1304,6 +1451,117 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
     }
     p->pf_inflight = true;
     return GGML_STATUS_SUCCESS;
+}
+
+// [TAG_FN_L22_POOLDIAG] from another thread (the bridge's wait timeout): every thread's position, then its progress, user
+// and kernel time and the process's page faults over the next 50 ms
+void ggml_cpu_moe_pool_where_dump(struct ggml_cpu_moe_pool * p, const char * why) {
+    if (p == nullptr || p->where == nullptr) {
+        return;
+    }
+    const int n = p->n_threads;
+    std::vector<int64_t> pc0(n), dt0(n);
+    std::vector<uint64_t> k0(n, 0), u0(n, 0);
+#if defined(_WIN32)
+    auto times = [&](int k, uint64_t & kt, uint64_t & ut) {
+        FILETIME c, e, kf, uf;
+        kt = ut = 0;
+        if (k < (int) p->where_th.size() && p->where_th[k] && GetThreadTimes(p->where_th[k], &c, &e, &kf, &uf)) {
+            kt = ((uint64_t) kf.dwHighDateTime << 32) | kf.dwLowDateTime;
+            ut = ((uint64_t) uf.dwHighDateTime << 32) | uf.dwLowDateTime;
+        }
+    };
+#else
+    auto times = [&](int, uint64_t & kt, uint64_t & ut) { kt = ut = 0; };
+#endif
+    const uint64_t f0 = moe_proc_faults();
+    const uint64_t t0 = ggml_fn_moe_tick();
+    for (int k = 0; k < n; ++k) {
+        pc0[k] = p->where[(size_t) k*GGML_FN_MOE_WH_N + GGML_FN_MOE_WH_PIECES];
+        dt0[k] = p->where[(size_t) k*GGML_FN_MOE_WH_N + GGML_FN_MOE_WH_DOTS];
+        times(k, k0[k], u0[k]);
+    }
+    GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG] %s: the last post was %.1f ms ago, %llu page faults since\n", why,
+            (t0 - p->where_t_post)/(p->tick_per_us*1000.0), (unsigned long long) (f0 - p->where_f_post));
+    moe_pool_where_dump(p, "the bridge", 3, 0);
+#if defined(_WIN32)
+    {
+        // the weight pages the threads that have sat in one piece for > 100 ms read: their state, and how long this thread
+        // takes to read their first byte
+        PERFORMANCE_INFORMATION pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.cb = sizeof(pi);
+        PROCESS_MEMORY_COUNTERS pmc;
+        memset(&pmc, 0, sizeof(pmc));
+        pmc.cb = sizeof(pmc);
+        if (K32GetPerformanceInfo(&pi, sizeof(pi)) && K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+            GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG]   memory: avail %.2f GiB, system cache %.2f GiB, commit %.2f / %.2f GiB, "
+                    "ws %.2f GiB (peak %.2f), pagefile %.2f GiB, faults %lu\n", pi.PhysicalAvailable*(double) pi.PageSize/1073741824.0,
+                    pi.SystemCache*(double) pi.PageSize/1073741824.0, pi.CommitTotal*(double) pi.PageSize/1073741824.0,
+                    pi.CommitLimit*(double) pi.PageSize/1073741824.0, pmc.WorkingSetSize/1073741824.0,
+                    pmc.PeakWorkingSetSize/1073741824.0, pmc.PagefileUsage/1073741824.0, (unsigned long) pmc.PageFaultCount);
+        }
+        uintptr_t seen[4] = { 0, 0, 0, 0 };
+        int n_seen = 0;
+        for (int k = 0; k < n && n_seen < 4; ++k) {
+            const volatile int64_t * w = p->where + (size_t) k*GGML_FN_MOE_WH_N;
+            const uintptr_t a = (uintptr_t) w[GGML_FN_MOE_WH_AK1];
+            const bool stuck = w[GGML_FN_MOE_WH_STAGE] != 99 && w[GGML_FN_MOE_WH_TICK] &&
+                    (t0 - (uint64_t) w[GGML_FN_MOE_WH_TICK]) > 100.0*1000.0*p->tick_per_us;
+            if (!stuck || a < 65536) {
+                continue;
+            }
+            bool dup = false;
+            for (int i = 0; i < n_seen; ++i) {
+                dup = dup || (seen[i] >> 21) == (a >> 21);
+            }
+            if (dup) {
+                continue;
+            }
+            seen[n_seen++] = a;
+            PSAPI_WORKING_SET_EX_INFORMATION wi[8];
+            const uintptr_t pg = a & ~(uintptr_t) 4095;
+            for (int i = 0; i < 8; ++i) {
+                memset(&wi[i], 0, sizeof(wi[i]));
+                wi[i].VirtualAddress = (void *) (pg + (uintptr_t) i*4096);
+            }
+            const bool q0 = K32QueryWorkingSetEx(GetCurrentProcess(), wi, sizeof(wi)) != 0;
+            char st0[8*24];
+            int o = 0;
+            for (int i = 0; i < 8 && q0; ++i) {
+                o += snprintf(st0 + o, sizeof(st0) - o, " %llx", (unsigned long long) wi[i].VirtualAttributes.Flags);
+            }
+            MEMORY_BASIC_INFORMATION mbi;
+            memset(&mbi, 0, sizeof(mbi));
+            VirtualQuery((void *) pg, &mbi, sizeof(mbi));
+            const uint64_t r0 = ggml_fn_moe_tick();
+            const char v = *(const volatile char *) pg;
+            const uint64_t r1 = ggml_fn_moe_tick();
+            const bool q1 = K32QueryWorkingSetEx(GetCurrentProcess(), wi, sizeof(wi)) != 0;
+            char st1[8*24];
+            o = 0;
+            for (int i = 0; i < 8 && q1; ++i) {
+                o += snprintf(st1 + o, sizeof(st1) - o, " %llx", (unsigned long long) wi[i].VirtualAttributes.Flags);
+            }
+            GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG]   slot %2d reads %p (region %p type %lx prot %lx state %lx): ws-ex before%s; "
+                    "this thread read it in %.3f ms (%d); after%s\n", k, (void *) a, mbi.AllocationBase, (unsigned long) mbi.Type,
+                    (unsigned long) mbi.Protect, (unsigned long) mbi.State, q0 ? st0 : " ?", (r1 - r0)/(p->tick_per_us*1000.0), (int) v,
+                    q1 ? st1 : " ?");
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const uint64_t f1 = moe_proc_faults();
+    const double   ms = (ggml_fn_moe_tick() - t0)/(p->tick_per_us*1000.0);
+    for (int k = 0; k < n; ++k) {
+        uint64_t k1 = 0, u1 = 0;
+        times(k, k1, u1);
+        GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG]   slot %2d over %.1f ms: pieces +%lld dots +%lld, stage %lld, user %.1f ms kernel %.1f ms\n",
+                k, ms, (long long) (p->where[(size_t) k*GGML_FN_MOE_WH_N + GGML_FN_MOE_WH_PIECES] - pc0[k]),
+                (long long) (p->where[(size_t) k*GGML_FN_MOE_WH_N + GGML_FN_MOE_WH_DOTS] - dt0[k]),
+                (long long) p->where[(size_t) k*GGML_FN_MOE_WH_N + GGML_FN_MOE_WH_STAGE], (u1 - u0[k])/1e4, (k1 - k0[k])/1e4);
+    }
+    GGML_LOG_WARN("moe_pool [TAG_FN_L22_POOLDIAG]   process page faults over %.1f ms: %llu\n", ms, (unsigned long long) (f1 - f0));
 }
 
 void ggml_cpu_moe_prefetch_stop(struct ggml_cpu_moe_pool * p) {

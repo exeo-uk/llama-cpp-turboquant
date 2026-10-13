@@ -803,6 +803,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_pool_park") == 0) {
         return (void *)ggml_cpu_moe_pool_park;
     }
+    if (strcmp(name, "ggml_cpu_moe_pool_where_dump") == 0) { // [TAG_FN_L22_POOLDIAG]
+        return (void *)ggml_cpu_moe_pool_where_dump;
+    }
     if (strcmp(name, "ggml_cpu_moe_pool_wake") == 0) {
         return (void *)ggml_cpu_moe_pool_wake;
     }
