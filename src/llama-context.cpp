@@ -6668,8 +6668,8 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] compute reserve FULL %.0f MiB (ubatch %u), SMALL %.0f MiB (<= %u tokens): the hot "
             "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB + %.0f MiB slack)\n", __func__,
-            full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib,
-            cbuf_slack_b/MiB);
+            full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (tail_full - small)/MiB, cbuf_pool_mib,
+            (l21_extra > 0 ? tail_extra : cbuf_slack_b)/MiB); // [TAG_FN_L21_BIGUB] the tail of the command's width
     return tail;
 }
 
