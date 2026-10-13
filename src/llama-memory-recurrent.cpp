@@ -397,6 +397,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // [TAG_FN_L21_RS_SHARED_RM] LLAMA_FN_L21_RS_SHARED_RM (default 1, every model; upstream #29928): a cell shared
+                // by several sequences (copy_prompt_to / copy_state_to share the tail until the next decode) cannot move back
+                // for one of them - the position and the rollback moved every sharer's state. The caller re-reads instead.
+                static const bool l21_shared_rm = [] { const char * e = getenv("LLAMA_FN_L21_RS_SHARED_RM"); return !(e && e[0] && atoi(e) == 0); }();
+                if (l21_shared_rm && cell.seq_id.size() > 1) {
+                    return false;
+                }
                 // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
                 if (is_empty()) {
                     cell.pos = p0 - 1;
