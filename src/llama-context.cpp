@@ -3321,6 +3321,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // [TAG_FN_L21_REUSE_SYNC] LLAMA_FN_L21_REUSE_SYNC (default 0, a diagnostic arm; upstream #28058 draft): 1 = wait for
+        // the scheduler before set_inputs when the graph is reused (not only with pipeline parallelism: a reused graph's
+        // input tensors are the ones the previous async compute may still read), 2 = before every set_inputs. Tests whether
+        // the timing part of the collapse (a sync after every ubatch cured it) is an input overwrite. ~10-30 us per sync.
+        {
+            static const int l21_reuse_sync = [] { const char * e = getenv("LLAMA_FN_L21_REUSE_SYNC"); return e && e[0] ? atoi(e) : 0; }();
+            if (l21_reuse_sync >= 2 || (l21_reuse_sync == 1 && graph_reused)) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
