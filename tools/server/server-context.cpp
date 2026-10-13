@@ -4425,8 +4425,7 @@ private:
         // [TAG_FN_L21_NANGUARD] a draft of the previous task saw non-finite logits: rebuild from token 0
         if (slot.nf_drop) {
             slot.nf_drop = false;
-            SLT_WRN(slot, "%s", "[TAG_FN_L21_NANGUARD] the last answer's draft saw non-finite logits: the cache is dropped
-");
+            SLT_WRN(slot, "%s", "[TAG_FN_L21_NANGUARD] the last answer's draft saw non-finite logits: the cache is dropped\n");
             slot.prompt_clear();
         }
         // process per-request lora adapters
@@ -4768,8 +4767,7 @@ private:
         const bool retry = first && slot.task && slot.nf_retry_task != slot.task->id;
         if (n_ev <= 8) {
             SLT_WRN(slot, "[TAG_FN_L21_NANGUARD] non-finite target logits (%s, batch row %d, %d tokens in the slot, %d generated, "
-                    "event %d): cache dropped, %s
-", where, row, (int) slot.prompt.tokens.size(), (int) slot.stats.n_gen, n_ev,
+                    "event %d): cache dropped, %s\n", where, row, (int) slot.prompt.tokens.size(), (int) slot.stats.n_gen, n_ev,
                     retry ? "re-reading the prompt once" : "the request ends with an error");
         }
         slot.prompt_clear();

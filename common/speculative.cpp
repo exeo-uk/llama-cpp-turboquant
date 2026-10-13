@@ -4799,8 +4799,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     n_drafting--;
                     static std::atomic<int> n_nf_log{0};
                     if (n_nf_log.fetch_add(1) < 4) {
-                        LOG_WRN("[TAG_FN_L21_NANGUARD] MTP draft: non-finite logits (seq %d, draft row %d, batch row %d): drafts off for this request
-",
+                        LOG_WRN("[TAG_FN_L21_NANGUARD] MTP draft: non-finite logits (seq %d, draft row %d, batch row %d): drafts off for this request\n",
                                 seq_id, i, i_last[seq_id]);
                     }
                     continue;
