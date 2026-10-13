@@ -1410,7 +1410,8 @@ public:
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP has a single block");
-    GGML_ASSERT(ubatch.token && "qwen4exp MTP requires token input");
+    // [TAG_FN_L21_MTP_VISION] image rows come as embeddings with their hidden state in embd_state (upstream #30397)
+    GGML_ASSERT((ubatch.token || (ubatch.embd && ubatch.embd_state)) && "qwen4exp MTP requires token input or image rows with a state");
 
     const int64_t hc = hparams.dsv4_hc_mult;
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "qwen4exp MTP hidden width mismatch");
@@ -1433,14 +1434,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         ggml_set_input(inp->tokens);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        // [TAG_FN_L21_MTP_VISION] image rows: the token embedding is the row's image embedding (n_embd_inp wide)
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ubatch.token ? hparams.n_embd_out() : hparams.n_embd_inp(), n_tokens);
         ggml_set_input(inp->embd);
 
         inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
         ggml_set_input(inp->h);
         ggml_set_name(inp->h, "mtp_h_input");
 
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        tok_embd = ubatch.token ? ggml_get_rows(ctx0, model.tok_embd, inp->tokens) : inp->embd;
         h        = inp->h;
 
         res->add_input(std::move(inp));

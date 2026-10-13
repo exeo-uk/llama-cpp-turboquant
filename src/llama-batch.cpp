@@ -69,6 +69,25 @@ bool llama_batch_allocr::init(
         return false;
     }
 
+    // [TAG_FN_L21_MTP_VISION] a state row (the MTP hidden state of an image row) is set on every entry or on none
+    {
+        const bool has_state = batch_inp.tokens[0].has_state;
+        for (int32_t i = 1; i < n_tok; ++i) {
+            if (batch_inp.tokens[i].has_state != has_state) {
+                LLAMA_LOG_ERROR("%s: all entries in the batch must have the same state embedding presence\n", __func__);
+                return false;
+            }
+        }
+        if (has_state) {
+            n_embd_state = (uint32_t) batch_inp.n_embd_state;
+            state_vec.resize((size_t) n_tok * n_embd_state);
+            for (int32_t i = 0; i < n_tok; ++i) {
+                memcpy(state_vec.data() + (size_t) i * n_embd_state, batch_inp.state.data() + batch_inp.tokens[i].state_off,
+                        n_embd_state * sizeof(float));
+            }
+        }
+    }
+
     //
     // build flat token/embd array
     //
@@ -775,6 +794,8 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     token_vec   .clear();
+    state_vec   .clear(); // [TAG_FN_L21_MTP_VISION]
+    n_embd_state = 0;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -817,6 +838,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
+    udata->embd_state.resize(state_vec.empty() ? 0 : (size_t) n_tokens * n_embd_state); // [TAG_FN_L21_MTP_VISION]
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -832,6 +854,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         if (batch.embd) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+        }
+
+        if (!state_vec.empty()) { // [TAG_FN_L21_MTP_VISION]
+            memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state,
+                    n_embd_state*sizeof(float));
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -892,7 +919,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
-        /*.data         =*/ std::move(udata),
+        /*.data         =*/ udata,
+        /*.embd_state   =*/ udata->embd_state.empty() ? nullptr : udata->embd_state.data(), // [TAG_FN_L21_MTP_VISION]
     };
 
     if (debug > 0) {
@@ -1064,6 +1092,8 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_tokens_max(llama_n_batch(ctx)),
         n_embd_inp(llama_batch_ext_select_n_embd_inp(ctx->get_cparams().ctx_type, llama_get_model(ctx)->arch, llama_get_model(ctx)->hparams)),
         n_embd_inp_enc(llama_get_model(ctx)->hparams.n_embd_inp_enc()),
+        n_embd_state(ctx->get_cparams().ctx_type == LLAMA_CONTEXT_TYPE_MTP ? llama_get_model(ctx)->hparams.n_embd_out() : 0),
+        n_embd_tok  (ctx->get_cparams().ctx_type == LLAMA_CONTEXT_TYPE_MTP ? llama_get_model(ctx)->hparams.n_embd_inp() : 0),
         n_seq_max(llama_n_seq_max(ctx)),
         mem(llama_get_memory(ctx)),
         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
@@ -1082,6 +1112,8 @@ llama_batch_ext::llama_batch_ext(
         n_tokens_max(n_tokens_max),
         n_embd_inp(n_embd_inp),
         n_embd_inp_enc(n_embd_inp_enc),
+        n_embd_state(0),
+        n_embd_tok(0),
         n_seq_max(n_seq_max),
         mem(mem),
         n_vocab(n_vocab),
@@ -1099,6 +1131,7 @@ void llama_batch_ext::own_embd() {
 void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
+    state .clear(); // [TAG_FN_L21_MTP_VISION]
     embd_ref = nullptr;
     n_embd = 0;
 }
@@ -1156,7 +1189,8 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
 
     const size_t n_total = embd_in.n_rows * embd_in.n_embd;
     if (n_embd == 0) {
-        if (n_total != n_embd_inp && n_total != n_embd_inp_enc) {
+        // [TAG_FN_L21_MTP_VISION] an MTP context also takes image rows at the token embedding width
+        if (n_total != n_embd_inp && n_total != n_embd_inp_enc && (n_embd_tok == 0 || n_total != n_embd_tok)) {
             LLAMA_LOG_ERROR("%s: embedding size mismatch, got %zu rows x %zu = %zu, expected %zu or %zu\n",
                     __func__, embd_in.n_rows, embd_in.n_embd, n_total, n_embd_inp, n_embd_inp_enc);
             return false;
@@ -1270,12 +1304,30 @@ bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_
     return batch->set_token_embd(idx, embd);
 }
 
+// [TAG_FN_L21_MTP_VISION] upstream #30257: the MTP hidden state of an entry, kept apart from its token embedding
+bool llama_batch_ext::set_token_state(int32_t idx, llama_embd state_in) {
+    if (idx < 0 || idx >= (int32_t) tokens.size() || !state_in.data || n_embd_state == 0) {
+        return false; // a context without a state input (only MTP contexts take one)
+    }
+    const size_t n_total = state_in.n_rows * state_in.n_embd;
+    if (n_total != n_embd_state) {
+        LLAMA_LOG_ERROR("%s: state size mismatch, got %zu rows x %zu = %zu, expected %zu\n",
+                __func__, state_in.n_rows, state_in.n_embd, n_total, n_embd_state);
+        return false;
+    }
+    token & t = tokens[idx];
+    if (t.has_state) {
+        LLAMA_LOG_ERROR("%s: state for token %d is already set\n", __func__, idx);
+        return false;
+    }
+    t.has_state = true;
+    t.state_off = state.size();
+    state.insert(state.end(), state_in.data, state_in.data + n_total);
+    return true;
+}
+
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
-    // TODO
-    GGML_UNUSED(batch);
-    GGML_UNUSED(idx);
-    GGML_UNUSED(embd);
-    return false;
+    return batch->set_token_state(idx, embd);
 }
 
 bool llama_batch_ext_set_output_embd(llama_batch_ext * batch, int32_t idx, bool value) {

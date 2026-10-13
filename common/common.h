@@ -1121,6 +1121,7 @@ struct common_batch {
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        llama_embd   state = { nullptr, 0, 0 }; // [TAG_FN_L21_MTP_VISION] set_embd_state() view, data == NULL if none
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1155,6 +1156,9 @@ struct common_batch {
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);
+
+    // [TAG_FN_L21_MTP_VISION] attach a state embedding (the target hidden state for MTP) to the entry at idx, once per entry
+    bool set_embd_state(int32_t idx, llama_embd state);
 
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions

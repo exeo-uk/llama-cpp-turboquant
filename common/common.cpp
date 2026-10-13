@@ -2216,6 +2216,15 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
     return true;
 }
 
+// [TAG_FN_L21_MTP_VISION]
+bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
+    if (idx < 0 || idx >= size() || tokens[idx].state.data != nullptr) {
+        return false;
+    }
+    tokens[idx].state = state;
+    return true;
+}
+
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
     token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
@@ -2261,6 +2270,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
+        }
+        if (t.state.data && !llama_batch_ext_set_embd_state(res, idx, t.state)) { // [TAG_FN_L21_MTP_VISION]
+            GGML_ABORT("%s: failed to set the state embedding at index %d\n", __func__, i);
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);

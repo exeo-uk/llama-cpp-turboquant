@@ -237,6 +237,8 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L19_CONVSTORE_EVICT",   "0",      P_ALL }, //   least recently stored first, as before
     { "LLAMA_FN_L19_CONVSTORE_CKPT",    "0",      P_ALL }, //   the checkpoint ring as before (no keeping rule, no disk checkpoints)
     { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
+    // [TAG_FN_L21_DEC] round 21 decode / TTFT items (exact)
+    { "LLAMA_FN_L21_MTP_VISION",        "1",      P_ALL }, // [TAG_FN_L21_MTP_VISION] the MTP draft decodes image rows (upstream #30257 + #30397)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

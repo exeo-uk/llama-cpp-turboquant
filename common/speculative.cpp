@@ -3416,6 +3416,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// [TAG_FN_L21_DEC] a round-21 switch: the qwen4exp profile or the environment there, the environment (default 0) elsewhere
+static int common_fn_l21_int(const llama_model * model, const char * name) {
+    const char * e = getenv(name);
+    return llama_fn_l4_int(model, name, e && e[0] ? atoi(e) : 0);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -3518,6 +3524,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // [TAG_FN_MTP_ATTN_WINDOW] LLAMA_MTP_ATTN_WINDOW on a qwen4exp MTP context: its draft KV keeps only this many
     // positions (llama-model.cpp), so prompt rows further back than that from their prompt's end are not decoded
     int32_t mtp_win = 0;
+
+    // [TAG_FN_L21_MTP_VISION] image batches go to the draft context; counts for the end-of-run log line
+    bool     mtp_vision     = false;
+    uint64_t vis_n_batches  = 0;
+    uint64_t vis_n_rows     = 0;
 
     // [TAG_FN_L4_HOST_MTPFUSE] LLAMA_FN_L4_HOST_MTPFUSE=1 (qwen4exp, single head): process() keeps the rows of a verify batch
     // instead of decoding them, accept() keeps the accepted ones, and the first draft decode carries them in front of its own
@@ -4008,6 +4019,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_FN_L21_MTP_VISION] LLAMA_FN_L21_MTP_VISION (qwen4exp profile: 1, else 0): image rows on the draft context.
+        // Only for the MTP graphs that take embedding rows (the others read token ids only), and not with a shared KV.
+        {
+            char arch[32] = { 0 };
+            const bool arch_ok = llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
+                    (strcmp(arch, "qwen4exp") == 0 || strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0 ||
+                     strcmp(arch, "qwen3next") == 0);
+            mtp_vision = arch_ok && !is_mem_shared && common_fn_l21_int(llama_get_model(ctx_dft), "LLAMA_FN_L21_MTP_VISION") > 0;
+            if (mtp_vision) {
+                LOG_INF("%s: [TAG_FN_L21_MTP_VISION] image rows are decoded on the MTP draft context\n", __func__);
+            }
+        }
+
         // [TAG_FN_MTP_ATTN_WINDOW] the window of the qwen4exp MTP draft cache: llama-model.cpp gives it one from
         // LLAMA_MTP_ATTN_WINDOW, and only for a dense MTP block ([TAG_SYNC_1004] a QSA block keeps the full cache)
         {
@@ -4224,9 +4248,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ad_proc_rows = batch_in.size();
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (!batch_in.has_token() || batch_in.has_embd()) {
+        // [TAG_FN_L21_MTP_VISION] LLAMA_FN_L21_MTP_VISION: image rows are decoded on the draft context too (upstream #30257 +
+        // #30397), their embedding as the token input and the target's h in the state channel, so the draft KV holds the
+        // image and the first text row after it pairs with the h of the image's last row. Off: image batches are skipped.
+        const bool img = mtp_vision && !batch_in.has_token() && batch_in.has_embd();
+        if (!img && (!batch_in.has_token() || batch_in.has_embd())) {
             return true;
+        }
+        if (img) {
+            vis_n_batches++;
+            vis_n_rows += batch_in.size();
+            LOG_INF("%s: [TAG_FN_L21_MTP_VISION] %d image rows to the draft context (pos %d; %llu batches, %llu rows)\n", __func__,
+                    (int) batch_in.size(), (int) batch_in.tokens[0].pos[0], (unsigned long long) vis_n_batches,
+                    (unsigned long long) vis_n_rows);
         }
 
         const int32_t n_tokens = batch_in.size();
@@ -4263,7 +4297,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
             // a verify batch: per sequence at most n_max + 1 rows at consecutive positions, no prompt still to come
-            fuse_defer = n_tokens <= 16;
+            fuse_defer = !img && n_tokens <= 16;
             for (int32_t k = 0; k < n_tokens && fuse_defer; ++k) {
                 const llama_seq_id s = batch_in.tokens[k].seq_id;
                 fuse_defer = s >= 0 && s < (llama_seq_id) n_seq && i_batch_end[s] - i_batch_beg[s] + 1 <= this->params.n_max + 1 &&
@@ -4295,6 +4329,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_tgt   = llama_get_embeddings_nextn(ctx_tgt);
             const int32_t n_b_max = std::max<int32_t>(1, (int32_t) llama_n_batch(ctx_dft));
 
+            // [TAG_FN_L21_MTP_VISION] one draft row: a token with h in embd, or an image row with h in the state channel
+            auto add_row = [&](int32_t k, const float * h) {
+                const auto & t = batch_in.tokens[k];
+                if (img) {
+                    const int32_t idx = batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                    batch.set_embd_state(idx, { h, 1, (size_t) n_embd });
+                } else {
+                    const int32_t idx = batch.add(t.id, t.pos[0], t.seq_id, false);
+                    batch.set_embd(idx, { h, 1, (size_t) n_embd });
+                }
+            };
+
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
@@ -4310,10 +4356,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int32_t l = 0; l < n_chunk; ++l) {
                     const int32_t      k = win_rows[off + l];
                     const llama_seq_id s = batch_in.tokens[k].seq_id;
-                    const int32_t    idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], s, false);
                     // the first row of a sequence pairs with the stashed h, every other row with the row before it
                     const float * h = k == i_batch_beg[s] ? pending_h[s].data() : h_tgt + (size_t) (k - 1)*n_embd;
-                    batch.set_embd(idx, { h, 1, (size_t) n_embd });
+                    add_row(k, h);
                 }
 
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -4349,13 +4394,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     for (int32_t k = off; k < off + n_chunk; ++k) {
                         const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-                        const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
-
                         const float * h_row = k == i_batch_beg[seq_id]
                             ? pending_h[seq_id].data()
                             : h_tgt + (size_t) (k - 1) * n_embd;
 
-                        batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                        add_row(k, h_row); // [TAG_FN_L21_MTP_VISION]
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
