@@ -1369,9 +1369,17 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    // [TAG_FN_L21_KV_ZERO] cells in use before the removal (the K/V data is zeroed when the removal empties the cache)
+    bool l21_had_used = false;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        l21_had_used = l21_had_used || v_cells[s].get_used() > 0;
+    }
+
     // [TAG_TURBOT] the same removal with the tier hooks
     if (is_turbot()) {
-        return seq_rm_turbot(seq_id, p0, p1);
+        const bool ok = seq_rm_turbot(seq_id, p0, p1);
+        l21_zero_if_empty(l21_had_used);
+        return ok;
     }
 
     if (seq_id >= 0) {
@@ -1451,9 +1459,41 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    l21_zero_if_empty(l21_had_used); // [TAG_FN_L21_KV_ZERO]
+
     return true;
 }
 
+
+// [TAG_FN_L21_KV_ZERO] LLAMA_FN_L21_KV_ZERO (default 1, every model): when a seq_rm empties the whole cache (every stream),
+// the base K/V tensors are zeroed (the mapped part of a KV-lend region). Free cells are still read by the attention
+// inside its window (masked: P = 0, and 0 * NaN = NaN), so a sequence whose state went NaN (the NaN guard drops it) could
+// poison the next one or another slot. Only the base K/V data: the cells, tiers, rotations and calibration scales stay.
+// Runs when a slot's prompt is replaced from token 0 with no other sequence in the cache (one memset per K/V tensor).
+void llama_kv_cache::l21_zero_if_empty(bool had_used) {
+    static const bool on = [] { const char * e = getenv("LLAMA_FN_L21_KV_ZERO"); return !(e && e[0] && atoi(e) == 0); }();
+    if (!on || !had_used) {
+        return;
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (v_cells[s].get_used() > 0) {
+            return;
+        }
+    }
+    for (auto & [_, buf] : ctxs_bufs) {
+        if (kvl_owns(buf.get())) {
+            kvl_clear(); // the mapped cells of the K/V regions only (no write may reach a region's unmapped part)
+            continue;
+        }
+        for (const auto & l : layers) {
+            for (ggml_tensor * t : { l.k, l.v }) {
+                if (t != nullptr && t->buffer == buf.get() && t->view_src == nullptr) {
+                    ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+                }
+            }
+        }
+    }
+}
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

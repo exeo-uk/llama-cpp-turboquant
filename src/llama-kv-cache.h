@@ -144,6 +144,9 @@ public:
 
     void clear(bool data) override;
 
+    // [TAG_FN_L21_KV_ZERO] zero the base K/V data when a seq_rm left every stream empty (had_used: cells before it)
+    void l21_zero_if_empty(bool had_used);
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
