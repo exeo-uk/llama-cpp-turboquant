@@ -222,8 +222,6 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
-    uint32_t n_nonfinite = 0; // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take
-
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -382,6 +380,9 @@ struct common_sampler {
     // logit-bias sampler sets to -inf (sorted)
     int                      fast_k = 0;
     std::vector<llama_token> fast_excl;
+
+    // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take (last: the aggregate inits above)
+    uint32_t n_nonfinite = 0;
 };
 
 std::string common_params_sampling::print() const {
