@@ -7,7 +7,10 @@
 //   convstore_gdsf         the value of a stored conversation for eviction ([TAG_FN_L19_CONVSTORE_EVICT])
 //   convstore_thin         which spilled checkpoints a conversation keeps on disk ([TAG_FN_L19_CONVSTORE_SPILL])
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <vector>
 
 // [TAG_FN_L19_CONVSTORE_CKPT] A full checkpoint ring used to drop its oldest entry (and, first, entries within
@@ -141,4 +144,16 @@ static inline bool convstore_near(const std::vector<int64_t> & kept, int64_t pos
         }
     }
     return false;
+}
+
+// [TAG_FN_L20_CONVFIX_LAZY] A restore that leaves the stored checkpoints on disk splits the ring of before in two: the
+// checkpoints in RAM (the ring) and the ones on disk. Without the keeping rule the ring kept its newest cap positions, so
+// the two lists together keep them too. pos: the positions of both (any order, duplicates count once each). Returns the
+// smallest position that stays: the cap-th newest, or the lowest int64 when all of them fit.
+static inline int64_t convfix_keep_from(std::vector<int64_t> pos, size_t cap) {
+    if (cap == 0 || pos.size() <= cap) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    std::sort(pos.begin(), pos.end(), std::greater<int64_t>());
+    return pos[cap - 1];
 }

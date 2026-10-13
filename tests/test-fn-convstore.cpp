@@ -226,12 +226,51 @@ static void test_thin() {
     TCHECK(!convstore_near({}, 2000, 1024), "nothing kept");
 }
 
+// [TAG_FN_L20_CONVFIX_LAZY] the ring and the checkpoints on disk together keep the newest cap positions
+static void test_keep_from() {
+    const int64_t lo = std::numeric_limits<int64_t>::min();
+    TCHECK(convfix_keep_from({}, 4) == lo, "empty");
+    TCHECK(convfix_keep_from({5657, 8025, 8021}, 4) == lo, "3 fit in 4");
+    TCHECK(convfix_keep_from({5657, 8021, 8025, 10715}, 4) == lo, "4 fit in 4");
+    // after a restore: the ring holds the new prompt's 2, the disk the stored ring's 4
+    TCHECK(convfix_keep_from({10719, 15570, 5657, 8021, 8025, 10715}, 4) == 8025, "newest 4 of 6");
+    TCHECK(convfix_keep_from({1, 2, 3}, 1) == 3, "cap 1");
+    TCHECK(convfix_keep_from({7, 7, 3}, 2) == 7, "duplicates count once each");
+    TCHECK(convfix_keep_from({1, 2}, 0) == lo, "cap 0 keeps all");
+    // random: exactly min(cap, n) positions are >= the result, and the result is one of them
+    std::mt19937 rng(20);
+    for (int it = 0; it < 2000; ++it) {
+        const size_t n   = rng() % 12;
+        const size_t cap = 1 + rng() % 6;
+        std::vector<int64_t> pos;
+        for (size_t i = 0; i < n; ++i) {
+            pos.push_back((int64_t) (rng() % 50000));
+        }
+        const int64_t k = convfix_keep_from(pos, cap);
+        size_t n_ge = 0;
+        for (int64_t p : pos) {
+            n_ge += p >= k;
+        }
+        if (n <= cap) {
+            TCHECK(k == lo && n_ge == n, "all fit (n %zu cap %zu)", n, cap);
+        } else {
+            TCHECK(std::find(pos.begin(), pos.end(), k) != pos.end(), "result is a position");
+            size_t n_gt = 0;
+            for (int64_t p : pos) {
+                n_gt += p > k;
+            }
+            TCHECK(n_gt < cap && n_ge >= cap, "cap-th newest (n %zu cap %zu: > %zu, >= %zu)", n, cap, n_gt, n_ge);
+        }
+    }
+}
+
 int main() {
     test_victim_fixed();
     test_agent_loop();
     test_victim_random();
     test_gdsf();
     test_thin();
+    test_keep_from();
     printf("test-fn-convstore: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

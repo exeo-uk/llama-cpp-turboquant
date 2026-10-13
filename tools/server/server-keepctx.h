@@ -37,6 +37,18 @@ struct server_keepctx_params {
     // [TAG_FN_L19_CONVSTORE_EVICT] evict by value per byte (convstore_gdsf) instead of least recently stored
     bool        gdsf         = false;
     double      fixed_tokens = 0.0;   // the fixed prefill cost of a restore's alternative, in tokens
+
+    // [TAG_FN_L20_CONVFIX_IO] a store and a restore reuse their memory: the pipe's blocks are allocated once, and a
+    // restore puts the stored checkpoints into the outgoing ring's buffers (no fresh, zero-filled 112.6 MiB allocation
+    // per checkpoint and no free of the old ones while the next prompt streams the experts). The bytes are the same.
+    bool        io_reuse = false;
+    // [TAG_FN_L20_CONVFIX_TRACE] the time of each part of a store / restore in its log line
+    bool        trace    = false;
+    // [TAG_FN_L20_CONVFIX_LAZY] a stored conversation's checkpoints start at sector offsets in its file, and a restore reads
+    // only the target and draft states: the checkpoints stay on disk as the slot's checkpoints on disk (the
+    // [TAG_FN_L19_CONVSTORE_SPILL] list: read back when a prompt resumes at one of them, stored with the conversation
+    // again without a write). A restore moves ~half the bytes (4 checkpoints of 112.6 MiB beside a ~420 MiB state).
+    bool        lazy     = false;
 };
 
 class server_keepctx_file;
@@ -92,6 +104,11 @@ struct server_keepctx_entry {
 
     uint64_t hash_tgt = 0;              // params.verify: hashes of the stored target and draft state bytes
     uint64_t hash_dft = 0;
+
+    // [TAG_FN_L20_CONVFIX_LAZY] params.lazy: each checkpoint's offset in the file (a multiple of the sector size) and, with
+    // params.verify, a hash of its bytes
+    std::vector<uint64_t> ckpt_off;
+    std::vector<uint64_t> ckpt_hash;
 
     std::vector<float> hot;             // params.hot: the MoE hot set's decayed counts when it left the slot
 
@@ -151,9 +168,12 @@ struct server_keepctx {
     // an unknown state and the caller must clear them.
     // [TAG_FN_L19_CONVSTORE] spill / conv (may be null): receive the entry's checkpoints on disk and what is known about
     // it (its restores counting this one)
+    // [TAG_FN_L20_CONVFIX_IO] reuse (may be null): checkpoints whose buffers the restored checkpoints take (the slot's
+    // outgoing ring); the ones left over are given back in it
     bool load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
               llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
-              server_keepctx_spill * spill = nullptr, server_keepctx_conv * conv = nullptr);
+              server_keepctx_spill * spill = nullptr, server_keepctx_conv * conv = nullptr,
+              std::list<common_prompt_checkpoint> * reuse = nullptr);
 
     // remove the entries whose tokens are a prefix of tokens (an older state of the same conversation), except keep
     // [TAG_FN_L19_CONVSTORE] tol > 0: also the entries that leave tokens within their last tol tokens (a conversation
@@ -197,6 +217,9 @@ private:
     std::deque<std::unique_ptr<spill_job>>  wr_q_;
     bool                                    wr_stop_ = false;
     std::vector<std::vector<uint8_t>>       spare_;   // buffers of written checkpoints (wr_mu_)
+
+    // [TAG_FN_L20_CONVFIX_IO] the blocks of the pipes of save / load / spill_read (the server thread, one at a time)
+    uint8_t *             io_mem_ = nullptr;
 
     server_keepctx_params params_;
     bool                  ok_     = false;

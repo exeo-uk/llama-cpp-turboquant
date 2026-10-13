@@ -151,6 +151,23 @@ private:
 #endif
 };
 
+// the KC_NBUF blocks of a pipe (sector aligned for unbuffered I/O)
+static uint8_t * kc_alloc_blocks() {
+#if defined(_WIN32)
+    return (uint8_t *) VirtualAlloc(nullptr, KC_NBUF*KC_BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    return (uint8_t *) std::aligned_alloc(KC_ALIGN, KC_NBUF*KC_BLOCK);
+#endif
+}
+
+static void kc_free_blocks(uint8_t * mem) {
+#if defined(_WIN32)
+    VirtualFree(mem, 0, MEM_RELEASE);
+#else
+    std::free(mem);
+#endif
+}
+
 //
 // a thread moves blocks between a few aligned buffers and the file, so the device copies of the caller and the disk
 // overlap. Write: put() fills blocks, the thread writes them in order. Read: the thread reads ahead, get() drains.
@@ -159,13 +176,15 @@ private:
 class kc_pipe {
 public:
     // [TAG_FN_L19_CONVSTORE_SPILL] base: where in the file the pipe starts (a multiple of KC_ALIGN)
-    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0) :
+    // [TAG_FN_L20_CONVFIX_IO] ext_mem: KC_NBUF blocks the caller owns (kc_alloc_blocks), else the pipe allocates its own
+    kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0, uint8_t * ext_mem = nullptr) :
             file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
-#if defined(_WIN32)
-        mem = (uint8_t *) VirtualAlloc(nullptr, KC_NBUF*KC_BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-        mem = (uint8_t *) std::aligned_alloc(KC_ALIGN, KC_NBUF*KC_BLOCK);
-#endif
+        if (ext_mem) {
+            mem     = ext_mem;
+            own_mem = false;
+        } else {
+            mem = kc_alloc_blocks();
+        }
         if (mem == nullptr) {
             err = true;
             return;
@@ -185,17 +204,42 @@ public:
         if (th.joinable()) {
             th.join();
         }
-        if (mem) {
-#if defined(_WIN32)
-            VirtualFree(mem, 0, MEM_RELEASE);
-#else
-            std::free(mem);
-#endif
+        if (mem && own_mem) {
+            kc_free_blocks(mem);
         }
     }
 
     bool     hashing = false;
     uint64_t hash    = KC_HASH_SEED;
+
+    // [TAG_FN_L20_CONVFIX_LAZY] the logical bytes so far (the file offset of the next byte, from base)
+    uint64_t logical() const { return n_logical; }
+
+    // writing: zeros up to the next sector boundary (the next put starts at an offset a lone read can use)
+    bool align() {
+        static const uint8_t zeros[KC_ALIGN] = {};
+        const size_t n = (size_t) (kc_round_up((size_t) n_logical) - n_logical);
+        if (n == 0) {
+            return !failed();
+        }
+        const bool h = hashing;
+        hashing = false;
+        const bool ok = put(zeros, n);
+        hashing = h;
+        return ok;
+    }
+
+    // reading: drop the bytes up to the logical offset off (padding)
+    bool skip_to(uint64_t off) {
+        uint8_t scratch[KC_ALIGN];
+        while (n_logical < off) {
+            const size_t k = (size_t) std::min<uint64_t>(sizeof(scratch), off - n_logical);
+            if (!get(scratch, k)) {
+                return false;
+            }
+        }
+        return n_logical == off;
+    }
 
     bool put(const void * src, size_t n) {
         if (hashing) {
@@ -356,6 +400,7 @@ private:
     const uint64_t        base;
 
     uint8_t * mem = nullptr;
+    bool      own_mem = true; // [TAG_FN_L20_CONVFIX_IO]
     size_t    len[KC_NBUF] = {};
 
     std::mutex              mu;
@@ -402,6 +447,11 @@ server_keepctx::server_keepctx(const server_keepctx_params & params) : params_(p
     }
     ok_ = true;
 
+    // [TAG_FN_L20_CONVFIX_IO]
+    if (params_.io_reuse) {
+        io_mem_ = kc_alloc_blocks();
+    }
+
     if (params_.verify) {
         std::string err;
         const bool pass = selftest(err);
@@ -419,6 +469,9 @@ server_keepctx::~server_keepctx() {
     wr_cv_.notify_all();
     if (wr_th_.joinable()) {
         wr_th_.join();
+    }
+    if (io_mem_) {
+        kc_free_blocks(io_mem_); // [TAG_FN_L20_CONVFIX_IO]
     }
 }
 
@@ -754,7 +807,7 @@ bool server_keepctx::spill_read(const server_keepctx_spilled & s, common_prompt_
     c.data_tgt .resize(s.size_tgt);
     c.data_dft .resize(s.size_dft);
     c.data_spec.resize(s.size_spec);
-    kc_pipe pipe(*s.file, false, s.bytes(), s.off);
+    kc_pipe pipe(*s.file, false, s.bytes(), s.off, io_mem_);
     if (!(pipe.get(c.data_tgt.data(), c.data_tgt.size()) && pipe.get(c.data_dft.data(), c.data_dft.size()) &&
           pipe.get(c.data_spec.data(), c.data_spec.size()))) {
         info = "read failed";
@@ -828,6 +881,9 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
 
     uint64_t need = e.size_tgt + e.size_dft;
     for (const auto & c : prompt.checkpoints) {
+        if (params_.lazy) {
+            need = kc_round_up((size_t) need); // [TAG_FN_L20_CONVFIX_LAZY] each checkpoint at a sector offset
+        }
         need += c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
     }
     // [TAG_FN_L19_CONVSTORE_SPILL] the conversation's checkpoints on disk go with it (the same file, nothing written),
@@ -885,31 +941,57 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
     }
 
     bool ok = true;
+    // [TAG_FN_L20_CONVFIX_TRACE] the parts: before the writes (eviction, file), target state, draft state, checkpoints,
+    // the last block
+    double tr_pre = 0.0, tr_tgt = 0.0, tr_dft = 0.0, tr_ckpt = 0.0, tr_fin = 0.0;
+    auto   tr_t   = std::chrono::steady_clock::now();
+    auto   tr_lap = [&](double & acc) {
+        const auto now = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(now - tr_t).count();
+        tr_t = now;
+    };
+    tr_pre = kc_ms_since(t0);
     {
-        kc_pipe pipe(*e.file, true, 0);
+        kc_pipe pipe(*e.file, true, 0, 0, io_mem_);
         pipe.hashing = params_.verify;
         ok = ok && llama_state_seq_write_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_tgt;
+        tr_lap(tr_tgt);
         e.hash_tgt = pipe.hash;
         pipe.hash  = KC_HASH_SEED;
         if (ok && ctx_dft) {
             ok = llama_state_seq_write_stream_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_write_cb, &pipe) == e.size_dft;
         }
+        tr_lap(tr_dft);
         e.hash_dft   = pipe.hash;
         pipe.hashing = false;
         for (const auto & c : prompt.checkpoints) {
             if (!ok) {
                 break;
             }
-            ok = pipe.put(c.data_tgt.data(), c.data_tgt.size()) && pipe.put(c.data_dft.data(), c.data_dft.size()) &&
+            // [TAG_FN_L20_CONVFIX_LAZY] a sector offset, so a restore can leave it on disk and read it alone later
+            if (params_.lazy) {
+                ok = pipe.align();
+                e.ckpt_off.push_back(pipe.logical());
+                if (params_.verify) {
+                    uint64_t h = KC_HASH_SEED;
+                    h = kc_hash(h, c.data_tgt.data(), c.data_tgt.size());
+                    h = kc_hash(h, c.data_dft.data(), c.data_dft.size());
+                    h = kc_hash(h, c.data_spec.data(), c.data_spec.size());
+                    e.ckpt_hash.push_back(h);
+                }
+            }
+            ok = ok && pipe.put(c.data_tgt.data(), c.data_tgt.size()) && pipe.put(c.data_dft.data(), c.data_dft.size()) &&
                  pipe.put(c.data_spec.data(), c.data_spec.size());
             e.ckpt_sizes.push_back(c.data_tgt.size());
             e.ckpt_sizes.push_back(c.data_dft.size());
             e.ckpt_sizes.push_back(c.data_spec.size());
         }
+        tr_lap(tr_ckpt);
         uint64_t n_written = 0;
         ok = pipe.finish(n_written) && ok;
         e.n_bytes = n_written;
     }
+    tr_lap(tr_fin);
     if (!ok || e.n_bytes != need) {
         info = string_format("writing '%s' failed (%.1f of %.1f MiB)", path.string().c_str(), e.n_bytes/1048576.0, need/1048576.0);
         return false;
@@ -945,13 +1027,18 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk (%.1f MiB), restores %lld, value %.0f, system block %d",
                               e.spilled.size(), need_spilled/1048576.0, (long long) e.conv.hits, e.value, (int) e.conv.sys_end);
     }
+    if (params_.trace) {
+        info += string_format(" [TAG_FN_L20_CONVFIX_TRACE] pre %.1f, target %.1f, draft %.1f, checkpoints %.1f, finish %.1f ms",
+                              tr_pre, tr_tgt, tr_dft, tr_ckpt, tr_fin);
+    }
     entries.push_back(std::move(e));
     return true;
 }
 
 bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_prompt & prompt, llama_context * ctx_tgt,
                           llama_context * ctx_dft, common_speculative * spec, llama_seq_id seq_id, bool keep, std::string & info,
-                          server_keepctx_spill * spill, server_keepctx_conv * conv) {
+                          server_keepctx_spill * spill, server_keepctx_conv * conv,
+                          std::list<common_prompt_checkpoint> * reuse) {
     const auto t0 = std::chrono::steady_clock::now();
 
     server_keepctx_entry e_own;
@@ -976,18 +1063,91 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
 
     std::list<common_prompt_checkpoint> ckpts;
     bool ok = true;
+    // [TAG_FN_L20_CONVFIX_TRACE]
+    double tr_tgt = 0.0, tr_dft = 0.0, tr_alloc = 0.0, tr_ckpt = 0.0;
+    auto   tr_t   = std::chrono::steady_clock::now();
+    auto   tr_lap = [&](double & acc) {
+        const auto now = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(now - tr_t).count();
+        tr_t = now;
+    };
+    int n_reused = 0;
+
+    // [TAG_FN_L20_CONVFIX_LAZY] the checkpoints stay in the file: each one becomes a checkpoint on disk of the slot (its
+    // offset, sizes and the hash of the tokens in front of it), unless one cannot be described that way
+    std::vector<server_keepctx_spilled> lazy_refs;
+    bool lazy = params_.lazy && spill != nullptr && !e.prompt.checkpoints.empty() &&
+                e.ckpt_off.size() == e.prompt.checkpoints.size() && e.ckpt_sizes.size() == 3*e.prompt.checkpoints.size();
+    if (lazy) {
+        std::vector<int64_t> at;
+        for (const auto & m : e.prompt.checkpoints) {
+            lazy = lazy && (at.empty() || m.n_tokens > at.back());
+            at.push_back(m.n_tokens);
+        }
+        std::vector<uint64_t> h;
+        if (lazy) {
+            kc_prefix_hashes(e.prompt.tokens, at, h);
+        }
+        size_t i = 0;
+        for (const auto & m : e.prompt.checkpoints) {
+            if (!lazy) {
+                break;
+            }
+            if (h[i] == 0) {
+                lazy = false;
+                break;
+            }
+            server_keepctx_spilled s;
+            s.n_tokens  = m.n_tokens;
+            s.id_task   = m.id_task;
+            s.pos_min   = m.pos_min;
+            s.pos_max   = m.pos_max;
+            s.size_tgt  = e.ckpt_sizes[3*i + 0];
+            s.size_dft  = e.ckpt_sizes[3*i + 1];
+            s.size_spec = e.ckpt_sizes[3*i + 2];
+            s.off       = e.ckpt_off[i];
+            s.hash      = h[i];
+            s.file      = e.file;
+            s.st        = std::make_shared<server_keepctx_spill_state>();
+            s.st->done      = 1;
+            s.st->hash_data = i < e.ckpt_hash.size() ? e.ckpt_hash[i] : 0;
+            lazy_refs.push_back(std::move(s));
+            i++;
+        }
+        if (!lazy) {
+            lazy_refs.clear();
+        }
+    }
     {
-        kc_pipe pipe(*e.file, false, e.n_bytes);
+        kc_pipe pipe(*e.file, false, lazy ? e.size_tgt + e.size_dft : e.n_bytes, 0, io_mem_);
         ok = ok && llama_state_seq_read_stream_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_read_cb, &pipe) == e.size_tgt;
+        tr_lap(tr_tgt);
         if (ok && ctx_dft) {
             ok = llama_state_seq_read_stream_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, kc_read_cb, &pipe) == e.size_dft;
         }
+        tr_lap(tr_dft);
         size_t k = 0;
+        size_t i = 0;
         for (const auto & m : e.prompt.checkpoints) {
-            if (!ok) {
+            if (!ok || lazy) {
                 break;
             }
+            // [TAG_FN_L20_CONVFIX_LAZY] a file of the sector-offset layout read in full
+            if (i < e.ckpt_off.size()) {
+                ok = pipe.skip_to(e.ckpt_off[i]);
+            }
+            i++;
             common_prompt_checkpoint c;
+            // [TAG_FN_L20_CONVFIX_IO] the buffers of an outgoing checkpoint: a resize to the same size neither allocates
+            // nor zero-fills (every byte is read over below)
+            if (reuse && !reuse->empty()) {
+                common_prompt_checkpoint & r = reuse->front();
+                c.data_tgt  = std::move(r.data_tgt);
+                c.data_dft  = std::move(r.data_dft);
+                c.data_spec = std::move(r.data_spec);
+                reuse->pop_front();
+                n_reused++;
+            }
             c.n_tokens = m.n_tokens;
             c.id_task  = m.id_task;
             c.pos_min  = m.pos_min;
@@ -996,8 +1156,10 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
             c.data_dft .resize(e.ckpt_sizes[k + 1]);
             c.data_spec.resize(e.ckpt_sizes[k + 2]);
             k += 3;
+            tr_lap(tr_alloc);
             ok = pipe.get(c.data_tgt.data(), c.data_tgt.size()) && pipe.get(c.data_dft.data(), c.data_dft.size()) &&
                  pipe.get(c.data_spec.data(), c.data_spec.size());
+            tr_lap(tr_ckpt);
             ckpts.push_back(std::move(c));
         }
     }
@@ -1014,6 +1176,16 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
     // [TAG_FN_L19_CONVSTORE] the checkpoints on disk go to the slot (the files are shared), the restore counts
     if (spill) {
         spill->list = e.spilled;
+        // [TAG_FN_L20_CONVFIX_LAZY] and the ring's, which stayed in the file (ascending n_tokens, one per position)
+        for (auto & s : lazy_refs) {
+            auto pos = std::lower_bound(spill->list.begin(), spill->list.end(), s.n_tokens,
+                                        [](const server_keepctx_spilled & x, int64_t n) { return x.n_tokens < n; });
+            if (pos != spill->list.end() && pos->n_tokens == s.n_tokens) {
+                *pos = std::move(s);
+            } else {
+                spill->list.insert(pos, std::move(s));
+            }
+        }
     }
     if (conv) {
         *conv = e.conv;
@@ -1048,12 +1220,21 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         const bool vd = !ctx_dft || (state_hash(ctx_dft, hd) && hd == e.hash_dft);
         ver = string_format(", verify: target %s, draft %s", vt ? "identical" : "DIFFERS", ctx_dft ? (vd ? "identical" : "DIFFERS") : "none");
     }
+    // [TAG_FN_L20_CONVFIX_LAZY] the bytes read
+    const uint64_t n_read_bytes = lazy ? e.size_tgt + e.size_dft : e.n_bytes;
     info = string_format("%d tokens, %zu checkpoints, %.1f MiB in %.0f ms = %.2f GB/s, %s, store %zu conversations / %.1f MiB%s%s",
-                         prompt.n_tokens(), prompt.checkpoints.size(), e.n_bytes/1048576.0, ms, e.n_bytes/(ms*1e6),
+                         prompt.n_tokens(), prompt.checkpoints.size(), n_read_bytes/1048576.0, ms, n_read_bytes/(ms*1e6),
                          keep ? "kept in the store (the prompt continues a part of it)" : "taken from the store",
                          entries.size(), n_bytes()/1048576.0, hot.c_str(), ver.c_str());
     if (!e.spilled.empty()) {
         info += string_format(" [TAG_FN_L19_CONVSTORE] %zu checkpoints on disk", e.spilled.size());
+    }
+    if (lazy) {
+        info += string_format(" [TAG_FN_L20_CONVFIX_LAZY] %zu checkpoints left on disk", lazy_refs.size());
+    }
+    if (params_.trace) {
+        info += string_format(" [TAG_FN_L20_CONVFIX_TRACE] target %.1f, draft %.1f, checkpoint buffers %.1f (%d reused), "
+                              "checkpoints %.1f ms", tr_tgt, tr_dft, tr_alloc, n_reused, tr_ckpt);
     }
     if (keep) {
         entries.splice(entries.end(), entries, it); // the most recently used
