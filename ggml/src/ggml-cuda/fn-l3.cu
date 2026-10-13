@@ -112,8 +112,15 @@ static __device__ __forceinline__ void fn_l3_q8_1_store(const float xi, block_q8
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
 
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float  d0 = amax / 127.0f;
+    // [TAG_FN_L21_Q8CLAMP] an overflowing fp16 scale quantizes against 65504 (same ops as before for every other block)
+    const bool   ovf = ggml_cuda_fn_l21_d_ovf(d0);
+    const float  d   = ovf ? 65504.0f : d0;
+    float        qf  = amax == 0.0f ? 0.0f : roundf(xi / d);
+    if (ovf) {
+        qf = fminf(fmaxf(qf, -127.0f), 127.0f);
+    }
+    const int8_t q = qf;
 
     yb->qs[lane] = q;
 
@@ -121,7 +128,7 @@ static __device__ __forceinline__ void fn_l3_q8_1_store(const float xi, block_q8
         return;
     }
 
-    yb->ds = make_half2(d, sum);
+    yb->ds = make_half2(d, ggml_cuda_fn_l21_h16(sum)); // [TAG_FN_L21_Q8CLAMP]
 }
 
 // [TAG_FN_L3_GPU_Q8F] scale -> silu with the q8_1 copy: thread (i0, r) of the padded rows as in quantize_q8_1; element

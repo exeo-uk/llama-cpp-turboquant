@@ -88,8 +88,15 @@ static __global__ void quantize_q8_1(
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
 
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float  d0 = amax / 127.0f;
+    // [TAG_FN_L21_Q8CLAMP] an overflowing fp16 scale quantizes against 65504 (same ops as before for every other block)
+    const bool   ovf = ggml_cuda_fn_l21_d_ovf(d0);
+    const float  d   = ovf ? 65504.0f : d0;
+    float        qf  = amax == 0.0f ? 0.0f : roundf(xi / d);
+    if (ovf) {
+        qf = fminf(fmaxf(qf, -127.0f), 127.0f);
+    }
+    const int8_t q = qf;
 
     y[ib].qs[iqs] = q;
 
@@ -97,7 +104,7 @@ static __global__ void quantize_q8_1(
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    y[ib].ds = make_half2(d, ggml_cuda_fn_l21_h16(sum)); // [TAG_FN_L21_Q8CLAMP]
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -512,13 +519,23 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    float d_inv = 127.0f / amax;
+    // [TAG_FN_L21_Q8CLAMP] the fp16 layouts: an overflowing scale quantizes against 65504 (q saturated to +-127)
+    const bool d_ovf = ds_layout != MMQ_Q8_1_DS_LAYOUT_D4 && ggml_cuda_fn_l21_d_ovf(1.0f / d_inv);
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    if (!d_ovf) {
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+    } else {
+        d_inv = 1.0f / 65504.0f;
+        q.x = fminf(fmaxf(roundf(xi.x*d_inv), -127.0f), 127.0f);
+        q.y = fminf(fmaxf(roundf(xi.y*d_inv), -127.0f), 127.0f);
+        q.z = fminf(fmaxf(roundf(xi.z*d_inv), -127.0f), 127.0f);
+        q.w = fminf(fmaxf(roundf(xi.w*d_inv), -127.0f), 127.0f);
+    }
+    const float d = d_ovf ? 65504.0f : 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -539,14 +556,14 @@ static __global__ void quantize_mmq_q8_1(
 
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
-                y[ib].d2s6[2 + iqs/16] = sum;
+                y[ib].d2s6[2 + iqs/16] = ggml_cuda_fn_l21_h16(sum); // [TAG_FN_L21_Q8CLAMP]
                 if (iqs % 64 == 0) {
                     y[ib].d2s6[iqs/64] = d;
                 }
             }
         } else if (iqs % 32 == 0) {
             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-                y[ib].ds4[iqs/32] = make_half2(d, sum);
+                y[ib].ds4[iqs/32] = make_half2(d, ggml_cuda_fn_l21_h16(sum)); // [TAG_FN_L21_Q8CLAMP]
             } else {
                 y[ib].d4[iqs/32]  = d;
             }
@@ -617,13 +634,23 @@ static __global__ void quantize_mmq_q8_1_pdl(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    float d_inv = 127.0f / amax;
+    // [TAG_FN_L21_Q8CLAMP] the fp16 layouts: an overflowing scale quantizes against 65504 (q saturated to +-127)
+    const bool d_ovf = ds_layout != MMQ_Q8_1_DS_LAYOUT_D4 && ggml_cuda_fn_l21_d_ovf(1.0f / d_inv);
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    if (!d_ovf) {
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+    } else {
+        d_inv = 1.0f / 65504.0f;
+        q.x = fminf(fmaxf(roundf(xi.x*d_inv), -127.0f), 127.0f);
+        q.y = fminf(fmaxf(roundf(xi.y*d_inv), -127.0f), 127.0f);
+        q.z = fminf(fmaxf(roundf(xi.z*d_inv), -127.0f), 127.0f);
+        q.w = fminf(fmaxf(roundf(xi.w*d_inv), -127.0f), 127.0f);
+    }
+    const float d = d_ovf ? 65504.0f : 1.0f / d_inv;
 
     const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
     const int64_t ib  = ib0 + k_block*ne1 + blockIdx.x;
@@ -634,14 +661,14 @@ static __global__ void quantize_mmq_q8_1_pdl(
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
         if (iqs % 16 == 0 && iqs < 96) {
-            y[ib].d2s6[2 + iqs/16] = sum;
+            y[ib].d2s6[2 + iqs/16] = ggml_cuda_fn_l21_h16(sum); // [TAG_FN_L21_Q8CLAMP]
             if (iqs % 64 == 0) {
                 y[ib].d2s6[iqs/64] = d;
             }
         }
     } else if (iqs % 32 == 0) {
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-            y[ib].ds4[iqs/32] = make_half2(d, sum);
+            y[ib].ds4[iqs/32] = make_half2(d, ggml_cuda_fn_l21_h16(sum)); // [TAG_FN_L21_Q8CLAMP]
         } else {
             y[ib].d4[iqs/32]  = d;
         }

@@ -1813,3 +1813,25 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// [TAG_FN_L21_Q8CLAMP] fp16 stores of the q8_1 scale d and partial sum s (quantize_q8_1, quantize_mmq_q8_1 DS4 / D2S6, the
+// fused fn-l3 / fn-l4 copies; Strata 2b726ba683 / f6601bf83f / 7a0e30235c, upstream #23606): |s| > 65504 (or d >= 65520,
+// which rounds to an fp16 inf) was stored as +-inf, and inf times a zero weight or a zero partial sum made NaN in the dot
+// product. The value is stored as +-65504 instead and a block with an overflowing d quantizes against d = 65504 (q saturated
+// to +-127). NaN stays NaN. Exact for every block whose fp16 stores were finite (the values in (65504, 65520) rounded to
+// 65504 before). No runtime switch: an off arm only brings the inf back (build with GGML_CUDA_NO_FN_L21_Q8CLAMP for it).
+static __device__ __forceinline__ float ggml_cuda_fn_l21_h16(const float v) {
+#ifndef GGML_CUDA_NO_FN_L21_Q8CLAMP
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+#else
+    return v;
+#endif
+}
+static __device__ __forceinline__ bool ggml_cuda_fn_l21_d_ovf(const float d) {
+#ifndef GGML_CUDA_NO_FN_L21_Q8CLAMP
+    return d >= 65520.0f;
+#else
+    GGML_UNUSED(d);
+    return false;
+#endif
+}
