@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -65,6 +66,9 @@ void llama_fn_touch_ranges(const std::vector<std::pair<const void *, size_t>> & 
 // while one runs, unless a prompt's stream waits for the warm pass); llama_fn_hushed: one runs now
 void llama_fn_hush(bool begin);
 bool llama_fn_hushed();
+// [TAG_FN_L19_TTFT_HUSH_BUDGET] the pause has a budget: the scopes stop the pass for at most ms milliseconds in all (their
+// wall time while one runs); later scopes no longer pause it, so it ends under continuous prompts. ms < 0: no budget
+void llama_fn_hush_budget(int64_t ms);
 struct llama_fn_hush_scope {
     bool on;
     explicit llama_fn_hush_scope(bool on) : on(on) {

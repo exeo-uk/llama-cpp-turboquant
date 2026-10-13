@@ -58,6 +58,12 @@ static std::vector<size_t> g_warm_layer_end;
 // for the warm pass (llama_fn_warm_wait_layer) lifts the pause, so the two never wait for each other
 static std::atomic<int>    g_fn_hush{0};
 static std::atomic<int>    g_warm_layer_waiters{0};
+// [TAG_FN_L19_TTFT_HUSH_BUDGET] the pause budget (us, < 0: none), the paused time used so far and the start of the scopes
+// running now (0: none)
+static std::atomic<int64_t> g_hush_budget_us{-1};
+static std::atomic<int64_t> g_hush_used_us{0};
+static std::atomic<int64_t> g_hush_t0_us{0};
+static std::atomic<bool>    g_hush_spent_logged{false};
 
 namespace {
 
@@ -1039,14 +1045,42 @@ void llama_fn_warm_small_decode(bool begin) {
 // [TAG_FN_L19_TTFT_HUSH] see llama-fn-tier.h
 void llama_fn_hush(bool begin) {
     if (begin) {
-        g_fn_hush.fetch_add(1, std::memory_order_relaxed);
+        if (g_fn_hush.fetch_add(1, std::memory_order_relaxed) == 0) {
+            g_hush_t0_us.store(fn_warm_now_us(), std::memory_order_relaxed); // [TAG_FN_L19_TTFT_HUSH_BUDGET]
+        }
     } else {
-        g_fn_hush.fetch_sub(1, std::memory_order_relaxed);
+        if (g_fn_hush.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            const int64_t t0 = g_hush_t0_us.exchange(0, std::memory_order_relaxed); // [TAG_FN_L19_TTFT_HUSH_BUDGET]
+            if (t0 > 0) {
+                g_hush_used_us.fetch_add(fn_warm_now_us() - t0, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
 bool llama_fn_hushed() {
-    return g_fn_hush.load(std::memory_order_relaxed) > 0 && g_warm_layer_waiters.load(std::memory_order_relaxed) == 0;
+    if (g_fn_hush.load(std::memory_order_relaxed) <= 0 || g_warm_layer_waiters.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    // [TAG_FN_L19_TTFT_HUSH_BUDGET] the paused time so far, the running scopes included
+    const int64_t budget = g_hush_budget_us.load(std::memory_order_relaxed);
+    if (budget < 0) {
+        return true;
+    }
+    const int64_t t0   = g_hush_t0_us.load(std::memory_order_relaxed);
+    const int64_t used = g_hush_used_us.load(std::memory_order_relaxed) + (t0 > 0 ? fn_warm_now_us() - t0 : 0);
+    if (used < budget) {
+        return true;
+    }
+    if (!g_hush_spent_logged.exchange(true)) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L19_TTFT_HUSH_BUDGET] the pause budget of %.1f s is used: the warm pass and the saved state's "
+                "read-ahead read on beside prompts from now\n", __func__, budget/1e6);
+    }
+    return false;
+}
+
+void llama_fn_hush_budget(int64_t ms) {
+    g_hush_budget_us.store(ms < 0 ? -1 : ms*1000, std::memory_order_relaxed);
 }
 
 // [TAG_FN_L16_PLEGATE] see llama-fn-tier.h

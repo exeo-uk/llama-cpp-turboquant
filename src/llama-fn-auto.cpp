@@ -227,6 +227,7 @@ const fn_item k_items[] = {
     // 105 -> 75 t/s, the cut dropped ~99 % of drafts after an early 4-row verify sample priced width 2 at 42.75 ms) and
     // LLAMA_FN_L19_DRAFT_F16KV (neutral: pooled decode 111.7 -> 111.0 t/s)
     { "LLAMA_FN_L19_TTFT_HUSH",         "3",      P_ALL }, // [TAG_FN_L19_TTFT_HUSH] the warm pass / state read-ahead pause during a FULL reserve and prompt batches
+    { "LLAMA_FN_L19_TTFT_HUSH_MS",      "10000",  P_ALL }, // [TAG_FN_L19_TTFT_HUSH_BUDGET] at most 10 s of those pauses in all: the warm pass ends under continuous prompts
     { "LLAMA_FN_L19_TTFT_EARLY",        "256",    P_ALL }, // [TAG_FN_L19_TTFT_EARLY] a <= 256-token prompt during the warm pass stays SMALL (no FULL reserve)
     { "LLAMA_FN_L19_TTFT_PHOT",         "1",      P_ALL }, // [TAG_FN_L19_TTFT_PHOT] CPU-path prompt graphs compute their hot experts on the GPU
     { "LLAMA_FN_L4_PROMPT",             "160",    P_ALL }, // [TAG_FN_L4_MEM_PROMPT] a <= 160-token prompt stays SMALL (ubatches of <= 31 tokens, no FULL switch)

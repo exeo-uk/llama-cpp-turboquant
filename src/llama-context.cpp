@@ -1770,9 +1770,12 @@ llama_context::llama_context(
             l19_early = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_EARLY", 0)); // [TAG_FN_L19_TTFT_EARLY]
             l19_tailfull = (uint32_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_TAILFULL", 0)); // [TAG_FN_L19_TTFT_TAILFULL]
             if (l19_hush != 0) {
-                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_HUSH] the warm pass and the saved state's read-ahead pause%s%s\n", __func__,
+                // [TAG_FN_L19_TTFT_HUSH_BUDGET] LLAMA_FN_L19_TTFT_HUSH_MS: the most the scopes pause the pass in all (< 0: no limit)
+                const int hush_ms = llama_fn_l3_int(model, "LLAMA_FN_L19_TTFT_HUSH_MS", -1);
+                llama_fn_hush_budget(hush_ms);
+                LLAMA_LOG_WARN("%s: [TAG_FN_L19_TTFT_HUSH] the warm pass and the saved state's read-ahead pause%s%s (budget %d ms, < 0: none)\n", __func__,
                         (l19_hush & 1) ? " while a FULL compute reserve is made" : "",
-                        (l19_hush & 2) ? " while a prompt batch runs" : "");
+                        (l19_hush & 2) ? " while a prompt batch runs" : "", hush_ms);
             }
             if (llama_moe_hot_fit_wanted(model) && llama_moe_hot_device(model) != nullptr) {
                 moe_hot_pending = true;
