@@ -887,7 +887,16 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            // [TAG_FN_L21_PADMEMSET] LLAMA_FN_L21_PADMEMSET (default 1; upstream #28782): the pad is cleared on the per-thread
+            // stream and waited for there. cudaMemset runs on the legacy default stream, which syncs with every blocking stream
+            // of the device; the bridge, warm and upload threads init tensors beside graph capture. 0 = cudaMemset as before.
+            static const bool l21_padmemset = [] { const char * e = getenv("LLAMA_FN_L21_PADMEMSET"); return !(e && e[0] && atoi(e) == 0); }();
+            if (l21_padmemset) {
+                CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            } else {
+                CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
