@@ -34,6 +34,9 @@
 #include <immintrin.h> // [TAG_FN_L17_START_NT]
 #endif
 
+// [TAG_FN_L21_VRAM_DXGI] defined at the end of this file (the Windows headers stay out of the code above)
+void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
+
 namespace {
 
 struct layer_state {
@@ -2903,7 +2906,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(layers[0].buft);
             size_t mem_free = 0, mem_total = 0;
             if (dev) {
-                ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+                fn_l21_dev_memory(dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI]
             }
             budget = mem_free > (headroom << 20) ? mem_free - (headroom << 20) : 0;
             // LLAMA_MOE_HOT_CAP_MIB: keep device use (all processes) at or below this, e.g. 28500 on a 32 GB card whose
@@ -5098,3 +5101,83 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
     }
     return true;
 }
+
+
+// [TAG_FN_L21_VRAM_DXGI] LLAMA_FN_L21_VRAM_DXGI (Windows; qwen4exp profile: 2, else 0): under WDDM cudaMemGetInfo can miss
+// what other processes hold (Strata #1911: 30,994 MiB read free with 6 GiB held elsewhere; #2065: ~400 MiB really free
+// pages the card, 91 -> 3.3 t/s). The process's DXGI video memory budget minus its current usage is what the OS lets it
+// add before it starts to demote. 1 = the hot set sizes from min(CUDA free, DXGI free); 2 = both are logged, CUDA's is used.
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#    include <dxgi1_4.h>
+
+static IDXGIAdapter3 * fn_l21_dxgi_adapter(size_t mem_total) {
+    static IDXGIAdapter3 * ad   = nullptr;
+    static bool            done = false;
+    if (done) {
+        return ad;
+    }
+    done = true;
+    HMODULE lib = LoadLibraryA("dxgi.dll");
+    using create_t = HRESULT (WINAPI *)(REFIID, void **);
+    create_t create = lib ? (create_t) GetProcAddress(lib, "CreateDXGIFactory1") : nullptr;
+    IDXGIFactory1 * fac = nullptr;
+    if (!create || FAILED(create(__uuidof(IDXGIFactory1), (void **) &fac)) || !fac) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_VRAM_DXGI] no DXGI factory, the CUDA free memory is used\n");
+        return nullptr;
+    }
+    // the NVIDIA adapter whose dedicated memory is closest to the CUDA device's total
+    size_t best_d = SIZE_MAX;
+    IDXGIAdapter1 * a1 = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &a1) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d = {};
+        IDXGIAdapter3 * a3 = nullptr;
+        if (SUCCEEDED(a1->GetDesc1(&d)) && d.VendorId == 0x10DE && SUCCEEDED(a1->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &a3))) {
+            const size_t ded  = (size_t) d.DedicatedVideoMemory;
+            const size_t dist = ded > mem_total ? ded - mem_total : mem_total - ded;
+            if (dist < best_d) {
+                if (ad) {
+                    ad->Release();
+                }
+                ad     = a3;
+                best_d = dist;
+            } else {
+                a3->Release();
+            }
+        }
+        a1->Release();
+    }
+    fac->Release();
+    return ad;
+}
+
+void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
+    ggml_backend_dev_memory(dev, mem_free, mem_total);
+    static const int mode = [] { const char * e = getenv("LLAMA_FN_L21_VRAM_DXGI"); return e ? atoi(e) : 0; }();
+    if (mode <= 0) {
+        return;
+    }
+    IDXGIAdapter3 * ad = fn_l21_dxgi_adapter(*mem_total);
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (!ad || FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        return;
+    }
+    const size_t dfree = info.Budget > info.CurrentUsage ? (size_t) (info.Budget - info.CurrentUsage) : 0;
+    LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_VRAM_DXGI] free VRAM: CUDA %zu MiB, DXGI %zu MiB (budget %zu, this process %zu MiB), "
+            "total %zu MiB: %s\n", *mem_free >> 20, dfree >> 20, (size_t) (info.Budget >> 20), (size_t) (info.CurrentUsage >> 20),
+            *mem_total >> 20, mode == 1 && dfree < *mem_free ? "the DXGI value is used" : "the CUDA value is used");
+    if (mode == 1 && dfree < *mem_free) {
+        *mem_free = dfree;
+    }
+}
+#else
+void fn_l21_dev_memory(ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
+    ggml_backend_dev_memory(dev, mem_free, mem_total);
+}
+#endif
