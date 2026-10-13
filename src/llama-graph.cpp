@@ -106,6 +106,14 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+// [TAG_FN_L21_MTPH_ZERO] LLAMA_FN_L21_MTPH_ZERO (default 1): a ubatch without embd leaves the MTP hidden-state input h
+// unwritten, so the graph read whatever the buffer held (stale rows or NaN; upstream #30257 asserts here). h is zeroed
+// once and again only after a ubatch wrote it, so a reused graph pays one memset per switch. 0 = as before.
+static bool llama_fn_l21_mtph_zero() {
+    static const bool on = [] { const char * e = getenv("LLAMA_FN_L21_MTPH_ZERO"); return !(e && e[0] && atoi(e) == 0); }();
+    return on;
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -126,6 +134,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        h_zero = false;
+    } else if (h && !h_zero && llama_fn_l21_mtph_zero()) {
+        ggml_backend_tensor_memset(h, 0, 0, ggml_nbytes(h)); // [TAG_FN_L21_MTPH_ZERO]
+        h_zero = true;
     }
 }
 

@@ -2800,6 +2800,14 @@ public:
         ggml_backend_tensor_set(embd, buf.data(), 0, buf.size()*sizeof(float));
         if (h && ubatch->embd) {
             ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*h->ne[0]*sizeof(float));
+            h_zero = false;
+        } else if (h && !h_zero) {
+            // [TAG_FN_L21_MTPH_ZERO] LLAMA_FN_L21_MTPH_ZERO (default 1): a ubatch without embd read an unwritten h
+            static const bool on = [] { const char * e = getenv("LLAMA_FN_L21_MTPH_ZERO"); return !(e && e[0] && atoi(e) == 0); }();
+            if (on) {
+                ggml_backend_tensor_memset(h, 0, 0, ggml_nbytes(h));
+                h_zero = true;
+            }
         }
     }
 
@@ -2810,6 +2818,7 @@ public:
 
     ggml_tensor * embd = nullptr; // F32 [table->ne[0], n_tokens]
     ggml_tensor * h    = nullptr; // F32 [n_embd_out, n_tokens] or nullptr
+    bool          h_zero = false; // [TAG_FN_L21_MTPH_ZERO]
 
     const ggml_tensor * table;
     std::vector<float>  buf;

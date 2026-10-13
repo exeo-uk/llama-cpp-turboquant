@@ -155,6 +155,7 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    bool          h_zero = false;   // [TAG_FN_L21_MTPH_ZERO] h reads 0 since the last ubatch without embd
 
     const int64_t n_embd = 0;
 };
