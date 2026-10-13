@@ -1481,6 +1481,21 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+
+    // [TAG_FN_L21_MTP_ROWS] LLAMA_FN_L21_MTP_ROWS (qwen4exp profile: 1): with masked h (the draft context), only the output
+    // rows go on past the attention, as in the main graph's last layer. A catch-up row (a prompt row, or an accepted row the
+    // fused first draft step carries) needs only its K/V, written above; its attention output, MoE, hc and head were
+    // computed and dropped (Strata 3fd0460ba2). Drafts only: the rows kept get the same numbers up to kernel width.
+    static const bool rows_on = llama_fn_l3_int(model, "LLAMA_FN_L21_MTP_ROWS", 0) > 0;
+    const bool rows_cut = rows_on && inp_out_ids && cparams.embeddings_nextn_masked;
+    if (rows_cut) {
+        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+    }
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
@@ -1488,8 +1503,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     // the next draft step reads this residual as its h
-    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
-    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+    ggml_tensor * flat_out = inp_out_ids && !rows_cut ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
     res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
     cb(res->t_h_nextn, "h_nextn", il);
     ggml_build_forward_expand(gf, res->t_h_nextn);

@@ -239,6 +239,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
     // [TAG_FN_L21_DEC] round 21 decode / TTFT items (exact)
     { "LLAMA_FN_L21_MTP_VISION",        "1",      P_ALL }, // [TAG_FN_L21_MTP_VISION] the MTP draft decodes image rows (upstream #30257 + #30397)
+    { "LLAMA_FN_L21_MTP_ROWS",          "1",      P_ALL }, // [TAG_FN_L21_MTP_ROWS] MTP catch-up rows stop after their K/V (no MoE / hc / head)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
