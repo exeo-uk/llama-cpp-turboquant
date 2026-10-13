@@ -1282,6 +1282,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool replayed_since_capture = false; // [TAG_FN_L21_RECAP] the last call replayed the instance unchanged (#29768)
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {

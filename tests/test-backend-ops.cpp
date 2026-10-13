@@ -15069,6 +15069,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {262144, 2, 1, 1}, k, true));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {262145, 1, 1, 1}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 65, 1, 1}, k));
+        if (k == 64) { // [TAG_FN_L21_TOPKSCAN] the QSA prompt shape: one block per row, a large unordered k, with and without ties
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 72, 1, 1}, 2048, false, true));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 72, 1, 1}, 2048, true, true));
+        }
     }
 
     for (int k : {1, 2, 3, 7, 15}) {

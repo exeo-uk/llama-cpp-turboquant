@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -94,6 +95,9 @@ struct layer_state {
     // device buffer that go to the KV cache while its context needs them; slot_out[s]: the slot, or SL_SLACK bytes after
     // it, touches a segment that is out now - it holds no expert and takes no upload (-1 / empty: the layer lends nothing)
     int32_t                           sl_base = -1;
+    // [TAG_FN_L21_BIGUB] slots [sl_bbase, sl_base) lie over segments of their own that go out only while a 16K prompt
+    // ubatch's compute reserve needs their VRAM (-1: none); mapped, they are ordinary slots (and stream sources)
+    int32_t                           sl_bbase = -1;
     std::vector<uint8_t>              slot_out;
     size_t                            sl_toff[3] = { 0, 0, 0 }; // up_c / gate_c / down_c: byte offset in the buffer
     size_t                            sl_sb[3]   = { 0, 0, 0 }; // and slot stride
@@ -299,6 +303,14 @@ struct moe_cache {
     std::vector<std::vector<std::pair<size_t, size_t>>> sl_grp; // per group: [lo, hi) byte ranges of the buffer
     std::vector<size_t>   sl_grp_bytes;
     std::vector<size_t>   sl_given;        // per group: bytes given to the KV cache now (0: mapped)
+    // [TAG_FN_L21_BIGUB] the groups [0, sl_n_kv) go to the KV cache; group sl_n_kv (when there is one) is the borrow group:
+    // its sb_bytes go to the compute reserve of a 16K prompt ubatch (sb_out: out now), its residents come back after it
+    size_t                sl_n_kv  = 0;
+    size_t                sb_bytes = 0;
+    size_t                sb_out   = 0;
+    std::vector<std::array<int32_t, 3>> sb_res; // (layer, slot, expert) resident when the borrow went out
+    uint64_t              sb_n = 0;
+    double                sb_rel_ms = 0.0, sb_res_ms = 0.0;
     ggml_tensor *         sl_raw = nullptr; // I8 over [0, cb_lo): the clear of a segment mapped again
     // [TAG_FN_L17_VISION_LEND] the projector's share of the KV lend: its bytes, what it holds out now, statistics
     size_t                vis_bytes = 0;
@@ -2399,6 +2411,8 @@ size_t hot_round_up(size_t x, size_t g) {
 size_t g_kv_want    = 0;
 size_t g_kv_keep    = 0;
 int    g_kv_n_trunk = 0;
+// [TAG_FN_L21_BIGUB] the bytes the next hot set init puts in the borrow group of the slot lend (0: none)
+size_t g_kv_borrow  = 0;
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -2495,6 +2509,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
     // [TAG_FN_L10_SLOTLEND] each lend layer's tensors: the granules from SL_SLACK past the last base slot up to the zero
     // slot, cut into the groups; all of them below the stream's range (g_kv_keep bytes under the tail) and a guard granule
     std::vector<std::vector<std::pair<size_t, size_t>>> sl_grp;
+    std::vector<std::pair<size_t, size_t>>              sb_grp; // [TAG_FN_L21_BIGUB]
     if (mc->sl_req) {
         int n_grp = 16;
         if (const char * e = getenv("LLAMA_FN_L10_SLOTLEND_GROUPS"); e && atoi(e) > 0) {
@@ -2525,6 +2540,15 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                     mc->sl_fail = true;
                     return nullptr;
                 }
+                if (ls.sl_bbase >= 0 && ls.sl_bbase < ls.sl_base) {
+                    // [TAG_FN_L21_BIGUB] the borrow slots: from SL_SLACK past the last base slot to the granule below the
+                    // first KV-lend slot's (a slot that touches either segment is out with it)
+                    const size_t ba = hot_round_up(o + (size_t) ls.sl_bbase*sb + SL_SLACK, gran);
+                    const size_t bb = (o + (size_t) ls.sl_base*sb)/gran*gran;
+                    if (bb > ba && bb <= a) {
+                        sb_grp.push_back({ ba, bb });
+                    }
+                }
                 if (b <= a) {
                     continue;
                 }
@@ -2547,6 +2571,25 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
         if (sum < g_kv_want) {
             mc->sl_retry = true; // the caller sizes one slot more per lend layer
             return nullptr;
+        }
+        if (g_kv_borrow > 0) {
+            // [TAG_FN_L21_BIGUB] the borrow group after the KV groups (short of its want: one slot more, as for the KV)
+            size_t bsum = 0;
+            for (const auto & r : sb_grp) {
+                bsum += r.second - r.first;
+            }
+            if (bsum < g_kv_borrow && mc->sl_extra < 2) {
+                mc->sl_retry = true;
+                return nullptr;
+            }
+            if (bsum < g_kv_borrow) {
+                // the borrow never costs the KV lend: none this time (the 16K prompt ubatches stay off)
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB: no borrow\n",
+                        bsum/1048576.0, g_kv_borrow/1048576.0);
+                g_kv_borrow = 0;
+            } else {
+                sl_grp.push_back(sb_grp);
+            }
         }
     }
     ggml_backend_buffer_t buf = vmm.alloc(buft, total);
@@ -2671,12 +2714,15 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
         mc->sl_grp = sl_grp;
         mc->sl_grp_bytes.assign(sl_grp.size(), 0);
         mc->sl_given.assign(sl_grp.size(), 0);
+        mc->sl_n_kv  = g_kv_borrow > 0 ? sl_grp.size() - 1 : sl_grp.size(); // [TAG_FN_L21_BIGUB]
         mc->kv_bytes = 0;
+        mc->sb_bytes = 0;
+        mc->sb_out   = 0;
         for (size_t j = 0; j < sl_grp.size(); ++j) {
             for (const auto & r : sl_grp[j]) {
                 mc->sl_grp_bytes[j] += r.second - r.first;
             }
-            mc->kv_bytes += mc->sl_grp_bytes[j];
+            (j < mc->sl_n_kv ? mc->kv_bytes : mc->sb_bytes) += mc->sl_grp_bytes[j];
         }
         int n_ll = 0, il_a = -1, il_b = -1, n_lend = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -2692,7 +2738,20 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
         mc->sl_on = true;
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L10_SLOTLEND] %d layers (blk.%d..%d) hold %d slots more each over %.0f MiB that go to the "
                 "KV cache in %zu groups while its context grows (%.0f MiB wanted); the other layers keep theirs\n", n_ll, il_a,
-                il_b, n_lend, mc->kv_bytes/1048576.0, sl_grp.size(), g_kv_want/1048576.0);
+                il_b, n_lend, mc->kv_bytes/1048576.0, mc->sl_n_kv, g_kv_want/1048576.0);
+        if (mc->sb_bytes > 0) {
+            int n_b = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const layer_state & ls = mc->layers[li0 + i];
+                if (ls.sl_bbase >= 0 && ls.sl_base > ls.sl_bbase) {
+                    n_b = ls.sl_base - ls.sl_bbase;
+                    break;
+                }
+            }
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] the same layers' %d slots below those (%.0f MiB, %.0f MiB wanted) give their "
+                    "VRAM to a 16K prompt ubatch's compute reserve while it runs; the slots per layer are as without it\n", n_b,
+                    mc->sb_bytes/1048576.0, g_kv_borrow/1048576.0);
+        }
     }
     ggml_tensor * raw = ggml_new_tensor_1d(cctx, GGML_TYPE_I8, (int64_t) (total - lo));
     ggml_set_name(raw, "moe_hot_tail");
@@ -3004,6 +3063,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
         std::vector<std::vector<int32_t>> hot_ids(layers.size());
         std::vector<int32_t>              n_slots_of(layers.size(), 0);
         std::vector<int32_t>              sl_base_of(layers.size(), -1); // [TAG_FN_L10_SLOTLEND]
+        std::vector<int32_t>              sl_bbase_of(layers.size(), -1); // [TAG_FN_L21_BIGUB]
         size_t used = 0;
         // [TAG_FN_L3_VRAM_CBUF] the virtual-memory layout pads the tail start and the end to granules and adds a guard
         // granule below the tail and after it
@@ -3032,6 +3092,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
             };
             std::vector<int> sl_layers;
             int32_t          sl_e = 0;
+            int32_t          sl_bx = 0; // [TAG_FN_L21_BIGUB]
             if (sl_req) {
                 std::vector<int> trunk;
                 for (int li = 0; li < (int) layers.size(); ++li) {
@@ -3060,6 +3121,11 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                     // granule); a placement that comes out short asks for one slot more (sl_extra)
                     const size_t waste = sl_layers.size()*3*(vmm_gran + SL_SLACK);
                     sl_e = (int32_t) ((g_kv_want + waste + per - 1)/per) + mc->sl_extra;
+                    if (g_kv_borrow > 0) {
+                        // [TAG_FN_L21_BIGUB] the borrow: that many of each lend layer's base slots more lie over segments
+                        // of their own (the slots per layer stay as they are: the learned set and the routing see no change)
+                        sl_bx = (int32_t) ((g_kv_borrow + waste + sl_layers.size()*3*vmm_gran + per - 1)/per) + mc->sl_extra;
+                    }
                 }
             }
             // the base slots from the budget without the KV cache's unmapped bytes: what a fit with the KV cache mapped
@@ -3077,6 +3143,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                         continue;
                     }
                     sl_base_of[li]  = nv[li];
+                    sl_bbase_of[li] = sl_bx > 0 && nv[li] > sl_bx ? nv[li] - sl_bx : -1; // [TAG_FN_L21_BIGUB]
                     n_slots_of[li] += e;
                     used += (size_t) e*layers[li].bytes;
                 }
@@ -3221,6 +3288,7 @@ bool llama_moe_hot_init(const llama_model & model, const void * owner, size_t bu
                 ls.pub.il       = layers[li].il;
                 ls.pub.n_slots  = n_hot;
                 ls.sl_base      = sl_base_of[li]; // [TAG_FN_L10_SLOTLEND]
+                ls.sl_bbase     = sl_bbase_of[li]; // [TAG_FN_L21_BIGUB]
                 ls.pub.up_src   = l->ffn_up_exps;
                 ls.pub.gate_src = l->ffn_gate_exps;
                 ls.pub.down_src = l->ffn_down_exps;
@@ -3600,7 +3668,8 @@ void hot_drain_out(moe_cache * mc) {
 // [TAG_FN_L10_SLOTLEND] which lend slots of the layer touch a segment that is out (the slot's bytes in each of its tensors
 // plus SL_SLACK after them)
 void hot_sl_slots(moe_cache * mc, layer_state & ls) {
-    for (int32_t s = std::max(0, ls.sl_base); s < ls.pub.n_slots && s < (int32_t) ls.slot_out.size(); ++s) {
+    const int32_t s0 = ls.sl_bbase >= 0 ? std::min(ls.sl_bbase, ls.sl_base) : ls.sl_base; // [TAG_FN_L21_BIGUB]
+    for (int32_t s = std::max(0, s0); s < ls.pub.n_slots && s < (int32_t) ls.slot_out.size(); ++s) {
         bool o = false;
         for (int k = 0; k < 3 && !o; ++k) {
             const size_t lo = ls.sl_toff[k] + (size_t) s*ls.sl_sb[k];
@@ -3633,7 +3702,7 @@ size_t hot_sl_release(moe_cache * mc, const void * owner, size_t need) {
     const int64_t t0 = ggml_time_us();
     std::vector<size_t> rel;
     size_t out = mc->kv_out;
-    for (size_t g = mc->sl_grp.size(); g > 0 && out < need; --g) {
+    for (size_t g = mc->sl_n_kv; g > 0 && out < need; --g) { // [TAG_FN_L21_BIGUB] the KV groups only
         if (mc->sl_given[g - 1] == 0 && mc->sl_grp_bytes[g - 1] > 0) {
             mc->sl_given[g - 1] = mc->sl_grp_bytes[g - 1]; // out from here on (the slots below see it)
             rel.push_back(g - 1);
@@ -3710,7 +3779,7 @@ size_t hot_sl_restore(moe_cache * mc, const void * owner, size_t keep) {
     const int64_t t0 = ggml_time_us();
     size_t n_res = 0;
     size_t bytes = 0;
-    for (size_t g = 0; g < mc->sl_grp.size(); ++g) {
+    for (size_t g = 0; g < mc->sl_n_kv; ++g) { // [TAG_FN_L21_BIGUB] the KV groups only
         if (mc->sl_given[g] == 0) {
             continue;
         }
@@ -3757,6 +3826,186 @@ size_t hot_sl_restore(moe_cache * mc, const void * owner, size_t keep) {
                 "out); their slots fill from the routing\n", n_res, bytes/1048576.0, ms, mc->kv_out/1048576.0);
     }
     return mc->kv_out;
+}
+
+size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads); // [TAG_FN_L21_BIGUB] below
+
+// [TAG_FN_L21_BIGUB] the borrow group goes out for a 16K prompt ubatch's compute reserve: its slots leave the tables (their
+// residents are remembered), queued uploads into them drop, the segments are unmapped. The owner's graphs are synchronized
+// (the caller is its switch to FULL). Returns the bytes out (0: none, nothing changed)
+size_t hot_sb_release(moe_cache * mc, const void * owner) {
+    if (!mc->sl_on || mc->sb_bytes == 0 || mc->sl_n_kv >= mc->sl_grp.size() || !mc->cb_buf || (mc->adapt && owner != mc->owner)) {
+        return 0;
+    }
+    if (mc->sb_out > 0) {
+        return mc->sb_out;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
+    const int64_t t0 = ggml_time_us();
+    const size_t  g  = mc->sl_n_kv;
+    mc->sl_given[g] = mc->sl_grp_bytes[g];
+    for (auto & ls : mc->layers) {
+        if (ls.sl_base >= 0) {
+            hot_sl_slots(mc, ls);
+        }
+    }
+    hot_drain_out(mc); // queued uploads into out slots dropped, the worker's batch landed (in memory still mapped)
+    mc->sb_res.clear();
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        layer_state & ls = mc->layers[li];
+        if (ls.sl_bbase < 0 || ls.slot_out.empty()) {
+            continue;
+        }
+        bool changed = false;
+        for (int32_t sl = ls.sl_bbase; sl < ls.sl_base; ++sl) {
+            if (!ls.slot_out[(size_t) sl]) {
+                continue;
+            }
+            const int32_t e = ls.slot_expert[sl];
+            if (e >= 0) {
+                mc->sb_res.push_back({ (int32_t) li, sl, e });
+                ls.expert_slot[e]  = -1;
+                ls.slot_expert[sl] = -1;
+                changed = true;
+            }
+        }
+        if (changed) {
+            hot_write_tables(mc, ls);
+        }
+    }
+    if (mc->up_backend) {
+        ggml_backend_synchronize(mc->up_backend);
+    }
+    bool ok = true;
+    for (const auto & r : mc->sl_grp[g]) {
+        ok = mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first) && ok;
+    }
+    if (!ok) {
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow group could not give all of its VRAM back\n");
+    }
+    mc->sb_out = ok ? mc->sl_grp_bytes[g] : 0;
+    if (!ok) {
+        mc->sl_given[g] = 1; // out (its slots hold nothing), a token amount: the restore maps it again
+    }
+    mc->sb_n++;
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->sb_rel_ms += ms;
+    if (mc->sb_n <= 3 || mc->sb_n % 32 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] borrow %" PRIu64 ": %.0f MiB out in %.1f ms (%zu residents remembered)\n",
+                mc->sb_n, mc->sb_out/1048576.0, ms, mc->sb_res.size());
+    }
+    return mc->sb_out;
+}
+
+// [TAG_FN_L21_BIGUB] the borrow group comes back (the compute reserve is gone): mapped, cleared, its remembered residents
+// uploaded again (through the upload worker with the adaptive set, else here) unless they are resident elsewhere now
+void hot_sb_restore(moe_cache * mc, const void * owner) {
+    if (!mc->sl_on || mc->sl_n_kv >= mc->sl_grp.size() || mc->sl_given[mc->sl_n_kv] == 0 || !mc->cb_buf ||
+        (mc->adapt && owner != mc->owner)) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc);
+    const int64_t t0 = ggml_time_us();
+    const size_t  g  = mc->sl_n_kv;
+    size_t done = 0;
+    bool   ok   = true;
+    for (const auto & r : mc->sl_grp[g]) {
+        (void) mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first); // a failed release may have left it mapped
+        if (!mc->cb_map(mc->cb_buf, r.first, r.second - r.first)) {
+            ok = false;
+            break;
+        }
+        done++;
+    }
+    if (!ok) {
+        for (size_t i = 0; i < done; ++i) {
+            const auto & r = mc->sl_grp[g][i];
+            (void) mc->cb_unmap(mc->cb_buf, r.first, r.second - r.first);
+        }
+        LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] mapping the borrow group again failed: its slots stay out until the next "
+                "restore\n");
+        return;
+    }
+    for (const auto & r : mc->sl_grp[g]) {
+        ggml_backend_tensor_memset(mc->sl_raw, 0, r.first, r.second - r.first);
+    }
+    mc->sl_given[g] = 0;
+    mc->sb_out      = 0;
+    for (auto & ls : mc->layers) {
+        if (ls.sl_base >= 0) {
+            hot_sl_slots(mc, ls);
+        }
+    }
+    size_t n_up  = 0;
+    size_t bytes = 0;
+    if (mc->adapt) {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        for (const auto & r : mc->sb_res) {
+            layer_state & ls = mc->layers[(size_t) r[0]];
+            const int32_t sl = r[1];
+            const int32_t e  = r[2];
+            if (ls.slot_out[(size_t) sl] || ls.slot_expert[sl] >= 0 || ls.slot_in_flight[sl] || ls.expert_slot[e] >= 0 ||
+                ls.expert_in_flight[e]) {
+                continue;
+            }
+            ls.slot_in_flight[sl]  = true;
+            ls.expert_in_flight[e] = true;
+            upload_job j;
+            j.layer_idx = (size_t) r[0];
+            j.expert    = e;
+            j.slot      = sl;
+            mc->todo.push_back(j);
+            bytes += ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            n_up++;
+        }
+    } else {
+        std::vector<refill_job> jobs;
+        std::vector<char> touched(mc->layers.size(), 0);
+        for (const auto & r : mc->sb_res) {
+            layer_state & ls = mc->layers[(size_t) r[0]];
+            const int32_t sl = r[1];
+            const int32_t e  = r[2];
+            if (ls.slot_out[(size_t) sl] || ls.slot_expert[sl] >= 0 || ls.expert_slot[e] >= 0) {
+                continue;
+            }
+            ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            bool fit = true;
+            for (int k = 0; k < 3; ++k) {
+                const size_t sz = srcs[k]->nb[2];
+                fit = fit && (size_t) sl*dsts[k]->nb[2] + sz <= ggml_nbytes(dsts[k]) && (size_t) (e + 1)*sz <= ggml_nbytes(srcs[k]);
+            }
+            if (!fit) {
+                continue;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const size_t sz = srcs[k]->nb[2];
+                jobs.push_back({ dsts[k], (size_t) sl*dsts[k]->nb[2], (const char *) srcs[k]->data + (size_t) e*sz, sz });
+            }
+            ls.slot_expert[sl] = e;
+            ls.expert_slot[e]  = sl;
+            touched[(size_t) r[0]] = 1;
+            n_up++;
+        }
+        bytes = hot_refill(mc, jobs, 8);
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            if (touched[li]) {
+                hot_write_tables(mc, mc->layers[li]);
+            }
+        }
+    }
+    mc->sb_res.clear();
+    if (mc->adapt && n_up > 0) {
+        mc->wcv.notify_one();
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->sb_res_ms += ms;
+    if (mc->sb_n <= 3 || mc->sb_n % 32 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] borrow %" PRIu64 " back in %.1f ms: %zu residents (%.2f GiB) %s\n", mc->sb_n, ms,
+                n_up, bytes/1073741824.0, mc->adapt ? "queued for the upload worker" : "refilled");
+    }
 }
 
 // the lent range as one I8 tensor (byte-offset clears of the tails that the slot tensors' alloc sizes pad after them)
@@ -4727,6 +4976,27 @@ void llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk) {
     g_kv_want    = want;
     g_kv_keep    = keep;
     g_kv_n_trunk = n_trunk;
+}
+
+void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
+    g_kv_borrow = bytes;
+}
+
+size_t llama_moe_hot_cb_borrow_bytes() {
+    const moe_cache * mc = g_cache;
+    return mc && mc->sl_on ? mc->sb_bytes : 0;
+}
+
+size_t llama_moe_hot_cb_borrow(const void * owner) {
+    moe_cache * mc = g_cache;
+    return mc ? hot_sb_release(mc, owner) : 0;
+}
+
+void llama_moe_hot_cb_unborrow(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (mc) {
+        hot_sb_restore(mc, owner);
+    }
 }
 
 size_t llama_moe_hot_kv_bytes() {

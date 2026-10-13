@@ -1347,6 +1347,12 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: [TAG_FN_L20_BIGPROMPT_UB] prompts wider than %u tokens run in ubatches of %u (n_batch = n_ubatch "
                     "= %u; other wide batches keep %u-token graphs)\n", __func__, l20_base_ub, (uint32_t) ub, (uint32_t) ub,
                     l20_base_ub);
+            l21_bigub = llama_fn_l3_int(model, "LLAMA_FN_L21_BIGUB", 0) != 0; // [TAG_FN_L21_BIGUB]
+            if (l21_bigub) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L21_BIGUB] only prompts of more than %u tokens take the %u-token ubatches; the tail "
+                        "stays at the %u-token size and the extra comes from borrow slots of the KV lend layers\n", __func__,
+                        (uint32_t) ub, (uint32_t) ub, l20_base_ub);
+            }
         }
     }
 
@@ -3919,7 +3925,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         bool     keep_full = false;
         if (l20_base_ub > 0) {
             const int64_t after = l20_prompt_after;
-            full_w    = llama_fn_l20_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after);
+            full_w    = !l21_bigub ? llama_fn_l20_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after) :
+                        l21_big_off ? l20_base_ub : // [TAG_FN_L21_BIGUB]
+                        llama_fn_l21_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after);
             keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
             if (keep_full && l20_n_keep++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
@@ -6399,10 +6407,12 @@ void llama_context::moe_hot_fit_try() {
     const size_t lend_want = kv_want + vis_want;
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(lend_want, llama_prefill_stream_lend_bytes(this), (int) model.hparams.n_layer());
+        llama_moe_hot_set_cb_borrow(cbuf_tail > 0 ? l21_extra : 0); // [TAG_FN_L21_BIGUB]
     }
     bool hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, cbuf_tail);
     if (lend_want > 0) {
         llama_moe_hot_set_kv_lend(0, 0, 0);
+        llama_moe_hot_set_cb_borrow(0); // [TAG_FN_L21_BIGUB]
         if (hot_ok && llama_moe_hot_kv_bytes() >= kv_want) {
             if (kv_want > 0) {
                 llama_kv_lend_set_hooks(llama_moe_hot_kv_release, llama_moe_hot_kv_restore, this);
@@ -6436,6 +6446,15 @@ void llama_context::moe_hot_fit_try() {
         ggml_backend_dev_memory(dev, &mem_free, &mem_total);
         budget = vis_cut(std::min(budget_max, llama_fn_vram_fit_budget(mem_total, mem_free, ceiling, margin)));
         hot_ok = budget > 0 && llama_moe_hot_init(model, this, budget, 0);
+    }
+    if (l21_extra > 0) {
+        // [TAG_FN_L21_BIGUB] no borrow placed: the command's width for every prompt (the tail fits only that)
+        const size_t bb = hot_ok && cbuf_tail > 0 ? llama_moe_hot_cb_borrow_bytes() : 0;
+        if (bb < l21_extra) {
+            l21_big_off = true;
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the hot set holds %.0f of the %.0f MiB borrow: prompts run at %u tokens per "
+                    "ubatch\n", bb/MiB, l21_extra/MiB, l20_base_ub);
+        }
     }
     if (hot_ok) {
         sched_need_reserve = true;
@@ -6527,6 +6546,11 @@ void llama_context::cbuf_off() {
     }
     llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
     synchronize();
+    if (l21_extra > 0) {
+        llama_moe_hot_cb_unborrow(this); // [TAG_FN_L21_BIGUB]
+        l21_extra   = 0;
+        l21_big_off = true;
+    }
     if (l20_base_ub > 0) {
         // [TAG_FN_L20_BIGPROMPT_UB] no lend: a FULL reserve for good, at the command's ubatch (as without the switch)
         LLAMA_LOG_WARN("%s: [TAG_FN_L20_BIGPROMPT_UB] no compute-buffer lend: back to n_batch = n_ubatch = %u\n", __func__,
@@ -6613,7 +6637,21 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     // the FULL reserve once the hot set exists can be larger (more splits: +235 MiB at -c 16384), and a larger tail costs
     // the decode nothing (all of it is mapped between prompts): a slack of max(128 MiB, FULL / 16)
     cbuf_slack_b = std::max<size_t>((size_t) 128 << 20, full/16);
-    const size_t tail = llama_fn_cbuf_tail(full, small, (cbuf_pool_mib << 20) + cbuf_slack_b + l20_dft_extra, gran, (size_t) 256 << 20);
+    // [TAG_FN_L21_BIGUB] the tail by the command's width, the 16K reserve's extra (with its larger slack and the draft's
+    // wide reserve) in the borrow
+    size_t tail_full = full, tail_extra = cbuf_slack_b + l20_dft_extra;
+    l21_extra = 0;
+    if (l21_bigub && l20_base_ub > 0 && l20_full_base_b > small && full > l20_full_base_b) {
+        const size_t slack_base = std::max<size_t>((size_t) 128 << 20, l20_full_base_b/16);
+        l21_extra  = full + cbuf_slack_b + l20_dft_extra - (l20_full_base_b + slack_base);
+        tail_full  = l20_full_base_b;
+        tail_extra = slack_base;
+    }
+    const size_t tail = llama_fn_cbuf_tail(tail_full, small, (cbuf_pool_mib << 20) + tail_extra, gran, (size_t) 256 << 20);
+    if (l21_extra > 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L21_BIGUB] the tail for FULL at %u tokens (%.0f MiB), the %u-token reserve's extra %.0f MiB "
+                "from the borrow\n", __func__, l20_base_ub, tail/MiB, cparams.n_ubatch, l21_extra/MiB);
+    }
     if (tail == 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] the FULL compute reserve (%.0f MiB) is not much larger than the SMALL one "
                 "(%.0f MiB): off\n", __func__, full/MiB, small/MiB);
@@ -6632,8 +6670,8 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] compute reserve FULL %.0f MiB (ubatch %u), SMALL %.0f MiB (<= %u tokens): the hot "
             "set keeps a tail of %.0f MiB for the difference (+ %zu MiB LLAMA_FN_CBUF_POOL_MIB + %.0f MiB slack)\n", __func__,
-            full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (full - small)/MiB, cbuf_pool_mib,
-            cbuf_slack_b/MiB);
+            full/MiB, std::min(cparams.n_ctx, cparams.n_ubatch), small/MiB, cbuf_small_t, (tail_full - small)/MiB, cbuf_pool_mib,
+            (l21_extra > 0 ? tail_extra : cbuf_slack_b)/MiB); // [TAG_FN_L21_BIGUB] the tail of the command's width
     return tail;
 }
 
@@ -6687,6 +6725,21 @@ bool llama_context::cbuf_set(bool full, uint32_t width) {
         const bool base_w  = l20_base_ub > 0 && w_want == l20_base_ub && l20_base_need > 0;
         released           = llama_moe_hot_cbuf_release(this, base_w ? l20_base_need : 0);
         cbuf_full_t        = l20_base_ub > 0 ? (base_w ? l20_base_ub : cparams.n_ubatch) : 0;
+        if (l21_extra > 0 && l20_base_ub > 0 && !base_w) {
+            // [TAG_FN_L21_BIGUB] the 16K reserve's extra: the borrow goes out (short: back, and the command's width)
+            const size_t got = llama_moe_hot_cb_borrow(this);
+            if (got < l21_extra) {
+                llama_moe_hot_cb_unborrow(this);
+                cbuf_full_t = l20_base_ub;
+                if (l21_n_fallback++ < 3) {
+                    LLAMA_LOG_WARN("%s: [TAG_FN_L21_BIGUB] the borrow gave %.0f of %.0f MiB: this prompt runs at %u tokens per "
+                            "ubatch\n", __func__, got/MiB, l21_extra/MiB, l20_base_ub);
+                }
+            } else {
+                released += got;
+                l21_n_borrow++;
+            }
+        }
         (base_w ? l20_n_base : l20_n_big) += l20_base_ub > 0 ? 1 : 0;
         cbuf_state         = CBUF_FULL;
         sched_need_reserve = true;
@@ -6771,6 +6824,9 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
         }
     }
     restored = llama_moe_hot_cbuf_restore(this);
+    if (l21_extra > 0) {
+        llama_moe_hot_cb_unborrow(this); // [TAG_FN_L21_BIGUB] after the tail: mapped, cleared, its residents queued
+    }
     try {
         sched_reserve();
         return true;

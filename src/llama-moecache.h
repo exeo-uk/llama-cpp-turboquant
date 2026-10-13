@@ -143,6 +143,14 @@ bool   llama_moe_hot_cbuf_restore(const void * owner);
 // again (lowest first) while at least `keep` bytes stay out, clears and refills them; returns the bytes out.
 // _generation changes with every release / restore: a graph built before must not be reused.
 void     llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk);
+// [TAG_FN_L21_BIGUB] with the slot lend: the next init also puts `bytes` of the lend layers' base slots over segments of
+// their own (the slots per layer unchanged); _cb_borrow_bytes: what it placed (0: none); _cb_borrow (the owner's graphs
+// synchronized, its switch to FULL): those segments go out for a wide compute reserve, returns the bytes out (0: none);
+// _cb_unborrow: they come back, cleared, their residents queued for upload again. The KV cache's groups are separate.
+void     llama_moe_hot_set_cb_borrow(size_t bytes);
+size_t   llama_moe_hot_cb_borrow_bytes();
+size_t   llama_moe_hot_cb_borrow(const void * owner);
+void     llama_moe_hot_cb_unborrow(const void * owner);
 size_t   llama_moe_hot_kv_bytes();
 
 // [TAG_FN_L21_VRAM_DXGI] ggml_backend_dev_memory, plus (LLAMA_FN_L21_VRAM_DXGI) the DXGI budget logged or used (llama-moecache.cpp)
