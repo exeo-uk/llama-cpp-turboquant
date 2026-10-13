@@ -47,6 +47,8 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+// [TAG_FN_L21_NANGUARD] rows sampled with NaN / +inf logits since the last call (then 0); LLAMA_FN_L21_NANGUARD=0: always 0
+uint32_t                common_sampler_take_nonfinite(struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 

@@ -222,6 +222,8 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    uint32_t n_nonfinite = 0; // [TAG_FN_L21_NANGUARD] rows seen with NaN / +inf logits since the last take
+
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -827,6 +829,15 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+uint32_t common_sampler_take_nonfinite(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return 0;
+    }
+    const uint32_t n = gsmpl->n_nonfinite;
+    gsmpl->n_nonfinite = 0;
+    return n;
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -953,6 +964,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // [TAG_FN_L4_HOST_TOPK] the K candidates straight from the row when that is exact, else the full array
     if (gsmpl->fast_k <= 0 || !gsmpl->set_logits_fast(ctx, idx)) {
         gsmpl->set_logits(ctx, idx);
+    }
+
+    // [TAG_FN_L21_NANGUARD] LLAMA_FN_L21_NANGUARD (default 1): a NaN hidden state makes every logit of the row NaN (the l19
+    // collapse sampled token 0, "!!!!"), so 9 candidates (first, last, 7 strided) are enough to see it; -inf is a legal
+    // masked logit, so only NaN and +inf count. The caller takes the count (common_sampler_take_nonfinite) and reacts.
+    {
+        static const bool l21_nanguard = [] { const char * e = getenv("LLAMA_FN_L21_NANGUARD"); return !(e && e[0] && atoi(e) == 0); }();
+        if (l21_nanguard && cur_p.size > 0) {
+            const size_t n = cur_p.size;
+            bool bad = false;
+            for (int k = 0; k < 9 && !bad; ++k) {
+                const float v = cur_p.data[k == 8 ? n - 1 : (n * (size_t) k) / 8].logit;
+                bad = std::isnan(v) || (std::isinf(v) && v > 0.0f);
+            }
+            gsmpl->n_nonfinite += bad ? 1 : 0;
+        }
     }
 
     // Check if a backend sampler has already sampled a token in which case we

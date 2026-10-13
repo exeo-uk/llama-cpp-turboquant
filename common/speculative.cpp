@@ -297,6 +297,9 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    // [TAG_FN_L21_NANGUARD] true once (then false) when a draft of seq_id saw non-finite logits since the last call
+    virtual bool take_nonfinite(llama_seq_id /*seq_id*/) { return false; }
+
     virtual bool process(const common_batch & batch) = 0;
 
     // [TAG_SPEC_PREFILL_TAIL_EXTRACT] true when this implementation will not read the target's
@@ -4109,9 +4112,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         fuse_ok[seq_id] = (int8_t) *p;
     }
 
+    // [TAG_FN_L21_NANGUARD] per sequence: drafts off for the rest of the request (nf_off) and a pending report (nf_flag)
+    std::vector<uint8_t> nf_off;
+    std::vector<uint8_t> nf_flag;
+
+    bool take_nonfinite(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) nf_flag.size() || !nf_flag[seq_id]) {
+            return false;
+        }
+        nf_flag[seq_id] = 0;
+        return true;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        common_sampler_take_nonfinite(smpls[seq_id].get()); // [TAG_FN_L21_NANGUARD] a new request drafts again
+        if (seq_id >= 0 && seq_id < (llama_seq_id) nf_off.size()) {
+            nf_off[seq_id] = 0;
+        }
 
         // [TAG_FN_L4_HOST_MTPFUSE] rows kept from an earlier request are not this prompt's
         if (fuse_on && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
@@ -4567,6 +4586,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+            // [TAG_FN_L21_NANGUARD] a request whose draft saw non-finite logits drafts nothing more
+            if (seq_id < (llama_seq_id) nf_off.size() && nf_off[seq_id]) {
+                continue;
+            }
 
             // [TAG_FN_MTP_COST] no draft decode when even a best-case first token cannot pay for its row and the decode
             if (use_policy && !cost.more(1.0, cost.acc_hi(cost_mode[seq_id], 0), cs_E, cs_R, 0, cs_n)) {
@@ -4762,6 +4785,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const llama_token id_sampled = eq_step ? eq_id[seq_id] : common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                // [TAG_FN_L21_NANGUARD] non-finite draft logits: no draft row for this step, drafts off for the request, and
+                // the server drops the slot's cache at the request's end so the next one rebuilds the MTP context from token 0
+                if (common_sampler_take_nonfinite(smpl) > 0) {
+                    if (nf_off.size() != n_seq) {
+                        nf_off.assign(n_seq, 0);
+                        nf_flag.assign(n_seq, 0);
+                    }
+                    nf_off[seq_id]  = 1;
+                    nf_flag[seq_id] = 1;
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    static std::atomic<int> n_nf_log{0};
+                    if (n_nf_log.fetch_add(1) < 4) {
+                        LOG_WRN("[TAG_FN_L21_NANGUARD] MTP draft: non-finite logits (seq %d, draft row %d, batch row %d): drafts off for this request
+",
+                                seq_id, i, i_last[seq_id]);
+                    }
+                    continue;
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -6280,6 +6323,17 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+bool common_speculative_take_nonfinite(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return false;
+    }
+    bool any = false;
+    for (auto & impl : spec->impls) {
+        any = impl->take_nonfinite(seq_id) || any;
+    }
+    return any;
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

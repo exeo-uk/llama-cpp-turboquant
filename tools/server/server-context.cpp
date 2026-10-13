@@ -1329,6 +1329,8 @@ struct server_slot {
     int64_t              t_park_us       = 0;
     int64_t              t_run_us        = 0;      // launch or last resume, for victim ordering
     int32_t              n_park_fail     = 0;
+    int                  nf_retry_task   = -1;     // [TAG_FN_L21_NANGUARD] the task whose prompt was re-read once
+    bool                 nf_drop         = false;  // [TAG_FN_L21_NANGUARD] a draft saw non-finite logits: drop the cache at the next task
     uint64_t             n_parks_total   = 0;      // never reset, /slots
     uint64_t             ckpt_build_iter = 0;      // pool iteration that created the newest context checkpoint
     std::function<void(server_slot &)> callback_on_park_drop;
@@ -4420,6 +4422,13 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // [TAG_FN_L21_NANGUARD] a draft of the previous task saw non-finite logits: rebuild from token 0
+        if (slot.nf_drop) {
+            slot.nf_drop = false;
+            SLT_WRN(slot, "%s", "[TAG_FN_L21_NANGUARD] the last answer's draft saw non-finite logits: the cache is dropped
+");
+            slot.prompt_clear();
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -4745,6 +4754,35 @@ private:
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
+    }
+
+    // [TAG_FN_L21_NANGUARD] LLAMA_FN_L21_NANGUARD (default 1, every model; Strata #1892 shape): the target sampled a row
+    // with NaN / +inf logits (a NaN hidden state; the l19 collapse answered "!!!!" until a restart). The slot's cache is
+    // dropped (target + draft sequence, checkpoints). At the first token of an answer the prompt is re-read from token 0
+    // once; later in an answer, or after that retry, the request ends with an error instead of garbage. The first events
+    // are logged with the batch row and the slot's size.
+    std::atomic<int> nf_events{0};
+    void nanguard_target(server_slot & slot, const int row, const char * where) {
+        const int  n_ev  = ++nf_events;
+        const bool first = slot.stats.n_gen == 0;
+        const bool retry = first && slot.task && slot.nf_retry_task != slot.task->id;
+        if (n_ev <= 8) {
+            SLT_WRN(slot, "[TAG_FN_L21_NANGUARD] non-finite target logits (%s, batch row %d, %d tokens in the slot, %d generated, "
+                    "event %d): cache dropped, %s
+", where, row, (int) slot.prompt.tokens.size(), (int) slot.stats.n_gen, n_ev,
+                    retry ? "re-reading the prompt once" : "the request ends with an error");
+        }
+        slot.prompt_clear();
+        slot.i_batch = -1;
+        slot.spec_draft.clear();
+        slot.spec_i_batch.clear();
+        if (retry) {
+            slot.nf_retry_task = slot.task->id;
+            slot.state = SLOT_STATE_STARTED;
+            return;
+        }
+        send_error(slot, "non-finite logits (NaN): the slot's cache was dropped, please retry", ERROR_TYPE_SERVER);
+        slot.release();
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -6282,6 +6320,12 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            // [TAG_FN_L21_NANGUARD] the draft saw non-finite logits (drafts stay off for this request): the next task of the
+            // slot starts from an empty cache, so the MTP context is rebuilt from token 0
+            if (common_speculative_take_nonfinite(spec.get(), slot.id)) {
+                slot.nf_drop = true;
+            }
+
             slot.stats.n_draft_tokens += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -7453,6 +7497,12 @@ private:
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
+            // [TAG_FN_L21_NANGUARD]
+            if (common_sampler_take_nonfinite(slot.smpl.get()) > 0) {
+                nanguard_target(slot, tok_idx, "single");
+                return;
+            }
+
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
@@ -7594,6 +7644,12 @@ private:
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_smp0).count());
                 }
                 slot.spec_i_batch.clear();
+
+                // [TAG_FN_L21_NANGUARD] the verify rows sampled non-finite logits: nothing of this step is used
+                if (common_sampler_take_nonfinite(slot.smpl.get()) > 0) {
+                    nanguard_target(slot, -1, "verify");
+                    return;
+                }
 
                 // [TAG_BS_LAZY_GRAMMAR] accept stopped at the token that activated the grammar or the budget's forcing;
                 // switch this slot to CPU sampling before its next verify decode is built
