@@ -90,12 +90,13 @@ static __global__ void mm_ids_helper(
                 }
             }
 
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
-            }
-
             const int n_uses_it = warp_reduce_sum<warp_size>(n_uses);
             dup |= n_uses_it > 1;
+
+            // [TAG_FN_L21_DUPID] a repeated expert takes the dup pass, which does not read the store (no racing writes)
+            if (iex_used != -1 && n_uses_it == 1) {
+                store[it_compact] = mm_ids_helper_store(it, iex_used);
+            }
             if (n_uses_it > 0) {
                 it_compact++;
             }
@@ -129,7 +130,7 @@ static __global__ void mm_ids_helper(
                 }
             }
 
-            if (iex_used != -1) {
+            if (iex_used != -1 && n_uses_it == 1) { // [TAG_FN_L21_DUPID] see the generic path
                 store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
             }
 
