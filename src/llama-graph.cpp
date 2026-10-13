@@ -4626,8 +4626,14 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
     // [TAG_FN_L19_RS_FILL] qwen4exp: the cleared state is written as zeros (fill), not scaled by 0 - a cell that once held a
     // non-finite value kept it through every later clear (NaN * 0 = NaN), so one bad prompt poisoned the sequence's recurrent
-    // state for good (every later answer of the slot decoded and drafted NaN until a restart). Other models keep the scale.
-    if (arch == LLM_ARCH_QWEN4EXP && states->type == GGML_TYPE_F32) {
+    // state for good (every later answer of the slot decoded and drafted NaN until a restart).
+    // [TAG_FN_L21_RS_FILL] LLAMA_FN_L21_RS_FILL (default 1, 0 = the scale for every model but qwen4exp): every model, as the
+    // 27B (qwen35) clears its GDN / conv cells through this same line (upstream #23606 reproduced the NaN loop there). Exact
+    // for finite states: the scale kernels write x*0 + 0 = +0 (CUDA scale_f32, IEEE -0 + +0 = +0), the fill writes +0.
+    // F32 / F16 only (the CUDA and CPU fill kernels; recurrent_type_r/s are F32 for every model today); other types scale.
+    static const int l21_rs_fill = [] { const char * e = getenv("LLAMA_FN_L21_RS_FILL"); return e && e[0] ? atoi(e) : 1; }();
+    const bool fill_ok = states->type == GGML_TYPE_F32 || states->type == GGML_TYPE_F16;
+    if (fill_ok && (arch == LLM_ARCH_QWEN4EXP || l21_rs_fill != 0)) {
         ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
     } else {
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));

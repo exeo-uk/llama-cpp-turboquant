@@ -200,6 +200,9 @@ bool         llama_fn_active(const llama_model & model);
 //                            ubatch, a line every 64 fills (read with getenv by llama-memory-hybrid-idx.cpp)
 bool llama_fn_l3_flag(const llama_model & model, const char * name);
 int  llama_fn_l3_int (const llama_model & model, const char * name, int def);
+// [TAG_FN_L21] the round-21 stability switches cover every model: qwen4exp reads them through llama_fn_env (environment,
+// then the profile), every other model from the environment only; unset = def
+int  llama_fn_l21_int(const llama_model & model, const char * name, int def);
 // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] model hooks (load: at the end of llama_fn_auto_on_load, after the profile
 // state exists; free)
 void llama_fn_l3_host_on_load(const llama_model & model);

@@ -980,6 +980,12 @@ bool llama_fn_l3_flag(const llama_model & model, const char * name) {
     return llama_fn_l3_int(model, name, 0) != 0;
 }
 
+// [TAG_FN_L21] see llama-fn-auto.h
+int llama_fn_l21_int(const llama_model & model, const char * name, int def) {
+    const char * v = model.arch == LLM_ARCH_QWEN4EXP ? llama_fn_env(model, name) : getenv(name);
+    return v && v[0] ? atoi(v) : def;
+}
+
 bool llama_fn_active(const llama_model & model) {
     return model.fn_auto && model.fn_auto->active;
 }
