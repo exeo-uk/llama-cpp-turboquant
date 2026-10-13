@@ -144,6 +144,9 @@ bool   llama_moe_hot_cbuf_restore(const void * owner);
 // _generation changes with every release / restore: a graph built before must not be reused.
 void     llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk);
 size_t   llama_moe_hot_kv_bytes();
+
+// [TAG_FN_L21_VRAM_DXGI] ggml_backend_dev_memory, plus (LLAMA_FN_L21_VRAM_DXGI) the DXGI budget logged or used (llama-moecache.cpp)
+void     fn_l21_dev_memory(const llama_model * model, struct ggml_backend_device * dev, size_t * mem_free, size_t * mem_total);
 size_t   llama_moe_hot_kv_out();
 size_t   llama_moe_hot_kv_release(const void * owner, size_t need);
 size_t   llama_moe_hot_kv_restore(const void * owner, size_t keep);

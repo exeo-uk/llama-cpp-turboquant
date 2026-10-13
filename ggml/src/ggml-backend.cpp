@@ -2004,6 +2004,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
+        // [TAG_FN_L21_REALLOC] GGML_SCHED_REALLOC_LOG=1 (diagnostic, default off): one line per runtime re-reserve, with a
+        // running count (upstream #30329 counts them; each one costs a backend synchronization)
+        {
+            static const bool rl_on = [] { const char * e = getenv("GGML_SCHED_REALLOC_LOG"); return e && atoi(e) > 0; }();
+            static int64_t rl_n = 0;
+            if (rl_on) {
+                ++rl_n;
+                GGML_LOG_INFO("%s: [TAG_FN_L21_REALLOC] graph re-reserve #%lld: nodes %d, leafs %d, size %d (prev %d), backend ids %s\n",
+                        __func__, (long long) rl_n, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_graph_size,
+                        sched->debug_prev_graph_size, backend_ids_changed ? "changed" : "same");
+            }
+        }
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]

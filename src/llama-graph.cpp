@@ -117,6 +117,21 @@ static bool llama_fn_l21_mtph_zero() {
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
+    // [TAG_FN_L21_MTP_VISION] the hidden state comes in its own channel (upstream #30257 embd_state): embd then holds the
+    // rows' image embeddings, at the width of the graph's embd input. Batches without it keep the path below.
+    if (ubatch->embd_state) {
+        if (ubatch->token) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        } else {
+            GGML_ASSERT(ubatch->embd && embd);
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*embd->ne[0]*ggml_element_size(embd));
+        }
+        GGML_ASSERT(h && n_embd == h->ne[0]);
+        ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd*ggml_element_size(h));
+        h_zero = false;
+        return;
+    }
+
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
@@ -147,6 +162,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd_state) || (h && h->ne[1] == params.ubatch.n_tokens); // [TAG_FN_L21_MTP_VISION]
 
     return res;
 }

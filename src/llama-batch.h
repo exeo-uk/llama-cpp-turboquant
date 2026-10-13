@@ -65,6 +65,7 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
+        std::vector<float>          embd_state; // [TAG_FN_L21_MTP_VISION]
 
         std::vector<llama_seq_id> seq_id_data;
 
@@ -77,6 +78,10 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // [TAG_FN_L21_MTP_VISION] [n_embd_state, n_tokens]: the target hidden state of each row, set only on MTP batches whose
+    // rows carry an image embedding in embd (upstream #30257 embd_state); NULL = the hidden state is in embd as before
+    float * embd_state = nullptr;
 };
 
 struct llama_hparams;
@@ -90,6 +95,10 @@ struct llama_batch_ext {
     const size_t n_tokens_max;     // max number of tokens that can be stored in the batch
     const size_t n_embd_inp;       // decoder embd row width
     const size_t n_embd_inp_enc;   // encoder embd row width (e.g. eagle3/dflash extracted features)
+    // [TAG_FN_L21_MTP_VISION] MTP contexts: the state row width (n_embd_out) and the token embedding width (n_embd_inp)
+    // an image row takes when it carries its hidden state through set_token_state(); 0 for every other context
+    const size_t n_embd_state;
+    const size_t n_embd_tok;
     const llama_seq_id n_seq_max;  // max number of sequences
     llama_memory_i * mem;          // memory for position inference
     const llama_token n_vocab;     // max token ID that we accept
@@ -103,6 +112,8 @@ struct llama_batch_ext {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
+        bool         has_state = false; // [TAG_FN_L21_MTP_VISION] whether state_off is set
+        size_t       state_off = 0;     // index offset in the state array
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
@@ -110,6 +121,7 @@ struct llama_batch_ext {
     };
     std::vector<token> tokens;
     std::vector<float> embd;
+    std::vector<float> state; // [TAG_FN_L21_MTP_VISION] state rows, see set_token_state()
 
     // [TAG_SYNC_BATCH_EXT_COMPAT] rows borrowed from the caller's llama_batch by llama_batch_compat::init with
     // borrow_embd (the llama_context encode/decode(llama_batch) path): n_tokens rows of n_embd floats in token order,
@@ -141,6 +153,7 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    bool set_token_state(int32_t idx, llama_embd state_in); // [TAG_FN_L21_MTP_VISION]
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -212,6 +225,8 @@ private:
     uint32_t n_outputs;
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
+    std::vector<float>          state_vec;    // [TAG_FN_L21_MTP_VISION] state rows in entry order, empty if none
+    uint32_t                    n_embd_state = 0;
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

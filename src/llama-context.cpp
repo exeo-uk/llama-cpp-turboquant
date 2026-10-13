@@ -3779,7 +3779,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+    // [TAG_FN_L21_MTP_VISION] an MTP batch of image rows carries the token embedding width and its state rows apart
+    const bool mtp_img = batch_inp.n_embd_tok > 0 && batch_inp.n_embd == batch_inp.n_embd_tok && !batch_inp.state.empty();
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp && !mtp_img) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
@@ -6281,7 +6283,7 @@ void llama_context::moe_hot_fit_try() {
         vram_account("fit SMALL");
     }
     size_t mem_free = 0, mem_total = 0;
-    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    fn_l21_dev_memory(&model, dev, &mem_free, &mem_total); // [TAG_FN_L21_VRAM_DXGI] the hot set's fit
 
     constexpr double MiB = 1024.0*1024.0;
     size_t m_model = 0, m_kv = 0, m_compute = 0;

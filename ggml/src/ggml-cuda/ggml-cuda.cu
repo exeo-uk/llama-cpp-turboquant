@@ -2148,6 +2148,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// [TAG_FN_L21_SHEXP] GGML_CUDA_FN_L21_SHEXP=1 (the qwen4exp profile sets it; unset = as before): upstream #29986, the
+// shared-expert match is batch independent, so graph_optimize gives every ubatch size the same node order and alloc deps
+// (no compute-buffer re-reserve and backend sync on each prompt <-> decode switch); the MMVQ batch test moves to the fusion
+static bool ggml_cuda_fn_l21_shexp() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_FN_L21_SHEXP"); return e && atoi(e) > 0; }();
+    return on;
+}
+
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -2174,7 +2182,7 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
             !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
             !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
             !up->src[0]->buffer ||
-            !ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            (ggml_cuda_fn_l21_shexp() ? !ggml_is_quantized(up->src[0]->type) : !ggml_cuda_should_fuse_mul_mat_vec_q(up))) {
         return false;
     }
     const ggml_tensor * input = up->src[1];
@@ -5471,7 +5479,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return env != nullptr && atoi(env) == 1;
     }();
     if (node->op == GGML_OP_MUL_MAT_ID && (cuda_ctx->stream_context().concurrent_events.empty() || !graph_opt_env) &&
-            ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
+            ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+            (!ggml_cuda_fn_l21_shexp() || ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1]))) { // [TAG_FN_L21_SHEXP]
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
             ggml_tensor * routed = cgraph->nodes[i + 2];

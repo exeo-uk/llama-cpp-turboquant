@@ -237,6 +237,16 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L19_CONVSTORE_EVICT",   "0",      P_ALL }, //   least recently stored first, as before
     { "LLAMA_FN_L19_CONVSTORE_CKPT",    "0",      P_ALL }, //   the checkpoint ring as before (no keeping rule, no disk checkpoints)
     { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
+    // [TAG_FN_L21_DEC] round 21 decode / TTFT items (exact). MTP_VISION stays off: on the owner's command with a
+    // 2560x1600 image (greedy, one pair, l21/dec) the answer after the image drafted 0.784 -> 0.739 accepted and an
+    // edit after it 0.870 -> 0.792, and the 4000 image rows cost the draft context ~0.9 s of the prompt
+    { "LLAMA_FN_L21_MTP_VISION",        "0",      P_ALL }, // [TAG_FN_L21_MTP_VISION] the MTP draft decodes image rows (upstream #30257 + #30397)
+    { "LLAMA_FN_L21_MTP_ROWS",          "1",      P_ALL }, // [TAG_FN_L21_MTP_ROWS] MTP catch-up rows stop after their K/V (no MoE / hc / head)
+    { "LLAMA_FN_L21_MTP_STATE",         "1",      P_ALL }, // [TAG_FN_L21_MTP_STATE] context checkpoints carry the MTP h / fused rows (#30141)
+    { "LLAMA_FN_L21_MEDIA_CKPT",        "1",      P_ALL }, // [TAG_FN_L21_MEDIA_CKPT] a checkpoint right after the last media chunk (#30201)
+    // [TAG_FN_L21_VRAM_DXGI] the smoke read CUDA 23,803 = DXGI 23,803 MiB free (budget 31,419, this process 7,616) with
+    // nothing else on the card, so the min changes nothing then and only shrinks the fit when another process holds VRAM
+    { "LLAMA_FN_L21_VRAM_DXGI",         "1",      P_ALL }, // [TAG_FN_L21_VRAM_DXGI] the hot set's fit from min(CUDA free, DXGI budget - usage)
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
