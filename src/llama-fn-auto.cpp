@@ -237,6 +237,13 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L19_CONVSTORE_EVICT",   "0",      P_ALL }, //   least recently stored first, as before
     { "LLAMA_FN_L19_CONVSTORE_CKPT",    "0",      P_ALL }, //   the checkpoint ring as before (no keeping rule, no disk checkpoints)
     { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
+    // [TAG_FN_L20_ADOPT] round 20 (l20/int, the owner's command with vision, MTPq3, 1 slot, 262K, OLD = int-l19 20a90baca, 1 round):
+    // the 16K prompt ubatches of the bigprompt family. Fresh prompts after a warm-in: 32K 2052 -> 2329 t/s (TTFT 15.9 -> 14.0 s),
+    // 131K 2371 -> 2674 t/s (55.3 -> 49.0 s), 245K 2402 -> 2614 t/s (102.3 -> 94.0 s); 16K-ubatch KLD in the band. Not adopted:
+    // LLAMA_FN_L20_BIGPROMPT_DFTUB / _PLEPRE (no gain), the draftfix and convfix switches (fixed, but no measured win)
+    { "LLAMA_FN_L20_BIGPROMPT_UB",      "16384",  P_ALL }, // [TAG_FN_L20_BIGPROMPT_UB] prompts wider than the command's -ub run in 16384-token ubatches (FULL16)
+    // [TAG_FN_L21_BIGUB] round 21: the 16K ubatches only for prompts above 16K, the tail sized for 8K FULL (start-up layout and KV slot lend as without them), the extra from the borrow slots - the test stage decides by KLD + needles + the first answer after a start
+    { "LLAMA_FN_L21_BIGUB",             "1",      P_ALL }, // [TAG_FN_L21_BIGUB]
 };
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment

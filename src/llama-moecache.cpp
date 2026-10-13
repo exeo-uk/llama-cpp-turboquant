@@ -2581,8 +2581,7 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
             }
             if (bsum < g_kv_borrow) {
                 // the borrow never costs the KV lend: none this time (the 16K prompt ubatches stay off)
-                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB: no borrow
-",
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB: no borrow\n",
                         bsum/1048576.0, g_kv_borrow/1048576.0);
                 g_kv_borrow = 0;
             } else {
