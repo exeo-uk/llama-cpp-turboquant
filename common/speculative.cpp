@@ -3527,6 +3527,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // [TAG_FN_L21_MTP_VISION] image batches go to the draft context; counts for the end-of-run log line
     bool     mtp_vision     = false;
+    // [TAG_FN_L21_MTP_STATE] server checkpoints carry the per-seq MTP state (get_state / set_state = the carry blob)
+    bool     mtp_state      = false;
     uint64_t vis_n_batches  = 0;
     uint64_t vis_n_rows     = 0;
 
@@ -4032,6 +4034,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_FN_L21_MTP_STATE] LLAMA_FN_L21_MTP_STATE (qwen4exp profile: 1, else 0): a context checkpoint stores the
+        // stashed h and the fused rows with the draft KV (upstream #30141), so a restore no longer pairs the first prompt row
+        // after it with the h of a later position
+        mtp_state = common_fn_l21_int(llama_get_model(ctx_dft), "LLAMA_FN_L21_MTP_STATE") > 0;
+
         // [TAG_FN_MTP_ATTN_WINDOW] the window of the qwen4exp MTP draft cache: llama-model.cpp gives it one from
         // LLAMA_MTP_ATTN_WINDOW, and only for a dense MTP block ([TAG_SYNC_1004] a QSA block keeps the full cache)
         {
@@ -4067,6 +4074,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+    }
+
+    // [TAG_FN_L21_MTP_STATE] a server checkpoint takes the carry blob (it is made before the batch it precedes is decoded,
+    // like the draft KV it is stored with); off: no state, as before
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        return mtp_state && get_carry(seq_id, data);
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (mtp_state && !data.empty()) {
+            set_carry(seq_id, data);
+        }
     }
 
     // [TAG_FN_L18_KEEPCTX] what the next request's first prompt batch reads: the stashed h its first row pairs with, and
