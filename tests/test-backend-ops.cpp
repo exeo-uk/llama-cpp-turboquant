@@ -6061,6 +6061,73 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// [TAG_FN_L21_DUPID] upstream #29998: MUL_MAT_ID with expert ids repeated within a token's row, mostly expert 0 (the
+// pattern of PHOT's zero slot); the last row also routes to the last expert
+struct test_mul_mat_id_dup : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",dup=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = (rng() % 4 == 0) ? (int32_t) (rng() % n_mats) : 0; // repeated ids, mostly expert 0
+                    }
+                    if (r == ggml_nrows(t) - 1) {
+                        data[0] = n_mats - 1;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [TAG_FN_L21_Q8CLAMP] activations of ~2048: each 32-value q8_1 partial sum is >= 65536, an fp16 inf before the clamp
+// (inf times the K-quant min gave inf / NaN). The CPU reference (Q8_K: float d, int16 sums) stays finite; after the
+// clamp the sum is 65504 instead of ~65540 (an error of ~0.05 % of the min term).
+static void init_tensors_bigact(ggml_context * ctx, const char * name_b) {
+    std::default_random_engine rng(4321);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type == GGML_TYPE_I32) {
+            continue;
+        }
+        if (strcmp(t->name, name_b) == 0 && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
+            std::vector<float> data(ggml_nelements(t));
+            for (auto & v : data) {
+                v = 2048.0f + u(rng);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
+
+struct test_mul_mat_bigact : public test_mul_mat {
+    test_mul_mat_bigact(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    std::string vars() override { return test_mul_mat::vars() + ",bigact=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensors_bigact(ctx, "b");
+    }
+};
+
+struct test_mul_mat_id_bigact : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",bigact=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensors_bigact(ctx, "b");
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -14566,6 +14633,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+
+    // [TAG_FN_L21_DUPID] repeated expert ids within a row (upstream #29998), plus the Flash-Next weight types
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1}) {
+        for (int n : {9, 16, 33, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+        }
+    }
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
+    }
+
+    // [TAG_FN_L21_MMQ_YPAD] upstream #29953 shapes: column counts the tile picker rounds up past J_max (9, 100) and a
+    // wide one (508), dense and MoE (512 experts, 10 used as on Flash-Next)
+    for (ggml_type ta : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        for (int n : {5, 9, 100, 508}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 64, n, ggml_blck_size(ta) == 256 ? 768 : 640, {1, 1}, {1, 1}));
+        }
+    }
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1}) {
+        for (int n : {9, 100, 508}) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 512, 10, false, 64, n, ggml_blck_size(ta) == 256 ? 768 : 640));
+        }
+    }
+
+    // [TAG_FN_L21_Q8CLAMP] large activations: q8_1 partial sums past the fp16 range (MMVQ n = 1 / 8, MMQ n = 32 / 100)
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (int n : {1, 8, 32, 100}) {
+            test_cases.emplace_back(new test_mul_mat_bigact(ta, 64, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_bigact(ta, GGML_TYPE_F32, 16, 4, false, 64, 32, 256));
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
