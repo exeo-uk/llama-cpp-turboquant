@@ -6088,9 +6088,9 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
-// [TAG_FN_L21_Q8CLAMP] activations of ~2048: each 32-value q8_1 partial sum is >= 65536, an fp16 inf before the clamp
+// [TAG_FN_L21_Q8CLAMP] activations of ~2048: each 32-value q8_1 partial sum is >= 65520, an fp16 inf before the clamp
 // (inf times the K-quant min gave inf / NaN). The CPU reference (Q8_K: float d, int16 sums) stays finite; after the
-// clamp the sum is 65504 instead of ~65540 (an error of ~0.05 % of the min term).
+// clamp the sum is 65504 instead of 65523..65536 (an error of <= 0.05 % of the min term).
 static void init_tensors_bigact(ggml_context * ctx, const char * name_b) {
     std::default_random_engine rng(4321);
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
@@ -6101,7 +6101,7 @@ static void init_tensors_bigact(ggml_context * ctx, const char * name_b) {
         if (strcmp(t->name, name_b) == 0 && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
             std::vector<float> data(ggml_nelements(t));
             for (auto & v : data) {
-                v = 2048.0f + u(rng);
+                v = 2047.6f + 0.4f*u(rng); // 32 of them sum to 65523..65536: an fp16 inf, 65504 after the clamp
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
         } else {
