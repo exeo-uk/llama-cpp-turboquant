@@ -198,6 +198,11 @@ struct ggml_moe_bridge {
     ggml_moe_bridge_runner_t runner    = nullptr;
     void *                   runner_ud = nullptr;
 
+    // [TAG_FN_L22_X_PRIOR] R-REV-9: a multi-row prior route wrote the unbiased top-k into the channel's raw-id area for the
+    // post whose ids it picked (that ids pointer); the post's launch then flags the job RAW (launch time, so a CUDA graph
+    // replays the same flags)
+    std::vector<const void *> fn_l22_raw_ids;
+
     // host side: in spin mode one executor thread polls and completes
     std::atomic<uint32_t> served{0};
     std::atomic<uint64_t> taken{0};
@@ -1517,6 +1522,50 @@ static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l22_topk_ro
     }
 }
 
+// [TAG_FN_L22_X_PRIOR] R-REV-9: the same routing for more rows than one block takes (verify ubatches of two slots, MTP n_max
+// >= 4): one warp per row over many blocks, into compact [k, T] scratch (a block may not write where another block's rows
+// still read: k_fn_l22_route_scatter writes ids / weights after), the unbiased top-k straight to raw (null: none)
+template <int n_experts>
+static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l22_topk_route_rows(const float * logits, float * w_tmp,
+        int32_t * id_tmp, const int n_rows, const int n_expert_used, const float clamp_val, const float scale_val,
+        const bool with_norm, const float * scale_row, const float * mask_row, const int pflags, const float expnm,
+        const int r0, int32_t * raw) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row  = blockIdx.x*(FN_L4_TOPK_THREADS/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (row >= n_rows) {
+        return;
+    }
+    constexpr int EPT = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+    float wt[EPT];
+    const float * lg = logits + (size_t) n_experts*row;
+#pragma unroll
+    for (int i = 0; i < n_experts; i += WARP_SIZE) {
+        wt[i / WARP_SIZE] = lg[i + lane];
+    }
+    int   o_id  = 0;
+    float o_w   = 0.0f;
+    int   o_raw = -1;
+    fn_l22_route_row<EPT>(wt, scale_row, mask_row, n_expert_used, raw ? pflags : (pflags & ~GGML_FN_L22_PRIOR_F_RAW), expnm, r0,
+            with_norm, clamp_val, scale_val, lane, o_id, o_w, o_raw);
+    if (lane < n_expert_used) {
+        id_tmp[n_expert_used*row + lane] = o_id;
+        w_tmp[n_expert_used*row + lane]  = o_w;
+        if (raw) {
+            raw[n_expert_used*row + lane] = o_raw;
+        }
+    }
+}
+
+static __global__ void k_fn_l22_route_scatter(const int32_t * id_tmp, const float * w_tmp, int32_t * ids, float * weights,
+        const int n, const int k, const int ids_stride) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    ids[ids_stride*(i / k) + i % k] = id_tmp[i];
+    weights[i] = w_tmp[i];
+}
+
 // hostfunc mode, after a post on stream: fork, the host job runs on the aux stream while this stream continues with the
 // device work of the layer
 static void mb_post_fork(ggml_moe_bridge * b, const int32_t chan, cudaStream_t stream);
@@ -1718,6 +1767,8 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     if (rc != cudaSuccess) {
         return fail("clearing the device counters", rc);
     }
+
+    b->fn_l22_raw_ids.assign(p->n_chan, nullptr); // [TAG_FN_L22_X_PRIOR] R-REV-9
 
     if (p->wait_mode == GGML_MOE_BRIDGE_WAIT_HOSTFUNC) {
         b->ev_post.assign(p->n_chan, nullptr);
@@ -2326,8 +2377,15 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * ids = dst->src[1];
     const ggml_tensor * w   = dst->src[2];
 
-    // [TAG_FN_L22_X_PRIOR] ids that an unfused (or post-less fused) prior top-k picked: tell the host (no unbiased ids)
-    const int32_t flags_p = flags | (fn_l22_prior_ids(ids) ? GGML_MOE_BRIDGE_JOB_PRIOR : 0);
+    // [TAG_FN_L22_X_PRIOR] ids that an unfused (or post-less fused) prior top-k picked: tell the host; R-REV-9: RAW when the
+    // multi-row route wrote this post's unbiased ids
+    int32_t flags_p = flags | (fn_l22_prior_ids(ids) ? GGML_MOE_BRIDGE_JOB_PRIOR : 0);
+    if ((flags_p & GGML_MOE_BRIDGE_JOB_PRIOR) && chan < (int32_t) b->fn_l22_raw_ids.size() && b->fn_l22_raw_ids[chan] != nullptr) {
+        if (b->fn_l22_raw_ids[chan] == ids->data) {
+            flags_p |= GGML_MOE_BRIDGE_JOB_RAW;
+        }
+        b->fn_l22_raw_ids[chan] = nullptr;
+    }
 
     cudaStream_t stream = ctx.stream();
     if (ggml_fn_l3_get(dst) == GGML_FN_L4_POST) { // [TAG_FN_L4_POST]
@@ -2424,6 +2482,8 @@ bool ggml_cuda_fn_l4_topk_post(ggml_backend_cuda_context & ctx, const ggml_tenso
 #ifndef GGML_MOE_BRIDGE_DISABLED
 namespace {
 
+constexpr int64_t FN_L22_PRIOR_MAX_ROWS = 1024; // R-REV-9
+
 struct fn_l22_prior_match {
     int                 n       = 0;       // nodes from i, the last one = the weights
     const ggml_tensor * logits  = nullptr; // the SOFT_MAX's input [512, T]
@@ -2454,8 +2514,9 @@ int fn_l22_prior_match_at(const ggml_cgraph * cg, const int i, fn_l22_prior_matc
     memcpy(&sm_scale, (const float *) sm->op_params + 0, sizeof(float));
     memcpy(&sm_bias,  (const float *) sm->op_params + 1, sizeof(float));
     const ggml_tensor * logits = sm->src[0];
+    // R-REV-9: up to FN_L22_PRIOR_MAX_ROWS rows (more than one block's 8: the multi-row route below)
     if (sm_scale != 1.0f || sm_bias != 0.0f || logits == nullptr || logits->type != GGML_TYPE_F32 || logits->ne[0] != 512 ||
-        !ggml_is_contiguous(logits) || logits->ne[1] < 1 || logits->ne[1] > TOPK_MOE_ROWS_PER_BLOCK ||
+        !ggml_is_contiguous(logits) || logits->ne[1] < 1 || logits->ne[1] > FN_L22_PRIOR_MAX_ROWS ||
         ggml_nrows(logits) != logits->ne[1]) {
         return 0;
     }
@@ -2596,6 +2657,41 @@ int ggml_cuda_fn_l22_try_prior(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         ++j;
     }
     ggml_tensor * post = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+
+    // R-REV-9: more rows than one block: the multi-row route (prior and resident swap); the unbiased top-k goes to the raw
+    // area of the post behind it, which then runs on its own and flags the job RAW
+    if (n_rows > TOPK_MOE_ROWS_PER_BLOCK) {
+        int32_t * raw = nullptr;
+        if ((m.pflags & GGML_FN_L22_PRIOR_F_RAW) && post != nullptr && post->op == GGML_OP_MOE_HOST_POST &&
+            (post->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_get_op_params_i32(post, 3) == 0) {
+            ggml_moe_bridge * b    = mb_get(ggml_get_op_params_i32(post, 0));
+            const int32_t     chan = ggml_get_op_params_i32(post, 1);
+            const ggml_tensor * pids = post->src[1];
+            if (b != nullptr && b->params.device == ctx.device && b->dev.off_raw > 0 && chan >= 0 && chan < b->params.n_chan &&
+                chan < (int32_t) b->fn_l22_raw_ids.size() && n_rows <= b->params.max_tokens && n_used <= b->params.n_used &&
+                pids != nullptr && pids->data == m.ids->data) {
+                raw = (int32_t *) (b->dev.data + (size_t) chan*b->dev.chan_bytes + b->dev.off_raw);
+                b->fn_l22_raw_ids[chan] = m.ids->data;
+            }
+        }
+        const int n_ent = n_rows*n_used;
+        ggml_cuda_pool_alloc<int32_t> id_tmp(ctx.pool(), n_ent);
+        ggml_cuda_pool_alloc<float>   w_tmp(ctx.pool(), n_ent);
+        const int rpb = FN_L4_TOPK_THREADS/WARP_SIZE;
+        k_fn_l22_topk_route_rows<512><<<(n_rows + rpb - 1)/rpb, FN_L4_TOPK_THREADS, 0, stream>>>((const float *) m.logits->data,
+                w_tmp.get(), id_tmp.get(), n_rows, n_used, clamp_val, scale_val, with_norm, scale_row, mask_row, (int) m.pflags,
+                m.expnm, (int) m.r0, raw);
+        CUDA_CHECK(cudaGetLastError());
+        k_fn_l22_route_scatter<<<(n_ent + 255)/256, 256, 0, stream>>>(id_tmp.get(), w_tmp.get(), (int32_t *) m.ids->data,
+                (float *) m.weights->data, n_ent, n_used, (int) (m.ids->nb[1]/sizeof(int32_t)));
+        CUDA_CHECK(cudaGetLastError());
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true)) {
+            GGML_LOG_INFO("%s: [TAG_FN_L22_X_PRIOR] the prior top-k of %d rows (flags %d) runs over %d blocks%s\n", __func__, n_rows,
+                    (int) m.pflags, (n_rows + rpb - 1)/rpb, raw ? ", the unbiased ids to the post's raw area" : "");
+        }
+        return m.n - 1;
+    }
     if (post != nullptr && post->op == GGML_OP_MOE_HOST_POST && ggml_fn_l3_get(post) == GGML_FN_L4_POST &&
         (post->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_get_op_params_i32(post, 3) == 0) {
         ggml_moe_bridge * b = mb_get(ggml_get_op_params_i32(post, 0));
