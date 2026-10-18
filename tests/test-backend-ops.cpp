@@ -10899,6 +10899,211 @@ struct test_flash_attn_ext_pos_ms : public test_case {
 };
 // ==== [TAG_4C_POSMASK_MS] multi-sequence positional mask (end) ======================================================
 
+// ==== [TAG_UPSTREAM_29510] per-sequence cell lists (begin) ==========================================================
+// LLAMA_KV_ROWS (llama-graph.cpp build_attn_mha): one turbot FA per slice (the queries of one sequence) with the cell
+// list of that sequence (ggml_flash_attn_ext_set_kv_rows), on the layout of test_flash_attn_ext_pos_ms (grouped queries,
+// V offsets per sequence, a prefix shared by sequences 0 and 1). The CPU reference ignores the lists and runs the dense
+// positional FA per slice, so the CUDA list kernel must give the same output. decoys = true also puts every 5th cell
+// (other sequences, holes, cells of no sequence) into each list: the positional mask must still hide them. n_seq = 1 is
+// the single-sequence form (one-row kv_pos / q_pos). `test-backend-ops -o FLASH_ATTN_EXT -p kv_rows` selects these cases.
+struct test_flash_attn_ext_kv_rows : public test_case {
+    const int64_t        kv;
+    const int64_t        n_tps;
+    const int            n_seq;
+    const bool           decoys;
+    const int64_t        hs  = 256;  // the Qwen3.8-27B geometry: 4 KV heads x 256, 24 query heads
+    const int64_t        hkv = 4;
+    const int64_t        hq  = 24;
+    turbot_test_cache    cache;
+    pos_ms_layout        layout;
+    std::vector<int32_t> rows;       // [n_rows, n_seq], -1 padded
+    int64_t              n_rows = 0;
+
+    std::string vars() override {
+        return std::string("kv_rows=turbot,") + VARS_TO_STR4(kv, n_tps, n_seq, decoys);
+    }
+
+    // the compared node is the concat of the slice outputs; list the case under FLASH_ATTN_EXT for -o
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * hq * n_tps * n_seq * (hs + hs) * kv;
+    }
+
+    test_flash_attn_ext_kv_rows(int64_t kv, int64_t n_tps, int n_seq, bool decoys)
+        : kv(kv), n_tps(n_tps), n_seq(n_seq), decoys(decoys) {}
+
+    uint64_t seed() const {
+        return (uint64_t) kv * 1000003u + (uint64_t) n_tps * 7919u + (uint64_t) n_seq * 131u + (uint64_t) decoys * 17u +
+               0x6b76726f7773ull;
+    }
+
+    // cell c is in the list of sequence s
+    bool listed(int64_t c, int s) const {
+        return ((layout.kv_set[c] >> s) & 1) != 0 || (decoys && c % 5 == 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the layout needs two sequences; n_seq = 1 uses sequence 0 of it
+        const int n_lay = std::max(n_seq, 2);
+        pos_ms_make_layout(kv, n_tps*n_lay, n_lay, false, layout);
+
+        // the lists in cell order, -1 padded to a multiple of 256 like the graph pads them
+        int64_t n_max = 0;
+        for (int s = 0; s < n_seq; ++s) {
+            int64_t n = 0;
+            for (int64_t c = 0; c < kv; ++c) {
+                n += listed(c, s) ? 1 : 0;
+            }
+            n_max = std::max(n_max, n);
+        }
+        n_rows = GGML_PAD(n_max, 256);
+        rows.assign(n_rows*n_seq, -1);
+        for (int s = 0; s < n_seq; ++s) {
+            int64_t n = 0;
+            for (int64_t c = 0; c < kv; ++c) {
+                if (listed(c, s)) {
+                    rows[s*n_rows + n++] = (int32_t) c;
+                }
+            }
+        }
+
+        cache.layer   = turbot_test_layer_geom(TURBOT_TW_L23, 0);
+        cache.kv_size = GGML_PAD(kv, 64) + 64;
+        turbot_test_plan_granules(cache, kv, TURBOT_MIX_ALT);
+        const ggml_turbot_layer & l = cache.layer;
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.k.s), 1024, cache.kv_size);
+        ggml_set_name(kc, "turbot_k");
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, ggml_turbot_type_of_s(l.v.s), 1024, cache.kv_size);
+        ggml_set_name(vc, "turbot_v");
+        ggml_tensor * pool = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, l.pool_row_bytes, cache.n_pool_rows);
+        ggml_set_name(pool, "turbot_pool");
+        ggml_tensor * gtab = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) cache.gtab.size());
+        ggml_set_name(gtab, "turbot_gtab");
+        ggml_tensor * k = turbot_test_fa_view(ctx, kc, kv);
+        ggml_tensor * v = turbot_test_fa_view(ctx, vc, kv);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n_tps*n_seq, hq, 1);
+        ggml_set_name(q, "q");
+
+        // as llama-graph.cpp builds them: kv_pos [kv, rows], and per slice its q_pos [n_tps, rows] and its list [n_rows]
+        const int64_t n_r = n_seq > 1 ? 2 : 1;
+        ggml_tensor * kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_r);
+        ggml_set_name(kv_pos, "kv_pos");
+
+        ggml_turbot_op_params p;
+        ggml_turbot_op_params_make(&p, &l, GGML_TURBOT_SIDE_BOTH);
+
+        const float scale = 1.0f/sqrtf((float) hs);
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_seq; ++s) {
+            ggml_tensor * q_s = ggml_view_4d(ctx, q, hs, n_tps, hq, 1, q->nb[1], q->nb[2], q->nb[3], s*n_tps*q->nb[1]);
+            ggml_tensor * p_s = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tps, n_r);
+            ggml_format_name(p_s, "q_pos_%d", s);
+            ggml_tensor * r_s = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+            ggml_format_name(r_s, "kv_rows_%d", s);
+
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx, q_s, k, v, nullptr, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_pos(fa, kv_pos, p_s);
+            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_flash_attn_ext_set_turbot(fa, pool, gtab, &p);
+            ggml_flash_attn_ext_set_kv_rows(fa, r_s);
+
+            out = out == nullptr ? fa : ggml_concat(ctx, out, fa, 3);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // the V side of every sequence cell re-encoded with its offset (test_flash_attn_ext_pos_ms::offset_turbot_v)
+    void offset_turbot_v() {
+        const ggml_turbot_layer & l = cache.layer;
+        const size_t rv  = l.v.base_row_bytes;
+        const size_t prb = l.pool_row_bytes;
+        std::vector<float> x(1024);
+        for (int64_t c = 0; c < kv; ++c) {
+            if (layout.v_seq[c] < 0) {
+                continue;
+            }
+            turbot_test_row(seed(), 2 * c + 1, x.data());
+            const float o = layout.v_off(c);
+            for (float & e : x) {
+                e += o;
+            }
+            const int32_t slot  = cache.gtab[c / 64];
+            uint8_t *     young = slot >= 0 ? cache.pool.data() + (size_t) ggml_turbot_pool_row(slot, (uint32_t) c) * prb : nullptr;
+            ggml_turbot_encode_side(x.data(), &l.v, cache.base_v.data() + (size_t) c * rv, young ? young + l.pool_v_off : nullptr);
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        turbot_test_encode(cache, seed(), 0);
+        offset_turbot_v();
+
+        // two rows: positions and sequence sets as set_input_kv_pos / set_input_q_pos write them; one row: the cells of
+        // sequence 0 only
+        const int64_t n_r = n_seq > 1 ? 2 : 1;
+        std::vector<int32_t> kvp(kv*n_r);
+        for (int64_t c = 0; c < kv; ++c) {
+            kvp[c] = n_r == 2 || (layout.kv_set[c] & 1) ? layout.kv_pos[c] : -1;
+            if (n_r == 2) {
+                kvp[kv + c] = layout.kv_set[c];
+            }
+        }
+        std::vector<int32_t> qp(n_tps*n_r*n_seq);
+        for (int s = 0; s < n_seq; ++s) {
+            for (int64_t t = 0; t < n_tps; ++t) {
+                qp[(s*n_r + 0)*n_tps + t] = layout.q_pos[s*n_tps + t];
+                if (n_r == 2) {
+                    qp[(s*n_r + 1)*n_tps + t] = layout.q_set[s*n_tps + t];
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->op != GGML_OP_NONE) {
+                continue;   // the K/V head views, the q slice views and the FA / concat nodes
+            }
+            if (strncmp(t->name, "kv_rows_", 8) == 0) {
+                const int s = atoi(t->name + 8);
+                GGML_ASSERT(s >= 0 && s < n_seq);
+                turbot_test_set(t, rows.data() + s*n_rows, n_rows * sizeof(int32_t));
+            } else if (strncmp(t->name, "q_pos_", 6) == 0) {
+                const int s = atoi(t->name + 6);
+                GGML_ASSERT(s >= 0 && s < n_seq);
+                turbot_test_set(t, qp.data() + s*n_r*n_tps, n_r*n_tps * sizeof(int32_t));
+            } else if (strcmp(t->name, "turbot_k") == 0) {
+                turbot_test_set(t, cache.base_k.data(), cache.base_k.size());
+            } else if (strcmp(t->name, "turbot_v") == 0) {
+                turbot_test_set(t, cache.base_v.data(), cache.base_v.size());
+            } else if (strcmp(t->name, "turbot_pool") == 0) {
+                turbot_test_set(t, cache.pool.data(), cache.pool.size());
+            } else if (strcmp(t->name, "turbot_gtab") == 0) {
+                turbot_test_set(t, cache.gtab.data(), cache.gtab.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                turbot_test_set(t, kvp.data(), kvp.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "q") == 0) {
+                turbot_test_init_uniform(t, seed() ^ 0x71756572ull, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+// ==== [TAG_UPSTREAM_29510] per-sequence cell lists (end) ============================================================
+
 // GGML_OP_TURBOT_SET_ROWS (SPEC 5.2, 6.1, 8): K and V writers into host-encoded caches, fill entries, then a turbot FA
 // whose mask shows only the written cells and the filled granules, so every written byte reaches the compared output.
 // perf = true times the K writer alone (turbot_perf=writer_*).
@@ -15663,6 +15868,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv, 64, 4, true));
             test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv,  2, 2, false));
             test_cases.emplace_back(new test_flash_attn_ext_pos_ms(tkv, tb, kv,  1, 2, false));
+        }
+    }
+    // [TAG_UPSTREAM_29510] per-sequence cell lists of the turbot FA (test_flash_attn_ext_kv_rows): 1 to 8 queries per slot
+    // (decode, verify; <4, 8> up to 4, <8, 8> above), 1 to 4 slots, kv 1000 (a partial last tile) to 16384, with and
+    // without foreign cells in the lists
+    for (int64_t kv : { 1000, 4096, 16384 }) {
+        for (int64_t n_tps : { 1, 3, 4, 8 }) {
+            for (int n_seq : { 1, 2, 4 }) {
+                for (bool decoys : { false, true }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(kv, n_tps, n_seq, decoys));
+                }
+            }
         }
     }
 
