@@ -21,6 +21,7 @@
 #include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
 #include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10]
 #include "llama-fn-auto.h"    // [TAG_FN_L22_STAGERS] llama_fn_l22_stagers
+#include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE]
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -38,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono> // [TAG_FN_L22_CPUSHARE]
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib> // [TAG_FN_L22_STAGERS]
@@ -61,6 +63,11 @@ struct pfs_layer {
     size_t        nbytes[3] = { 0, 0, 0 };
     size_t        pad[3]    = { 0, 0, 0 };                 // alloc size - nbytes, zeroed after each copy
     bool          src_pinned = false;
+    // [TAG_FN_L22_CPUSHARE] the zero-expert aliases [ne0, ne1, n_expert + 1] at the same bank address (mode 1) and the
+    // bytes behind the layer's experts that must read as zero (the zero expert and the alloc padding of that shape)
+    ggml_tensor * zdev[3] = { nullptr, nullptr, nullptr };
+    size_t        zpad[3] = { 0, 0, 0 };
+    bool          exp_ok  = false; // every tensor is n_expert whole nb[2] slices (expert ranges can be skipped)
 
     llama_pfs_view view;
 };
@@ -86,6 +93,11 @@ struct pfs_bank {
     std::vector<int32_t> tk;
     ggml_backend_event_t ev_tk = nullptr;
     bool                 tk_rec = false;
+
+    // [TAG_FN_L22_CPUSHARE] holds lacks some late experts (a share job skipped them): never kept for another ubatch;
+    // zc[k]: the layer bytes of tensor k behind which the zero-expert region is known to be zero (0: unknown)
+    bool   partial = false;
+    size_t zc[3]   = { 0, 0, 0 };
 };
 
 struct pfs_job {
@@ -192,6 +204,19 @@ struct pfs_state {
     uint64_t       pass_seq      = 0;     // under mtx
     uint64_t       pass_read     = 0;     // under mtx
     double         fix_ms        = 0.0;   // host ms of the lends and returns (the owner's thread)
+
+    // [TAG_FN_L22_CPUSHARE] round 22, package P16 (all off unless a share mode was configured before the init)
+    int                      cps_mode    = 0;     // the configured share mode (0 off)
+    bool                     zexp        = false; // the banks carry a zero expert behind every layer (mode 1)
+    int                      cps_wait_ms = 100;   // the most a share job waits for its layer's plan
+    int64_t                  n_exp_max   = 0;     // mask stride
+    uint64_t                 share_gen   = 0;     // the generation whose jobs have a late phase (0: none)
+    std::vector<uint8_t>     late;                // [n_pos][n_exp_max] under mtx
+    std::vector<uint8_t>     late_any;            // [n_pos] under mtx
+    std::vector<uint8_t>     skip;                // [n_pos][n_exp_max] under mtx
+    std::vector<uint64_t>    pub_gen;             // [n_pos] the generation of the published skip
+    std::vector<int64_t>     pub_us;              // [n_pos] when it was published
+    llama_pfs_share_counters sctr;                // under mtx
 };
 
 pfs_state * g_pfs = nullptr;
@@ -434,9 +459,13 @@ void pfs_run(pfs_state * s) {
     std::vector<std::pair<size_t, size_t>>   rr_stage;
     std::vector<uint8_t>                     dio;
     std::vector<llama_fn_dio_req>            dio_req;
+    // [TAG_FN_L22_CPUSHARE]
+    std::vector<uint8_t>                     late_l;
+    std::vector<uint8_t>                     skip_l;
 
     for (;;) {
         pfs_job job;
+        bool share = false; // [TAG_FN_L22_CPUSHARE] this job copies its late experts after the layer's plan
         {
             std::unique_lock<std::mutex> lk(s->mtx);
             s->cv.wait(lk, [&]() { return s->stop || !s->queue.empty(); });
@@ -445,7 +474,7 @@ void pfs_run(pfs_state * s) {
             }
             job = s->queue.front();
             pfs_bank & b0 = s->banks[s->layers[job.pos].bank];
-            if (b0.holds == job.pos && b0.complete) {
+            if (b0.holds == job.pos && b0.complete && !b0.partial) {
                 // the bank has this layer already (weights never change): keep it until the layer's release, unless
                 // the layer's gate already took it in this generation (then its release frees it, maybe already did)
                 if (!(b0.used_gen == s->gen && b0.used_pos == job.pos)) {
@@ -457,9 +486,19 @@ void pfs_run(pfs_state * s) {
             }
             s->cur_gen = job.gen;
             s->cur_pos = job.pos;
+            // [TAG_FN_L22_CPUSHARE] a job of a share ubatch (never layer 0: a new ubatch keeps bank 0's copy)
+            if (s->cps_mode > 0 && s->share_gen != 0 && job.gen == s->share_gen && !job.wrap && job.pos > 0 &&
+                s->late_any[job.pos] != 0 && s->layers[job.pos].exp_ok) {
+                const int64_t ne = s->layers[job.pos].src[0]->ne[2];
+                const uint8_t * m = s->late.data() + (size_t) job.pos*s->n_exp_max;
+                late_l.assign(m, m + ne);
+                skip_l.assign((size_t) ne, 0);
+                share = true;
+            }
         }
         const pfs_layer & L = s->layers[job.pos];
         pfs_bank &        B = s->banks[L.bank];
+        const int64_t t_job0 = share ? ggml_time_us() : 0; // [TAG_FN_L22_CPUSHARE]
         llama_fn_warm_wait_layer(L.il); // [TAG_FN_L15_WARM] the warm pass brings this layer in first
         // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
         // [TAG_FN_L22_READAHEAD] not while the round-22 read-ahead thread runs (it covers every layer of the pass)
@@ -524,6 +563,12 @@ void pfs_run(pfs_state * s) {
                 B.holds    = job.pos;
                 B.complete = false;
                 B.consumed = false;
+                B.partial  = false; // [TAG_FN_L22_CPUSHARE]
+                for (int k = 0; k < 3; ++k) {
+                    if (B.zc[k] != L.nbytes[k]) {
+                        B.zc[k] = 0; // this layer's copies may write over the zero region of the last one
+                    }
+                }
             }
             pfs_bank_release_tk(s->copy, B); // [TAG_FN_L22_PIN] the bank's last copies have landed (its layer was used)
             gen5::ev_wait(s->copy, B.ev_free, s->compute);
@@ -744,13 +789,38 @@ void pfs_run(pfs_state * s) {
                       L.src[k]->nb[2]*(size_t) n_exp == L.nbytes[k];
             }
         }
-        for (int k = 0; k < 3 && !cancelled; ++k) {
-            if (d2d) {
-                expert_ranges(k, false);
-            } else {
-                ranges.assign(1, { (size_t) 0, L.nbytes[k] });
+        // [TAG_FN_L22_CPUSHARE] the runs of experts for which pred(e) holds, as byte ranges of tensor k
+        auto ranges_where = [&](int k, const auto & pred) {
+            ranges.clear();
+            const size_t nb = L.src[k]->nb[2];
+            for (int64_t e = 0; e < n_exp; ) {
+                if (!pred(e)) {
+                    ++e;
+                    continue;
+                }
+                int64_t e1 = e + 1;
+                while (e1 < n_exp && pred(e1)) {
+                    ++e1;
+                }
+                ranges.push_back({ (size_t) e*nb, (size_t) e1*nb });
+                e = e1;
             }
-            stream_ranges(k);
+        };
+        if (!share) {
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                if (d2d) {
+                    expert_ranges(k, false);
+                } else {
+                    ranges.assign(1, { (size_t) 0, L.nbytes[k] });
+                }
+                stream_ranges(k);
+            }
+        } else {
+            // [TAG_FN_L22_CPUSHARE] the early experts first: host experts that are neither in a hot slot nor late
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                ranges_where(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && late_l[e] == 0; });
+                stream_ranges(k);
+            }
         }
         if (!cancelled && !flush()) {
             cancelled = true;
@@ -786,8 +856,66 @@ void pfs_run(pfs_state * s) {
                 }
             }
         }
+        // [TAG_FN_L22_CPUSHARE] the late experts: wait (bounded) for the layer's plan, then copy the ones it does not skip
+        bool     skipped_any = false;
+        uint64_t b_skip      = 0;
+        uint64_t b_late      = 0;
+        if (share && !cancelled) {
+            const int64_t tw0 = ggml_time_us();
+            bool got = false;
+            bool timed_out = false;
+            {
+                std::unique_lock<std::mutex> lk(s->mtx);
+                auto ready = [&]() { return s->stop || s->cur_gen != s->gen || s->pub_gen[job.pos] == job.gen; };
+                if (!ready()) {
+                    timed_out = !s->cv.wait_for(lk, std::chrono::milliseconds(s->cps_wait_ms), ready);
+                }
+                if (s->stop || s->cur_gen != s->gen) {
+                    cancelled = true;
+                } else if (s->pub_gen[job.pos] == job.gen) {
+                    got = true;
+                    const uint8_t * m = s->skip.data() + (size_t) job.pos*s->n_exp_max;
+                    skip_l.assign(m, m + n_exp);
+                    const double plan_us = (double) std::max<int64_t>(0, s->pub_us[job.pos] - t_job0);
+                    s->sctr.plan_us_ewma = s->sctr.plan_us_ewma < 0 ? plan_us : 0.8*s->sctr.plan_us_ewma + 0.2*plan_us;
+                }
+                s->sctr.plan_wait_ms += (ggml_time_us() - tw0)/1e3;
+                if (timed_out && !cancelled) {
+                    s->sctr.timeouts++;
+                }
+            }
+            if (!got) {
+                std::fill(skip_l.begin(), skip_l.end(), 0); // no plan in time: every late expert is copied
+            }
+            for (int64_t e = 0; e < n_exp && !cancelled; ++e) {
+                if (late_l[e] != 0 && !(d2d && hot_slot[e] >= 0)) {
+                    const uint64_t eb = L.src[0]->nb[2] + L.src[1]->nb[2] + L.src[2]->nb[2];
+                    (skip_l[e] != 0 ? b_skip : b_late) += eb;
+                    skipped_any = skipped_any || skip_l[e] != 0;
+                }
+            }
+            for (int k = 0; k < 3 && !cancelled; ++k) {
+                ranges_where(k, [&](int64_t e) { return !(d2d && hot_slot[e] >= 0) && late_l[e] != 0 && skip_l[e] == 0; });
+                stream_ranges(k);
+            }
+            if (!cancelled && !flush()) {
+                cancelled = true;
+            }
+        }
         if (!cancelled) {
             for (int k = 0; k < 3; ++k) {
+                if (s->zexp) {
+                    // [TAG_FN_L22_CPUSHARE] the zero expert and the padding of the zero-expert shape, unless this bank's
+                    // last zeroing was for a layer of the same size and no larger copy came since
+                    if (B.zc[k] != L.nbytes[k]) {
+                        for (size_t o = 0; o < L.zpad[k]; o += s->zeros.size) {
+                            const size_t n = std::min(s->zeros.size, L.zpad[k] - o);
+                            ggml_backend_tensor_set_async(s->copy, B.raw, s->zeros.ptr, s->off[k] + L.nbytes[k] + o, n);
+                        }
+                        B.zc[k] = L.nbytes[k];
+                    }
+                    continue;
+                }
                 for (size_t o = 0; o < L.pad[k]; o += s->zeros.size) {
                     const size_t n = std::min(s->zeros.size, L.pad[k] - o);
                     ggml_backend_tensor_set_async(s->copy, B.raw, s->zeros.ptr, s->off[k] + L.nbytes[k] + o, n);
@@ -830,6 +958,12 @@ void pfs_run(pfs_state * s) {
             std::lock_guard<std::mutex> lk(s->mtx);
             if (!cancelled) {
                 B.complete = true;
+                if (share) { // [TAG_FN_L22_CPUSHARE]
+                    B.partial = skipped_any;
+                    s->sctr.jobs++;
+                    s->sctr.skip_bytes += b_skip;
+                    s->sctr.late_bytes += b_late;
+                }
                 s->ctr.jobs++;
                 s->ctr.bytes += bytes;
                 s->ub_bytes  += bytes;
@@ -854,14 +988,91 @@ void pfs_run(pfs_state * s) {
     }
 }
 
-void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
-    GGML_UNUSED(dst);
-    GGML_UNUSED(nth);
-    if (ith != 0) {
-        return;
+// a new ubatch (gate 0, or the first share layer's plan): the device is idle, so no bank has a user. Older jobs are
+// cancelled, except a copy of layer 0 (the wrap), which is kept running or kept in bank 0. s->mtx held
+void pfs_ubatch_begin(pfs_state * s, int64_t t0) {
+    pfs_bank & B = s->banks[s->layers[0].bank];
+    bool had = false;
+    // [TAG_FN_L22_CPUSHARE] a bank a share job left without some late experts never serves another ubatch
+    for (auto & b : s->banks) {
+        if (b.partial) {
+            b.holds    = -1;
+            b.complete = false;
+            b.partial  = false;
+            s->sctr.invalidated++;
+        }
     }
+    s->gen++;
+    const bool run0  = s->cur_pos == 0;                               // a copy of layer 0 is running
+    const bool data0 = B.holds == 0 && (B.complete || run0);          // bank 0 has (or is getting) layer 0
+    if (run0) {
+        s->cur_gen = s->gen;
+    }
+    std::deque<pfs_job> q;
+    if (s->cur_pos >= 0 && !s->queue.empty()) {
+        q.push_back(s->queue.front()); // the running job stays at the front; the streamer pops it
+        if (run0) {
+            q.back().gen = s->gen;
+        }
+    }
+    for (size_t b = 0; b < s->banks.size(); ++b) {
+        s->banks[b].consumed = !(b == 0 && data0); // gate 0 uses bank 0 now: nothing may overwrite it
+    }
+    if (!run0 && !data0) {
+        q.push_back({ 0, s->gen });
+    }
+    for (int p = 1; p < (int) s->layers.size(); ++p) {
+        q.push_back({ p, s->gen });
+    }
+    if (s->wrap) {
+        q.push_back({ 0, s->gen, true });
+    }
+    s->queue.swap(q);
+    s->ctr.ubatches++;
+    s->t_ub0    = t0;
+    s->ub_bytes = 0;
+    s->ub_d2d   = 0;
+    s->ub_wait  = 0.0;
+    s->ub_pinned = 0; // [TAG_FN_L22_P4]
+    s->ub_ssd    = 0;
+    s->sums.ubatches++;
+    had = B.holds == 0 && B.complete;
+    if (had) {
+        s->ctr.reused++;
+    }
+    // [TAG_FN_L22_READAHEAD] a new pass: the read-ahead samples every layer once and prefetches what is out
+    if (s->l22.readahead && s->ra_thr.joinable()) {
+        std::lock_guard<std::mutex> rlk(s->ra_mtx);
+        s->ra_gen = s->gen;
+        s->ra_cv.notify_one();
+    }
+}
+
+// wait until the layer's bank holds it, then claim the bank. s->mtx held (lk)
+void pfs_layer_wait(pfs_state * s, pfs_layer * L, std::unique_lock<std::mutex> & lk) {
+    pfs_bank & B = s->banks[L->bank];
+    while (!(B.holds == L->pos && B.complete) && !s->stop) {
+        bool queued = s->cur_pos == L->pos;
+        for (const auto & j : s->queue) {
+            queued = queued || (j.pos == L->pos && j.gen == s->gen);
+        }
+        if (!queued) {
+            s->queue.push_back({ L->pos, s->gen }); // guard: never wait for a copy nobody will do
+            s->cv.notify_all();
+        }
+        s->cv_done.wait(lk);
+    }
+    // the layer is in use from here to its release: claim the bank, also when its data is left from an earlier
+    // ubatch and the streamer has not reached this layer's job yet
+    if (B.holds == L->pos && B.complete) {
+        B.consumed = false;
+        B.used_gen = s->gen;
+        B.used_pos = L->pos;
+    }
+}
+
+pfs_state * pfs_gate_state(pfs_layer * L) {
     pfs_state * s = g_pfs;
-    pfs_layer * L = (pfs_layer *) ud;
     if (!s || L->pos >= (int) s->layers.size() || &s->layers[L->pos] != L) {
         GGML_ABORT("prefill-stream: a graph outlived its stream state");
     }
@@ -869,85 +1080,57 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         // [TAG_FN_R1_PFS_LEND] the banks are the hot set's slots right now: a decode could be reading them
         GGML_ABORT("prefill-stream: a streamed graph ran while its banks were not borrowed");
     }
-    const int64_t t0 = ggml_time_us();
+    return s;
+}
+
+void pfs_gate_end(pfs_state * s, pfs_layer * L, int64_t t0) {
     pfs_bank & B = s->banks[L->bank];
-    bool had = false;
-    {
-        std::unique_lock<std::mutex> lk(s->mtx);
-        if (L->pos == 0) {
-            // a new ubatch: the device is idle, so no bank has a user. Older jobs are cancelled, except a copy of
-            // layer 0 (the wrap), which is kept running or kept in bank 0.
-            s->gen++;
-            const bool run0  = s->cur_pos == 0;                               // a copy of layer 0 is running
-            const bool data0 = B.holds == 0 && (B.complete || run0);          // bank 0 has (or is getting) layer 0
-            if (run0) {
-                s->cur_gen = s->gen;
-            }
-            std::deque<pfs_job> q;
-            if (s->cur_pos >= 0 && !s->queue.empty()) {
-                q.push_back(s->queue.front()); // the running job stays at the front; the streamer pops it
-                if (run0) {
-                    q.back().gen = s->gen;
-                }
-            }
-            for (size_t b = 0; b < s->banks.size(); ++b) {
-                s->banks[b].consumed = !(b == 0 && data0); // gate 0 uses bank 0 now: nothing may overwrite it
-            }
-            if (!run0 && !data0) {
-                q.push_back({ 0, s->gen });
-            }
-            for (int p = 1; p < (int) s->layers.size(); ++p) {
-                q.push_back({ p, s->gen });
-            }
-            if (s->wrap) {
-                q.push_back({ 0, s->gen, true });
-            }
-            s->queue.swap(q);
-            s->ctr.ubatches++;
-            s->t_ub0    = t0;
-            s->ub_bytes = 0;
-            s->ub_d2d   = 0;
-            s->ub_wait  = 0.0;
-            s->ub_pinned = 0; // [TAG_FN_L22_P4]
-            s->ub_ssd    = 0;
-            s->sums.ubatches++;
-            had = B.holds == 0 && B.complete;
-            if (had) {
-                s->ctr.reused++;
-            }
-            // [TAG_FN_L22_READAHEAD] a new pass: the read-ahead samples every layer once and prefetches what is out
-            if (s->l22.readahead && s->ra_thr.joinable()) {
-                std::lock_guard<std::mutex> rlk(s->ra_mtx);
-                s->ra_gen = s->gen;
-                s->ra_cv.notify_one();
-            }
-        }
-        s->cv.notify_all();
-        while (!(B.holds == L->pos && B.complete) && !s->stop) {
-            bool queued = s->cur_pos == L->pos;
-            for (const auto & j : s->queue) {
-                queued = queued || (j.pos == L->pos && j.gen == s->gen);
-            }
-            if (!queued) {
-                s->queue.push_back({ L->pos, s->gen }); // guard: never wait for a copy nobody will do
-                s->cv.notify_all();
-            }
-            s->cv_done.wait(lk);
-        }
-        // the layer is in use from here to its release: claim the bank, also when its data is left from an earlier
-        // ubatch and the streamer has not reached this layer's job yet
-        if (B.holds == L->pos && B.complete) {
-            B.consumed = false;
-            B.used_gen = s->gen;
-            B.used_pos = L->pos;
-        }
-    }
     gen5::ev_wait(s->compute, B.ev_done, s->copy);
     const double w = (ggml_time_us() - t0) / 1e6;
     std::lock_guard<std::mutex> lk(s->mtx);
     s->ctr.wait_s += w;
     s->ub_wait    += w;
     s->sums.wait_ms += w*1e3; // [TAG_FN_L22_P4]
+}
+
+void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    pfs_layer * L = (pfs_layer *) ud;
+    pfs_state * s = pfs_gate_state(L);
+    const int64_t t0 = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        if (L->pos == 0) {
+            pfs_ubatch_begin(s, t0);
+        }
+        s->cv.notify_all();
+        pfs_layer_wait(s, L, lk);
+    }
+    pfs_gate_end(s, L, t0);
+}
+
+// [TAG_FN_L22_CPUSHARE] the gate of a share layer: the new-ubatch work ran in the first share layer's plan
+void pfs_gate_share_op(ggml_tensor * dst, int ith, int nth, void * ud) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    if (dst->data != nullptr && dst->type == GGML_TYPE_F32) {
+        *(float *) dst->data = 0.0f; // an ordering node: its value is never read, but keep it defined
+    }
+    pfs_layer * L = (pfs_layer *) ud;
+    pfs_state * s = pfs_gate_state(L);
+    const int64_t t0 = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        s->cv.notify_all();
+        pfs_layer_wait(s, L, lk);
+    }
+    pfs_gate_end(s, L, t0);
 }
 
 void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
@@ -988,6 +1171,11 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
                 const uint64_t direct = std::min<uint64_t>(s->ub_bytes, s->ub_pinned + s->ub_ssd);
                 const double   sh     = (double) (s->ub_bytes - direct) / (double) s->ub_bytes;
                 s->stg_share = s->stg_share < 0.0 ? sh : 0.5*s->stg_share + 0.5*sh;
+            }
+            // [TAG_FN_L22_CPUSHARE] the copy rate of share passes (bytes per us of the pass), for the CPU budget
+            if (s->share_gen != 0 && s->share_gen == s->gen && s->ub_bytes > 0 && p.wall_ms > 0.0) {
+                const double r = (double) s->ub_bytes / (p.wall_ms*1e3);
+                s->sctr.dma_bpu_ewma = s->sctr.dma_bpu_ewma < 0 ? r : 0.7*s->sctr.dma_bpu_ewma + 0.3*r;
             }
         }
         if (s->stats && L->pos == (int) s->layers.size() - 1) {
@@ -1135,6 +1323,9 @@ static bool pfs_take(pfs_state * s) {
         for (auto & L : s->layers) {
             for (int k = 0; k < 3 && ok; ++k) {
                 ok = ggml_backend_tensor_alloc(buf, L.dev[k], base + (size_t) L.bank*s->bank_size + s->off[k]) == GGML_STATUS_SUCCESS;
+                if (ok && L.zdev[k]) { // [TAG_FN_L22_CPUSHARE] the zero-expert alias at the same address
+                    ok = ggml_backend_tensor_alloc(buf, L.zdev[k], base + (size_t) L.bank*s->bank_size + s->off[k]) == GGML_STATUS_SUCCESS;
+                }
             }
         }
         if (!ok) {
@@ -1159,6 +1350,8 @@ static bool pfs_take(pfs_state * s) {
             B.complete = false;
             B.consumed = true;
             B.used_pos = -1;
+            B.partial  = false; // [TAG_FN_L22_CPUSHARE] the range held hot slots until now
+            B.zc[0] = B.zc[1] = B.zc[2] = 0;
         }
         s->ctr.lends++;
         pfs_stagers_apply(s); // [TAG_FN_L22_STAGERS] before any job of this lend
@@ -1191,6 +1384,8 @@ static void pfs_return(pfs_state * s) {
             B.complete = false;
             B.consumed = true;
             B.used_pos = -1;
+            B.partial  = false; // [TAG_FN_L22_CPUSHARE] the hot set refills the range
+            B.zc[0] = B.zc[1] = B.zc[2] = 0;
         }
     }
     if (s->copy) {
@@ -1238,6 +1433,19 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     const bool cpu_dev = !d.dev || ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     ggml_backend_buffer_type_t host_buft = !cpu_dev ? ggml_backend_dev_host_buffer_type(d.dev) : nullptr;
 
+    // [TAG_FN_L22_CPUSHARE] P16's share mode, configured by the owner context before this init
+    if (const llama_fn_cps_cfg * cps = llama_fn_cpushare_cfg()) {
+        s->cps_mode    = cps->mode;
+        s->zexp        = cps->mode == 1;
+        s->cps_wait_ms = std::max(1, cps->wait_ms);
+    }
+    ggml_context * zctx = nullptr; // the zero-expert shapes, only to ask the buffer type for their alloc size
+    if (s->zexp) {
+        ggml_init_params zp = { ggml_tensor_overhead()*(3*layers.size() + 4), nullptr, true };
+        zctx = ggml_init(zp);
+        s->zexp = zctx != nullptr;
+    }
+
     // one layout for every bank: up at 0, gate and down after the largest up / gate of any layer
     const size_t align = std::max<size_t>(256, ggml_backend_buft_get_alignment(d.buft));
     size_t max_alloc[3] = { 0, 0, 0 };
@@ -1264,6 +1472,25 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         }
         L.src_pinned = L.src_pinned || arena;
         s->by_up[L.src[0]] = (int) p;
+        // [TAG_FN_L22_CPUSHARE] expert-granular ranges, and with the zero expert the bytes behind the layer that must be 0
+        const int64_t ne_e = L.src[0]->ne[2];
+        L.exp_ok = ne_e > 0;
+        for (int k = 0; k < 3; ++k) {
+            L.exp_ok = L.exp_ok && L.src[k]->ne[2] == ne_e && L.src[k]->ne[3] == 1 && L.src[k]->nb[2]*(size_t) ne_e == L.nbytes[k];
+        }
+        s->n_exp_max = std::max(s->n_exp_max, ne_e);
+        if (zctx && L.exp_ok) {
+            for (int k = 0; k < 3; ++k) {
+                const ggml_tensor * t = L.src[k];
+                ggml_tensor * z = ggml_new_tensor_4d(zctx, t->type, t->ne[0], t->ne[1], t->ne[2] + 1, t->ne[3]);
+                const size_t za = ggml_backend_buft_get_alloc_size(d.buft, z);
+                L.zpad[k]    = za > L.nbytes[k] ? za - L.nbytes[k] : 0;
+                max_alloc[k] = std::max(max_alloc[k], za);
+            }
+        }
+    }
+    if (zctx) {
+        ggml_free(zctx);
     }
     s->off[0]    = 0;
     s->off[1]    = align_up(max_alloc[0], align);
@@ -1312,7 +1539,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
 
     // per layer aliases with the layer's own types and shapes
     {
-        ggml_init_params ip = { ggml_tensor_overhead()*(3*layers.size() + 8), nullptr, true };
+        ggml_init_params ip = { ggml_tensor_overhead()*((s->zexp ? 6 : 3)*layers.size() + 8), nullptr, true };
         ggml_context * ctx = ggml_init(ip);
         if (!ctx) {
             return fail("no context");
@@ -1326,12 +1553,19 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
                 const ggml_tensor * t = L.src[k];
                 L.dev[k] = ggml_new_tensor_4d(ctx, t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
                 ggml_format_name(L.dev[k], "pfs.%d.%s", L.il, nm[k]);
+                if (s->zexp && L.exp_ok) { // [TAG_FN_L22_CPUSHARE] one more expert, the zero one, behind the layer
+                    L.zdev[k] = ggml_new_tensor_4d(ctx, t->type, t->ne[0], t->ne[1], t->ne[2] + 1, t->ne[3]);
+                    ggml_format_name(L.zdev[k], "pfsz.%d.%s", L.il, nm[k]);
+                }
                 if (s->lend) {
                     continue; // [TAG_FN_R1_PFS_LEND] placed at the first lend
                 }
                 void * addr = (char *) ggml_backend_buffer_get_base(B.buf) + s->off[k];
                 if (ggml_backend_tensor_alloc(B.buf, L.dev[k], addr) != GGML_STATUS_SUCCESS) {
                     return fail("alias allocation failed");
+                }
+                if (L.zdev[k] && ggml_backend_tensor_alloc(B.buf, L.zdev[k], addr) != GGML_STATUS_SUCCESS) {
+                    return fail("zero-expert alias allocation failed");
                 }
             }
             L.view.up     = L.dev[0];
@@ -1358,7 +1592,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             e = gen5::ev_new(d.dev);
         }
     }
-    if (!s->zeros.alloc(d.dev, 64u << 10, "prefill stream zeros")) {
+    if (!s->zeros.alloc(d.dev, s->zexp ? 1u << 20 : 64u << 10, "prefill stream zeros")) { // [TAG_FN_L22_CPUSHARE] 1 MiB
         return fail("no zero page");
     }
     memset(s->zeros.ptr, 0, s->zeros.size);
@@ -1381,6 +1615,16 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         return fail("no copy backend");
     }
 
+    // [TAG_FN_L22_CPUSHARE] late / skip masks per position
+    if (s->cps_mode > 0) {
+        const size_t np = s->layers.size();
+        s->late.assign(np*(size_t) s->n_exp_max, 0);
+        s->late_any.assign(np, 0);
+        s->skip.assign(np*(size_t) s->n_exp_max, 0);
+        s->pub_gen.assign(np, 0);
+        s->pub_us.assign(np, 0);
+    }
+
     s->pool = std::make_unique<gen5::copy_pool>();
     s->pool->start(n_threads);
     s->n_threads_max = s->pool->size(); // [TAG_FN_L22_STAGERS]
@@ -1393,6 +1637,10 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
             s->chunk >> 20, s->pool->size(), s->wrap ? "on" : "off",
             s->d2d ? ", the hot set's experts slot -> bank on the device [TAG_FN_L14_PFSD2D]" : "");
+    if (s->cps_mode > 0) {
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s\n",
+                s->cps_mode, s->cps_wait_ms, s->zexp ? ", a zero expert behind every layer in the banks" : "");
+    }
     return true;
 }
 
@@ -1635,4 +1883,134 @@ double llama_prefill_stream_fix_take(const void * owner) {
     const double ms = s->fix_ms;
     s->fix_ms = 0.0;
     return ms;
+}
+
+// [TAG_FN_L22_CPUSHARE] -------------------------------------------------------------------------------------------------
+
+int llama_prefill_stream_pos(const llama_pfs_view * v) {
+    return v && v->handle ? ((const pfs_layer *) v->handle)->pos : -1;
+}
+
+int llama_prefill_stream_n_pos() {
+    const pfs_state * s = g_pfs;
+    return s ? (int) s->layers.size() : 0;
+}
+
+bool llama_prefill_stream_view_z(const llama_pfs_view * v, ggml_tensor * out[3]) {
+    const pfs_state * s = g_pfs;
+    if (!s || !s->zexp || !v || !v->handle) {
+        return false;
+    }
+    const pfs_layer * L = (const pfs_layer *) v->handle;
+    for (int k = 0; k < 3; ++k) {
+        if (!L->zdev[k]) {
+            return false;
+        }
+        out[k] = L->zdev[k];
+    }
+    return true;
+}
+
+ggml_backend_t llama_prefill_stream_device() {
+    const pfs_state * s = g_pfs;
+    return s ? s->compute : nullptr;
+}
+
+void llama_prefill_stream_share_begin(const uint8_t * late, int n_expert) {
+    pfs_state * s = g_pfs;
+    if (!s || s->layers.empty()) {
+        return;
+    }
+    if (s->lend && !s->lent) {
+        GGML_ABORT("prefill-stream: a streamed graph ran while its banks were not borrowed");
+    }
+    const int64_t t0 = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> lk(s->mtx);
+        const bool masks = late != nullptr && s->cps_mode > 0 && n_expert > 0 && n_expert <= s->n_exp_max;
+        if (s->cps_mode > 0) {
+            std::fill(s->late.begin(), s->late.end(), 0);
+            std::fill(s->late_any.begin(), s->late_any.end(), 0);
+            if (masks) {
+                for (size_t p = 1; p < s->layers.size(); ++p) { // position 0 is never late
+                    uint8_t * dst = s->late.data() + p*(size_t) s->n_exp_max;
+                    const uint8_t * src = late + p*(size_t) n_expert;
+                    uint8_t any = 0;
+                    for (int e = 0; e < n_expert; ++e) {
+                        dst[e] = src[e] != 0;
+                        any |= dst[e];
+                    }
+                    s->late_any[p] = any;
+                }
+            }
+        }
+        pfs_ubatch_begin(s, t0);
+        s->share_gen = masks ? s->gen : 0;
+    }
+    s->cv.notify_all();
+}
+
+bool llama_prefill_stream_share_active() {
+    pfs_state * s = g_pfs;
+    if (!s) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    return s->share_gen != 0 && s->share_gen == s->gen;
+}
+
+void llama_prefill_stream_share_publish(const llama_pfs_view * v, const uint8_t * skip, int n_expert) {
+    pfs_state * s = g_pfs;
+    if (!s || s->cps_mode <= 0 || !v || !v->handle) {
+        return;
+    }
+    const pfs_layer * L = (const pfs_layer *) v->handle;
+    if (L->pos < 0 || L->pos >= (int) s->layers.size() || &s->layers[L->pos] != L) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(s->mtx);
+        uint8_t * dst = s->skip.data() + (size_t) L->pos*s->n_exp_max;
+        std::fill(dst, dst + s->n_exp_max, 0);
+        if (skip != nullptr && n_expert > 0 && n_expert <= s->n_exp_max) {
+            for (int e = 0; e < n_expert; ++e) {
+                dst[e] = skip[e] != 0;
+            }
+        }
+        s->pub_gen[L->pos] = s->gen;
+        s->pub_us[L->pos]  = ggml_time_us();
+    }
+    s->cv.notify_all();
+}
+
+bool llama_prefill_stream_layer_full(const llama_pfs_view * v) {
+    pfs_state * s = g_pfs;
+    if (!s || !v || !v->handle) {
+        return false;
+    }
+    const pfs_layer * L = (const pfs_layer *) v->handle;
+    if (L->pos < 0 || L->pos >= (int) s->layers.size() || &s->layers[L->pos] != L) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    const pfs_bank & B = s->banks[L->bank];
+    return B.holds == L->pos && B.complete && !B.partial;
+}
+
+ggml_tensor * llama_prefill_stream_build_gate_share(ggml_context * ctx, ggml_cgraph * gf, const llama_pfs_view * v, ggml_tensor * dep) {
+    pfs_layer * L = (pfs_layer *) v->handle;
+    ggml_tensor * args[1] = { dep };
+    ggml_tensor * g = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, args, 1, pfs_gate_share_op, 1, L);
+    ggml_format_name(g, "pfs_gate_share-%d", L->il);
+    ggml_build_forward_expand(gf, g);
+    return g;
+}
+
+llama_pfs_share_counters llama_prefill_stream_share_counters() {
+    pfs_state * s = g_pfs;
+    if (!s) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    return s->sctr;
 }
