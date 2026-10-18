@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-fn-l22.h" // [TAG_FN_L22_PHASE]
 #include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10] llama_fn_l22_cost
+#include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE] llama_pfs_share_counters
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
@@ -699,6 +700,12 @@ private:
     void     l22_sk_free_full();
     void     l22_sk_swap_in(bool restored);
     void     l22_sk_drop();
+
+    // [TAG_FN_L22_CPUSHARE] round 22, package P16: the CPU share mode this context owns (0: none)
+    int      l22_cps_mode   = 0;
+    uint64_t l22_cps_n_grow = 0; // compute-buffer growths seen after a share decode
+    llama_pfs_share_counters l22_cps_sc0; // the stream's share counters at the last PASSLOG line
+    void     l22_cps_log(ggml_backend_sched_t s0, const std::vector<size_t> & b0);
 
     bool     dft_set_wide(bool wide);
     llama_context * l20_draft() const;

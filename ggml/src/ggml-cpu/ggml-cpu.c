@@ -1336,6 +1336,15 @@ bool ggml_cpu_fn_vec_dot_mr(enum ggml_type type, int n, float * s, size_t bs, co
     return true;
 }
 
+// [TAG_FN_L22_CPUSHARE] the multi-row kernel of a type (NULL: none) for a caller that runs it many times (the CPU share op
+// of src/llama-fn-cpushare.cpp, through the proc "ggml_cpu_fn_mr_kernel_get"): ggml_cpu_fn_vec_dot_mr runs ggml_cpu_init
+// on every call
+void * ggml_cpu_fn_mr_kernel_get(enum ggml_type type);
+void * ggml_cpu_fn_mr_kernel_get(enum ggml_type type) {
+    ggml_cpu_init();
+    return (void *) ggml_cpu_fn_mr_kernel(type);
+}
+
 // [TAG_Q2_0_CPU] the use_ref backend (the reference of test-backend-ops -b CPU) runs the scalar Q2_0 dot product, so the
 // SIMD one is compared against it
 static inline ggml_vec_dot_t ggml_cpu_mul_mat_vec_dot(enum ggml_type type, bool use_ref) {
