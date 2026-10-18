@@ -257,14 +257,12 @@ bool llama_fn_dmashare_wanted(const llama_model * model, const llama_moe_bridge 
         s->tail.r = std::min(100, std::max(0, (int) llama_fn_l22_x_read(model).tailskip));
         const char * tw = llama_fn_env(*model, "LLAMA_FN_L22_X_TAILSKIP_W");
         s->tail.w = s->tail.r > 0 && tw && tw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(tw))) : 0.0f;
-        const char * dr = llama_fn_env(*model, "LLAMA_FN_L22_X_DEFER_R");
-        const char * dw = llama_fn_env(*model, "LLAMA_FN_L22_X_DEFER_W");
-        // N-P11-1: P11's parse (R 0..127, W 0..1, unset 0; neither rule set: W 0.1); at the P11 merge read
-        // llama_moe_bridge_defer_params instead
-        s->defer.r = std::min(127, std::max(0, dr && dr[0] ? atoi(dr) : 0));
-        s->defer.w = dw && dw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(dw))) : 0.0f;
-        if (s->defer.r == 0 && s->defer.w <= 0.0f) {
-            s->defer.w = 0.1f;
+        // N-P11-1: P11's light rule as its bridge parsed it (set in llama_moe_bridge_create before this call); DEFER off:
+        // no rule (no job carries GGML_MOE_BRIDGE_JOB_DEFER then)
+        s->defer.r = 0;
+        s->defer.w = 0.0f;
+        if (llama_moe_bridge_defer_mode(br) > 0) {
+            llama_moe_bridge_defer_params(br, &s->defer.w, &s->defer.r);
         }
     }
 
@@ -460,8 +458,8 @@ bool llama_fn_dmashare_plan(llama_fn_dmashare_job * jv, int32_t * skip_table) {
     if (j->flags & GGML_MOE_BRIDGE_JOB_TAIL) {
         in.tail = s->tail;
     }
-    if (j->flags & GGML_MOE_BRIDGE_JOB_DEFER) {
-        in.defer = s->defer;
+    if ((j->flags & GGML_MOE_BRIDGE_JOB_DEFER) && j->w != nullptr) {
+        in.defer = s->defer; // P11 splits weighted jobs only (ggml_fn_moe_compute): an unweighted one has no light part
     }
     if (in.n_exp != (int) L.slots.mirror.size()) {
         return false;
