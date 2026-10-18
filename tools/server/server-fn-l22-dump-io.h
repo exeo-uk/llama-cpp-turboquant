@@ -28,7 +28,8 @@ namespace l22dump {
 static constexpr char     MAGIC[8]     = { 'L', '2', '2', 'D', 'U', 'M', 'P', '1' };
 static constexpr int32_t  VERSION      = 1;
 static constexpr int32_t  K_MAX        = 256;
-static constexpr int32_t  WINDOW_MAX   = 64;
+static constexpr int32_t  WINDOW_MAX   = 8;  // rows per forced decode: a verify-sized window (3 = n_max 2) keeps the
+                                             // context's pinned output buffer at the size real decodes use (plan 3.6)
 static constexpr int32_t  REC_MAX      = 4096; // records incl. record 0, so at most REC_MAX - 1 forced tokens
 static constexpr float    LOG_ZERO     = -1e30f;
 static constexpr uint64_t FNV_OFFSET   = 0xcbf29ce484222325ULL;
