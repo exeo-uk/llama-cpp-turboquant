@@ -50,6 +50,8 @@ struct clip_graph {
 
     // TODO [QWEN_VIDEO]: improve this in the future
     int n_batch = 1;
+    // [TAG_FN_L22_VLBATCH] > 1: n_batch independent still images (img_batch->fn_n_images)
+    int fn_n_images = 1;
 
     ggml_context_ptr ctx0_ptr;
     ggml_context * ctx0;
