@@ -244,7 +244,7 @@ bool kvl_grow_l22(kvl_state * ks, uint32_t want, size_t extra, size_t add) {
             // after the hot set's give: its unmapped VRAM has left LOCAL usage (a check before it unpins for bytes it gives)
             uint64_t budget = 0;
             uint64_t usage  = 0;
-            if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget < usage + add + mib512) {
+            if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget < usage + add + llama_fn_pin_precheck_margin()) {
                 oom_called = true;
                 llama_fn_pin_on_oom(add);
                 kvl_cur = ks;

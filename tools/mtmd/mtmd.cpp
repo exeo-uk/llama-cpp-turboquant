@@ -734,7 +734,7 @@ struct mtmd_context {
         if (luid_fn == nullptr || !luid_fn(dev, &luid) || !llama_fn_dxgi_query(luid, 0, &budget, &usage)) {
             return;
         }
-        const uint64_t margin = (uint64_t) 256 << 20;
+        const uint64_t margin = std::min<uint64_t>((uint64_t) 256 << 20, llama_fn_pin_precheck_margin()); // R-REV-2
         if (usage + need + margin > budget) {
             const bool freed = llama_fn_pin_on_oom(need);
             llama_fn_l22_log("pin", "[TAG_FN_L22_OOMHOOK] vision lend: LOCAL %.0f of %.0f MiB used, %.0f MiB more needed: pins %s",

@@ -123,7 +123,7 @@ bool dma_room(size_t bytes, bool * asked) {
     }
     uint64_t budget = 0;
     uint64_t usage  = 0;
-    if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget > usage && budget - usage >= (uint64_t) bytes + 512*DMA_MIB) {
+    if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget > usage && budget - usage >= (uint64_t) bytes + llama_fn_pin_precheck_margin()) {
         return true;
     }
     *asked = true;

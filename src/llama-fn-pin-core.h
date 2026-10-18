@@ -336,6 +336,24 @@ inline uint64_t plan_bytes(const budget_in & b, const budget_cfg & c) {
     return lim;
 }
 
+// R-REV-1: the OOM hook's stop rule. Below this LOCAL charge per registered byte, unpinning does not raise DXGI
+// headroom in a useful way
+constexpr double OOM_RATIO_MIN = 0.05;
+
+// the most one OOM hook call unpins: `want` bytes when it stops by bytes (DXGI shows the room, cannot be read, or shows no
+// charge), else the bytes whose measured charge covers the deficit (x 1.25 + 256 MiB), never less than want
+inline uint64_t oom_cap_bytes(uint64_t want, int64_t head0, bool by_bytes, double l_ratio) {
+    if (by_bytes || l_ratio < OOM_RATIO_MIN) {
+        return want;
+    }
+    const double deficit = (double) want - (double) head0;
+    if (deficit <= 0.0) {
+        return want;
+    }
+    const double cap = 1.25*deficit/l_ratio + (double) ((uint64_t) 256 << 20);
+    return cap >= 1.8e19 ? UINT64_MAX : std::max(want, (uint64_t) cap);
+}
+
 // the groups of the plan that fit in `bytes`, in plan order: a group that does not fit ends the list (whole experts,
 // the order kept)
 inline int plan_take(const plan & p, uint64_t bytes) {

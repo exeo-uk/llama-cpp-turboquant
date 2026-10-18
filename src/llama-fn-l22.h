@@ -292,3 +292,19 @@ LLAMA_API void llama_fn_l22_passlog_model(const llama_model * model, bool loaded
 // R-P6-1 / R-P14-5 (P6, src/llama-fn-pin.cpp; no stub): llama_fn_pin_query plus the device address of seg->src for a
 // pinned segment (0 when unknown or unpinned; set only with LLAMA_FN_L22_DMASHARE). Valid while the ticket is held
 LLAMA_API bool llama_fn_pin_query_dev(const void * p, size_t n, llama_fn_pin_seg * seg, uint64_t * dev);
+
+// R-REV-2 (review fixes, P6, src/llama-fn-pin.cpp): the headroom every pin pre-check keeps on top of an allocation's bytes:
+// 512 MiB, at most the watcher threshold that the pin budget set at ready (512 MiB without pins)
+LLAMA_API uint64_t llama_fn_pin_precheck_margin(void);
+// R-REV-12 (review fixes, P6): 0 llama_fn_pin_on_ready not called yet, 1 planning / registering, 2 registration ended
+// (pins may be active or all gone), 3 no pins in this run (no thread, or shut down)
+LLAMA_API int llama_fn_pin_phase(void);
+
+// R-REV-6 (review fixes, P0, src/llama-fn-l22-log.cpp): the plan 3.8 gates of the answer-changing levers as pure functions
+// (build_moe_ffn, fn_x_defer_mode and llama_fn_route_prior call them; test-fn-l22-gate covers them). The bridge job flags
+// a graph's levers add to its posts and sync ops: GGML_MOE_BRIDGE_JOB_TAIL iff fn_x has LLAMA_FN_L22_XB_TAIL
+LLAMA_API int32_t llama_fn_l22_job_flags(uint8_t fn_x);
+// DEFER acts in a graph: fn_x has LLAMA_FN_L22_XB_DEFER, one sequence, a bridge (or its sync op), not a two-chain graph
+LLAMA_API bool llama_fn_l22_defer_acts(uint8_t fn_x, uint32_t n_seqs_unq, bool have_bridge, bool tbo);
+// the route prior / resident swap act in a graph: fn_x has XB_PRIOR or XB_RESIDENT, or (_X_PRIOR_PROMPT) fn_gen is 0
+LLAMA_API bool llama_fn_l22_prior_acts(uint8_t fn_x, uint8_t fn_gen, bool prompt_rule);

@@ -6525,7 +6525,7 @@ size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
         uint64_t budget = 0, usage = 0;
         if (llama_fn_dxgi_query(0, 0, &budget, &usage)) {
             const uint64_t head = budget > usage ? budget - usage : 0;
-            if (head < (uint64_t) need + ((uint64_t) 512 << 20)) {
+            if (head < (uint64_t) need + llama_fn_pin_precheck_margin()) {
                 const bool freed = llama_fn_pin_on_oom(need);
                 llama_fn_l22_log("pin", "what=oom_pre site=vision_take need_mib=%.0f headroom_mib=%.0f freed=%d", need/1048576.0,
                         head/1048576.0, freed ? 1 : 0);
@@ -7538,8 +7538,9 @@ void llama_context::l22_cps_log(ggml_backend_sched_t s0, const std::vector<size_
     l22_cps_sc0 = sc;
 }
 
-// [TAG_FN_L22_OOMHOOK] before a device allocation of need bytes with pins active: DXGI LOCAL headroom below need + 512 MiB
-// -> P6 unpins first (synchronized: every caller has synchronized this context)
+// [TAG_FN_L22_OOMHOOK] before a device allocation of need bytes with pins active: DXGI LOCAL headroom below need + the
+// pin pre-check margin (512 MiB, at most what the pin budget left at ready) -> P6 unpins first (synchronized: every
+// caller has synchronized this context)
 void llama_context::l22_oom_pre(size_t need) {
     if (!llama_fn_pin_active()) {
         return;
@@ -7557,12 +7558,15 @@ void llama_context::l22_oom_pre(size_t need) {
         }
     }
     need = need > held ? need - held : 0;
+    if (need == 0) {
+        return; // R-REV-2: the held buffers cover it, nothing new is allocated
+    }
     uint64_t budget = 0, usage = 0;
     if (!llama_fn_dxgi_query(0, 0, &budget, &usage)) {
         return;
     }
     const uint64_t head = budget > usage ? budget - usage : 0;
-    if (head >= (uint64_t) need + ((uint64_t) 512 << 20)) {
+    if (head >= (uint64_t) need + llama_fn_pin_precheck_margin()) {
         return;
     }
     const bool freed = llama_fn_pin_on_oom(need);

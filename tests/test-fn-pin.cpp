@@ -417,10 +417,27 @@ static void test_concurrent() {
     TCHECK(n_pinned.load() > 0, "queries saw pinned ranges");
 }
 
+// R-REV-1: the OOM hook's cap never lets one call drain every range when DXGI shows no charge per registered byte
+static void test_oom_cap() {
+    const uint64_t M = 1ull << 20;
+    const uint64_t G = 1ull << 30;
+    TCHECK(fn_pin::oom_cap_bytes(512*M, 400*M, false, 0.0) == 512*M, "no charge seen: want bytes only");
+    TCHECK(fn_pin::oom_cap_bytes(512*M, 400*M, false, 0.01) == 512*M, "charge below the minimum: want bytes only");
+    TCHECK(fn_pin::oom_cap_bytes(512*M, 400*M, true, 1.0) == 512*M, "by bytes: want");
+    TCHECK(fn_pin::oom_cap_bytes(512*M, 600*M, false, 1.0) == 512*M, "no deficit: want");
+    TCHECK(fn_pin::oom_cap_bytes(512*M, 400*M, false, 1.0) == 512*M, "small deficit at ratio 1: at least want");
+    const uint64_t c1 = fn_pin::oom_cap_bytes(1*G, 0, false, 0.1);
+    TCHECK(c1 == (uint64_t) (1.25*(double) G/0.1) + 256*M, "deficit / ratio x 1.25 + 256 MiB (%.2f GiB)", c1/(double) G);
+    const uint64_t c2 = fn_pin::oom_cap_bytes(4*G, 1*G, false, 0.5);
+    TCHECK(c2 == (uint64_t) (1.25*3.0*(double) G/0.5) + 256*M, "deficit 3 GiB at ratio 0.5 (%.2f GiB)", c2/(double) G);
+    TCHECK(fn_pin::oom_cap_bytes(4*G, -1*(int64_t) G, false, 2.0) >= 4*G, "negative headroom");
+}
+
 int main() {
     test_unit();
     test_order();
     test_rules();
+    test_oom_cap();
     test_registry();
     test_arena_copy();
     test_lifo();

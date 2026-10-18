@@ -22,7 +22,8 @@
 // the ready headroom - 512 MiB; LLAMA_FN_L22_PIN_TEST_LOCAL_MIB forces one) or available RAM below the floor for two
 // samples unpins the last ranges (as the OOM hook). Any unpin ends registration for the process (no relock).
 // llama_fn_pin_on_oom(need): the callers' allocation hook (plan 3.6): drain the last ranges (tickets back to 0, bounded),
-// unregister them until LOCAL headroom >= need + 512 MiB (or that many bytes when DXGI shows no charge), unmark.
+// unregister them until LOCAL headroom >= need + the pre-check margin (512 MiB, at most the watcher threshold), or until
+// the freed bytes reach the cap from the measured LOCAL charge per byte (that many bytes when DXGI shows no charge), unmark.
 
 #include "llama-fn-l22.h"
 #include "llama-fn-pin-core.h"
@@ -403,6 +404,17 @@ struct fn_pin_state {
 std::mutex                  g_pin_mtx;
 std::atomic<fn_pin_state *> g_pin{nullptr};
 
+// llama_fn_pin_phase: 0 not started, 1 planning / registering, 2 registration ended, 3 no pins in this run
+std::atomic<int> g_pin_phase{0};
+
+// R-REV-2: the headroom a pre-check keeps on top of an allocation: 512 MiB, but never more than the watcher threshold
+// (the pin budget may leave less than 512 MiB at ready; an allocation that runs today must not unpin for good)
+constexpr uint64_t FN_PRECHECK_MARGIN = (uint64_t) 512 << 20;
+
+uint64_t fn_precheck_margin(const fn_pin_state * st) {
+    return st != nullptr ? std::min<uint64_t>(FN_PRECHECK_MARGIN, st->watch_local) : FN_PRECHECK_MARGIN;
+}
+
 // decode activity (llama_fn_pin_decode_mark) and the stream's queries while registering
 std::atomic<int>     g_dec_running{0};
 std::atomic<int64_t> g_dec_end_us{0};
@@ -579,8 +591,9 @@ bool fn_touch(fn_pin_state * st, const uint8_t * p, size_t n) {
     return true;
 }
 
-// ggml-cuda's allocation hook (R-P7-2), before a graph instantiate or a VMM pool growth: after_failure 0 = pre-check,
-// unpin only when LOCAL headroom < need + 512 MiB (on_oom unpins for good); 1 = the allocation failed, unpin once
+// ggml-cuda's allocation hook (R-P7-2), before a graph instantiate, a VMM pool growth or a device buffer: after_failure
+// 0 = pre-check, unpin only when LOCAL headroom < need + the pre-check margin (on_oom unpins for good); 1 = the
+// allocation failed, unpin once
 bool fn_cuda_oom(size_t need, int after_failure, void * ud) {
     (void) ud;
     if (after_failure == 0) {
@@ -590,7 +603,7 @@ bool fn_cuda_oom(size_t need, int after_failure, void * ud) {
         }
         bool ok = false;
         const int64_t head = fn_local_headroom(st, &ok);
-        if (!ok || head >= (int64_t) need + (int64_t) (512*FN_MIB)) {
+        if (!ok || head >= (int64_t) need + (int64_t) fn_precheck_margin(st)) {
             return false;
         }
     }
@@ -946,6 +959,7 @@ void fn_thread(fn_pin_state * st) {
     st->registering.store(false);
     g_query_stamp.store(false);
     st->frozen.store(true);
+    g_pin_phase.store(2, std::memory_order_release);
     {
         const fn_pin::budget_in b = fn_read_budget(st);
         fn_log("event=ready pinned_gib=%.2f units=%d secs=%.1f stop=%s nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f reserve_need_gib=%.2f "
@@ -1083,6 +1097,16 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     if (g_pin.load() != nullptr) {
         return;
     }
+    // llama_fn_pin_phase: 1 while this runs and the thread registers, 3 when it returns without a thread
+    struct phase_guard {
+        bool started = false;
+        phase_guard() { g_pin_phase.store(1, std::memory_order_release); }
+        ~phase_guard() {
+            if (!started) {
+                g_pin_phase.store(3, std::memory_order_release);
+            }
+        }
+    } phase;
     const int64_t t0 = fn_now_us();
     ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
     auto reg_fn   = creg ? (fn_reg_fn_t)   ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_register_host")   : nullptr;
@@ -1310,6 +1334,7 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     }
     fn_pin_state * raw = st.release();
     g_pin.store(raw, std::memory_order_release);
+    phase.started = true;
     raw->th = std::thread(fn_thread, raw);
 }
 
@@ -1388,34 +1413,50 @@ bool llama_fn_pin_on_oom(size_t need_bytes) {
     if (st == nullptr || !st->reg.any_active()) {
         return false;
     }
-    st->frozen.store(true);
     std::lock_guard<std::mutex> op(st->op_mtx);
     st->n_oom.fetch_add(1);
-    const uint64_t want = (uint64_t) need_bytes + 512*FN_MIB;
+    const uint64_t want = (uint64_t) need_bytes + fn_precheck_margin(st);
     bool lok = false;
     const int64_t head0 = fn_local_headroom(st, &lok);
-    // DXGI shows the room already (the charge is not visible there, or another reason): free that many bytes instead
-    const bool by_bytes = !lok || head0 >= (int64_t) want;
+    // R-REV-1: stop on bytes as well as on headroom. The cap comes from the LOCAL charge per registered byte that the
+    // registration measured (l_ratio): when DXGI shows the room already, cannot be read, or shows (almost) no charge,
+    // unpinning does not raise the headroom there, so `want` bytes go and no more (never every range in one call)
+    const double ratio = st->cfg.l_ratio;
+    const bool   by_bytes = !lok || head0 >= (int64_t) want || ratio < fn_pin::OOM_RATIO_MIN;
+    const uint64_t cap = fn_pin::oom_cap_bytes(want, lok ? head0 : 0, by_bytes, ratio);
     const int64_t t_end = fn_now_us() + 3000000;
     int n = 0;
     const uint64_t freed = fn_unpin(st, [&](uint64_t f) {
-        if (fn_now_us() > t_end) {
+        if (fn_now_us() > t_end || f >= cap) {
             return true;
         }
         if (by_bytes) {
-            return f >= want;
+            return false;
         }
         bool ok2 = false;
         const int64_t h = fn_local_headroom(st, &ok2);
         return !ok2 || h >= (int64_t) want;
     }, 50000, true, &n);
+    if (freed > 0) {
+        st->frozen.store(true); // an unpin ends registration (no relock); nothing freed: registration goes on
+    }
     bool ok3 = false;
     const int64_t head1 = fn_local_headroom(st, &ok3);
-    LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] OOM hook (need %.1f MiB): %d range(s), %.2f GiB unpinned, LOCAL headroom %.2f -> %.2f GiB\n",
-            __func__, need_bytes/1048576.0, n, fn_gib(freed), head0/(double) FN_GIB, head1/(double) FN_GIB);
-    fn_log("event=oom need_mib=%.1f unpinned_gib=%.2f units=%d by_bytes=%d headroom_gib=%.2f->%.2f pinned_gib=%.2f", need_bytes/1048576.0,
-            fn_gib(freed), n, by_bytes ? 1 : 0, head0/(double) FN_GIB, head1/(double) FN_GIB, fn_gib(st->reg.active_bytes()));
+    LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] OOM hook (need %.1f MiB): %d range(s), %.2f GiB unpinned (cap %.2f GiB, LOCAL charge %.3f per "
+            "byte), LOCAL headroom %.2f -> %.2f GiB\n", __func__, need_bytes/1048576.0, n, fn_gib(freed), fn_gib(cap), ratio,
+            head0/(double) FN_GIB, head1/(double) FN_GIB);
+    fn_log("event=oom need_mib=%.1f unpinned_gib=%.2f units=%d by_bytes=%d cap_gib=%.2f l_ratio=%.4f headroom_gib=%.2f->%.2f pinned_gib=%.2f",
+            need_bytes/1048576.0, fn_gib(freed), n, by_bytes ? 1 : 0, fn_gib(cap), ratio, head0/(double) FN_GIB, head1/(double) FN_GIB,
+            fn_gib(st->reg.active_bytes()));
     return freed > 0;
+}
+
+uint64_t llama_fn_pin_precheck_margin(void) {
+    return fn_precheck_margin(g_pin.load(std::memory_order_acquire));
+}
+
+int llama_fn_pin_phase(void) {
+    return g_pin_phase.load(std::memory_order_acquire);
 }
 
 void llama_fn_pin_decode_mark(bool begin) {
@@ -1469,4 +1510,5 @@ void llama_fn_pin_shutdown(const llama_model * model) {
             n + left, fn_gib(b), left);
     // the state stays allocated (a late release or query sees no active range)
     g_pin.store(nullptr, std::memory_order_release);
+    g_pin_phase.store(3, std::memory_order_release);
 }
