@@ -66,6 +66,7 @@ struct res_table {
     std::mutex              mtx;  // SSD planning and the eviction queue (taken before pmtx)
     std::mutex              pmtx; // the hot set's view: slot / cnt / vol of every layer
     std::vector<std::pair<int, int>> evq;  // left VRAM, to touch when idle
+    std::vector<std::pair<int, int>> dropq; // to leave the working set at the next quiet moment (no decode for 50 ms)
     std::thread             svc;
     std::atomic<bool>       stop{false};
     std::atomic<bool>       warm_done{false};
@@ -271,6 +272,20 @@ std::vector<std::pair<int, int>> res_droppable(const res_table * t, bool vram, b
         }
     }
     return out;
+}
+
+// a drop removes pages from the working set, and every processor that runs a thread of this process flushes its TLB:
+// the service thread does it only while no decode or prompt runs (queued here)
+void res_queue_drop(res_table * t, const std::vector<std::pair<int, int>> & ex) {
+    if (ex.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(t->mtx);
+    t->dropq.insert(t->dropq.end(), ex.begin(), ex.end());
+    if (t->dropq.size() > 65536) { // a long answer: each expert once
+        std::sort(t->dropq.begin(), t->dropq.end());
+        t->dropq.erase(std::unique(t->dropq.begin(), t->dropq.end()), t->dropq.end());
+    }
 }
 
 // [TAG_FN_L22_RESSET] the layers in the prefill stream's lend range, estimated as llama_moe_hot_lend places it
@@ -513,10 +528,14 @@ void res_ssd_plan(res_table * t, int stage) {
         t->n_ssd_mark.fetch_add(pick.size());
         t->gen.fetch_add(1);
     }
-    const size_t dropped = res_drop(t, drop);
+    size_t dropped = 0;
+    for (const auto & x : drop) {
+        dropped += t->L[x.first].eb;
+    }
+    t->dropq.insert(t->dropq.end(), drop.begin(), drop.end()); // t->mtx is held
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDTIER] %s: the streamed set needs %.2f GiB, %.2f GiB in RAM, %.2f GiB available (floor %.1f, "
             "pins pending %.2f): %.2f GiB of %zu least-routed cold experts are read by direct I/O in prompts (%.2f GiB of them "
-            "left the working set)\n", __func__, stage == 0 ? "before the warm pass" : "what does not fit", need/1073741824.0,
+            "leave the working set)\n", __func__, stage == 0 ? "before the warm pass" : "what does not fit", need/1073741824.0,
             res/1073741824.0, avail/1073741824.0, t->floor_b/1073741824.0, pin_pending/1073741824.0, marked/1073741824.0,
             pick.size(), dropped/1073741824.0);
 #else
@@ -667,14 +686,8 @@ void res_service(res_table * t) {
             left.clear();
             res_poll(t, &entered, &left);
             if (t->resset) {
-                // drop the host copies of experts that came into VRAM; prefetch the ones that left it
-                std::vector<std::pair<int, int>> d;
-                for (const auto & x : entered) {
-                    if (!(t->L[x.first].fl[x.second].load() & F_PIN)) {
-                        d.push_back(x);
-                    }
-                }
-                res_drop(t, d);
+                // drop the host copies of experts that came into VRAM (queued); prefetch the ones that left it
+                res_queue_drop(t, entered);
                 if (!left.empty()) {
                     const auto rs = res_expert_ranges(t, left);
                     fn_prefetch(rs);
@@ -692,6 +705,19 @@ void res_service(res_table * t) {
         }
         int64_t act = 0;
         const bool busy = llama_fn_p5_busy(&act);
+        if (!busy && now - act >= 50000) {
+            std::vector<std::pair<int, int>> q;
+            {
+                std::lock_guard<std::mutex> lk(t->mtx);
+                q.swap(t->dropq);
+            }
+            // pinned meanwhile, or no longer VRAM-held / SSD (the eviction prefetch wants it back): skip
+            q.erase(std::remove_if(q.begin(), q.end(), [&](const std::pair<int, int> & x) {
+                const uint8_t f = t->L[x.first].fl[x.second].load();
+                return (f & F_PIN) || !(f & (F_VRAM | F_SSD));
+            }), q.end());
+            res_drop(t, q);
+        }
         const bool idle = !busy && now - act >= 1000000 && !llama_fn_warm_running() && t->warm_done.load();
         if (!idle) {
             continue;
@@ -750,7 +776,7 @@ void res_service(res_table * t) {
         if (now - t_per >= 60000000) {
             t_per = now;
             if (t->resset) {
-                res_drop(t, res_droppable(t, true, false)); // pages read back since (a refill, a CPU path)
+                res_queue_drop(t, res_droppable(t, true, false)); // pages read back since (a refill, a CPU path)
             }
             res_ssd_plan(t, 1);
         }
@@ -1009,7 +1035,11 @@ void llama_fn_p5_after_warm(const llama_model & model, size_t warmed, double sec
     size_t dropped = 0;
     if (t->resset) {
         // [TAG_FN_L22_RESSET] the host copies of VRAM-held experts (and of resident SSD-marked ones) to the standby list
-        dropped = res_drop(t, res_droppable(t, true, t->ssd > 0));
+        const auto d = res_droppable(t, true, t->ssd > 0);
+        for (const auto & x : d) {
+            dropped += t->L[x.first].eb;
+        }
+        res_queue_drop(t, d);
     }
     res_ssd_plan(t, 1);
     double share = 1.0;
@@ -1017,7 +1047,7 @@ void llama_fn_p5_after_warm(const llama_model & model, size_t warmed, double sec
     res_missing_blocks(t, miss, &share);
     t->share.store(share);
     t->warm_done.store(true);
-    LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] ready: %.2f GiB warmed in %.1f s, %.2f GiB of VRAM-held host copies sent to standby, "
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] ready: %.2f GiB warmed in %.1f s, %.2f GiB of VRAM-held host copies go to standby, "
             "streamed set %.1f %% in RAM\n", __func__, warmed/1073741824.0, secs, dropped/1073741824.0, 100.0*share);
     res_log(t, "ready");
 }
