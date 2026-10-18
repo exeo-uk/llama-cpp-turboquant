@@ -7748,7 +7748,6 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && (!(has_mtmd || l22_after_media) || is_after_last_media); // [TAG_FN_L21_MEDIA_CKPT]
 
-
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
