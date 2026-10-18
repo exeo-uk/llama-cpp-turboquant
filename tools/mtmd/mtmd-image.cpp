@@ -115,6 +115,7 @@ struct img_tool {
         int max_pixels = 0;   // 0 = disabled
         // applied before min/max_pixels, so min_pixels can push an edge back above longest_edge
         int longest_edge = 0; // 0 = disabled
+        bool round_half_even = false; // [TAG_FN_L22_VLRESIZE] Python round() instead of std::round (#30736)
     };
 
     // calculate the size of the **resized** image, while preserving the aspect ratio and
@@ -127,7 +128,10 @@ struct img_tool {
             return {0, 0};
         }
 
-        auto round_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
+        auto round_by_factor = [f = opts.align_size, even = opts.round_half_even](float x) {
+            const float q = x / static_cast<float>(f);
+            return static_cast<int>(even ? std::nearbyint(q) : std::round(q)) * f;
+        };
         auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
@@ -794,10 +798,11 @@ clip_image_size mtmd_image_preprocessor_dyn_size::calc_target_size(const clip_hp
     return img_tool::calc_size_preserved_ratio(
         original_size,
         {
-            /* align_size   */ hparams.patch_size * cur_merge,
-            /* min_pixels   */ hparams.image_min_pixels,
-            /* max_pixels   */ hparams.image_max_pixels,
-            /* longest_edge */ 0,
+            /* align_size      */ hparams.patch_size * cur_merge,
+            /* min_pixels      */ hparams.image_min_pixels,
+            /* max_pixels      */ hparams.image_max_pixels,
+            /* longest_edge    */ 0,
+            /* round_half_even */ hparams.image_round_half_even,
         });
 }
 

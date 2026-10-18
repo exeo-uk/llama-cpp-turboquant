@@ -58,6 +58,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    bool l22_vlresize; // [TAG_FN_L22_VLRESIZE] Qwen-VL family: resize as the HF processor does (#30736: no padding, round half to even)
 };
 
 struct clip_init_result {
@@ -130,6 +131,18 @@ typedef void   (*clip_lend_give_fn)(void * ud);
 size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_give_fn give, void * ud);
 // [TAG_FN_L22_OOMHOOK] round 22 (P2): a failed lend buffer allocation of bytes; true = memory was released, retry once
 typedef bool   (*clip_lend_oom_fn)(void * ud, size_t bytes);
+// called once when the weight buffer or the encoder's compute buffer of a lent context cannot be allocated (NULL: none)
+void   clip_lend_set_oom(struct clip_ctx * ctx, clip_lend_oom_fn fn, void * ud);
+// [TAG_FN_L22_VLEND_SIZE] before clip_lend_park: size each take from the picture's own compute buffer (measured at park)
+void   clip_lend_set_size(struct clip_ctx * ctx, bool on);
+// the most a take asks for (the largest picture), 0 when not parked
+size_t clip_lend_max_bytes(const struct clip_ctx * ctx);
+// [TAG_FN_L22_VLEND_HOLD] on: count a hold, off: release one. While held, an encode keeps the weights and the VRAM after it
+// (the next encode needs no take / upload); the last release parks and gives the VRAM back. suspend: park and give back
+// now, keep the count (call it before any decode of the text model). reset: release every hold
+void   clip_lend_hold(struct clip_ctx * ctx, bool on);
+void   clip_lend_suspend(struct clip_ctx * ctx);
+void   clip_lend_hold_reset(struct clip_ctx * ctx);
 
 // the device the encoder runs on (nullptr: the CPU)
 ggml_backend_dev_t clip_get_device(const struct clip_ctx * ctx);

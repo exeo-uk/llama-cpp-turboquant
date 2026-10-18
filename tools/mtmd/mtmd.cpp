@@ -8,6 +8,9 @@
 
 #include "llama.h"
 #include "../src/llama-ext.h" // [TAG_FN_L17_VISION_LEND]
+#include "../src/llama-fn-l22.h" // [TAG_FN_L22] switches, PASSLOG, pin needs
+#include "../common/tokcache.h" // [TAG_FN_L22_TOKCACHE] header only (mtmd does not link common)
+#include "mtmd-l22.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -20,10 +23,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -526,6 +531,13 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // [TAG_FN_L22] round 22 P2 switches (the text model's environment / profile)
+    const llama_model * text_model = nullptr;
+    bool vlend_hold     = false; // LLAMA_FN_L22_VLEND_HOLD: mtmd_lend_hold counts holds
+    int  imgdec_threads = 1;     // LLAMA_FN_L22_IMGDEC_THREADS: picture preprocessing threads in mtmd_tokenize
+    mutable mtmd_l22_embd_cache      embd_cache; // LLAMA_FN_L22_IMGCACHE: encoder outputs by content
+    std::unique_ptr<common_tokcache> tokcache;   // LLAMA_FN_L22_TOKCACHE: the text parts of mtmd_tokenize
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -537,7 +549,8 @@ struct mtmd_context {
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
-        batch_max_tokens(ctx_params.batch_max_tokens)
+        batch_max_tokens(ctx_params.batch_max_tokens),
+        text_model      (text_model)
     {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -566,18 +579,34 @@ struct mtmd_context {
             }
         }
 
+        // [TAG_FN_L22] the text model's switches (environment, else its profile; no text model: the environment)
+        auto l22_env = [&](const char * name) { return llama_model_fn_env(text_model, name); };
+        auto l22_int = [&](const char * name, long def) {
+            const char * v = l22_env(name);
+            return v && *v ? std::strtol(v, nullptr, 10) : def;
+        };
+        // [TAG_FN_L22_IMG_MAXROWS] opt-in, changes answers: at most this many rows per picture (the --image-max-tokens path)
+        int image_max_tokens = ctx_params.image_max_tokens;
+        const long img_maxrows = l22_int("LLAMA_FN_L22_IMG_MAXROWS", 0);
+        if (img_maxrows > 0 && (image_max_tokens <= 0 || image_max_tokens > img_maxrows)) {
+            image_max_tokens = (int) std::min<long>(img_maxrows, INT_MAX);
+            LOG_WRN("%s: [TAG_FN_L22_IMG_MAXROWS] at most %d rows per picture (changes answers)\n", __func__, image_max_tokens);
+        }
+        const bool vlresize = llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_VLRESIZE"));
+
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* device            */ ctx_params.device,
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
-            /* image_max_tokens  */ ctx_params.image_max_tokens,
+            /* image_max_tokens  */ image_max_tokens,
             /* warmup            */ ctx_params.warmup,
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* l22_vlresize      */ vlresize,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -625,19 +654,64 @@ struct mtmd_context {
         }
         // [TAG_FN_L17_VISION_LEND] the projector's VRAM serves the text model's hot set between encodes
         if (ctx_v && text_model && !no_alloc && llama_fn_vision_lend_wanted(text_model, clip_get_device(ctx_v))) {
-            const size_t b = clip_lend_park(ctx_v, lend_take, lend_give, (void *) text_model);
+            clip_lend_set_size(ctx_v, llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_VLEND_SIZE"))); // [TAG_FN_L22_VLEND_SIZE]
+            const size_t b = clip_lend_park(ctx_v, lend_take, lend_give, (void *) this);
             if (b > 0) {
                 llama_fn_vision_lend_register(text_model, b);
+                // [TAG_FN_L22_PIN] the largest take, for the pin watcher's LOCAL reserve
+                llama_fn_pin_note_need(text_model, LLAMA_FN_PIN_NEED_VISION_LEND, clip_lend_max_bytes(ctx_v));
+                vlend_hold = llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_VLEND_HOLD")); // [TAG_FN_L22_VLEND_HOLD]
             }
+        }
+
+        // [TAG_FN_L22_IMGCACHE] [TAG_FN_L22_IMGDEC] [TAG_FN_L22_TOKCACHE]
+        if (!no_alloc) {
+            embd_cache.n_max = (size_t) std::max(0L, std::min(l22_int("LLAMA_FN_L22_IMGCACHE", 0), 1024L));
+            imgdec_threads   = (int) std::max(1L, std::min(l22_int("LLAMA_FN_L22_IMGDEC_THREADS", 1), 32L));
+            if (vocab && llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_TOKCACHE"))) {
+                tokcache = std::make_unique<common_tokcache>(96, (size_t) 64 << 20, 256);
+                tokcache->n_verify.store(llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_TOKCACHE_VERIFY")) ? 32 : 0);
+            }
+            llama_fn_l22_log("switch", "mtmd: VLEND_HOLD=%d VLEND_SIZE=%d (largest lend %.0f MiB) IMGCACHE=%zu IMGDEC_THREADS=%d "
+                    "IMG_MAXROWS=%ld VLRESIZE=%d TOKCACHE=%d", vlend_hold ? 1 : 0,
+                    llama_fn_l22_switch_on(l22_env("LLAMA_FN_L22_VLEND_SIZE")) ? 1 : 0,
+                    ctx_v ? clip_lend_max_bytes(ctx_v)/1048576.0 : 0.0, embd_cache.n_max, imgdec_threads, img_maxrows,
+                    vlresize ? 1 : 0, tokcache ? 1 : 0);
         }
     }
 
     static size_t lend_take(void * ud, size_t bytes) {
-        return llama_fn_vision_take((const llama_model *) ud, bytes);
+        const mtmd_context * mctx = (const mtmd_context *) ud;
+        const size_t got = llama_fn_vision_take(mctx->text_model, bytes);
+        // [TAG_FN_L22_PIN] plan 3.6: what the hot set did not give comes from free VRAM. With pins active, check the LOCAL
+        // headroom first and let the pins give memory back once
+        if (got < bytes && llama_fn_pin_active()) {
+            l22_vram_headroom(clip_get_device(mctx->ctx_v), bytes - got);
+        }
+        return got;
     }
 
     static void lend_give(void * ud) {
-        llama_fn_vision_give((const llama_model *) ud);
+        llama_fn_vision_give(((const mtmd_context *) ud)->text_model);
+    }
+
+    static void l22_vram_headroom(ggml_backend_dev_t dev, size_t need) {
+        if (dev == nullptr) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        using luid_fn_t = bool (*)(ggml_backend_dev_t, uint64_t *);
+        auto luid_fn = reg ? (luid_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_device_luid") : nullptr;
+        uint64_t luid = 0, budget = 0, usage = 0;
+        if (luid_fn == nullptr || !luid_fn(dev, &luid) || !llama_fn_dxgi_query(luid, 0, &budget, &usage)) {
+            return;
+        }
+        const uint64_t margin = (uint64_t) 256 << 20;
+        if (usage + need + margin > budget) {
+            const bool freed = llama_fn_pin_on_oom(need);
+            llama_fn_l22_log("pin", "[TAG_FN_L22_OOMHOOK] vision lend: LOCAL %.0f of %.0f MiB used, %.0f MiB more needed: pins %s",
+                    usage/1048576.0, budget/1048576.0, need/1048576.0, freed ? "released memory" : "released nothing");
+        }
     }
 
     void init_vision() {
@@ -1067,6 +1141,7 @@ struct mtmd_context {
     }
 
     ~mtmd_context() {
+        clip_lend_hold_reset(ctx_v); // [TAG_FN_L22_VLEND_HOLD] a hold left over gives its VRAM back
         clip_free(ctx_a);
         clip_free(ctx_v);
         clip_free(ctx_gen_a);
@@ -1156,6 +1231,15 @@ struct mtmd_tokenizer {
 
     mtmd_input_chunks cur;
     uint32_t n_images_added = 0; // 0-based index assigned to the next image chunk
+
+    // [TAG_FN_L22_IMGDEC] pictures preprocessed ahead on several threads, in the order add_media takes them
+    struct pre_item {
+        const mtmd_bitmap *    bmp = nullptr;
+        mtmd_image_preproc_out out;
+        std::exception_ptr     err;
+    };
+    std::vector<pre_item> pre;
+    size_t pre_next = 0;
 
     ~mtmd_tokenizer() {
         // note: mtmd::bitmap is already RAII
@@ -1275,6 +1359,8 @@ struct mtmd_tokenizer {
 
         auto merged_bitmaps = mtmd_group_mergeable_bitmaps(parts, n_merge_frames);
 
+        preprocess_ahead(merged_bitmaps); // [TAG_FN_L22_IMGDEC]
+
         size_t i_bm = 0;
         for (const auto & p : parts) {
             if (p.bitmap != nullptr) {
@@ -1334,8 +1420,84 @@ struct mtmd_tokenizer {
             throw std::runtime_error("llama_vocab is not provided");
         }
         LOG_DBG("%s: %s\n", __func__, txt.c_str());
+        if (ctx->tokcache) {
+            // [TAG_FN_L22_TOKCACHE] the text parts repeat from request to request: exact or prefix re-use
+            const int64_t t0 = ggml_time_us();
+            common_tokcache_stats st;
+            auto tokens = common_tokcache_tokenize(*ctx->tokcache, vocab, txt, /* add_special */ false, parse_special, &st);
+            const double ms = (ggml_time_us() - t0)/1000.0;
+            if (txt.size() >= 65536 || ms >= 5.0 || st.mismatch) {
+                static const char * paths[] = { "full encode", "same text", "prefix re-use", "cache off" };
+                llama_fn_l22_log("media", "[TAG_FN_L22_TOKCACHE] text part %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids%s%s)",
+                        txt.size(), tokens.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids,
+                        st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+            }
+            add_text(tokens);
+            return;
+        }
         auto tokens = mtmd_tokenize_text_internal(vocab, txt, /* add_special */ false, parse_special);
         add_text(tokens);
+    }
+
+    // [TAG_FN_L22_IMGDEC] one picture: the u8 copy and the model's preprocessing (a const method without shared state)
+    mtmd_image_preproc_out preprocess_one(const mtmd_bitmap * bmp) const {
+        clip_image_u8 img_u8;
+        img_u8.set_size(
+            {(int)bmp->nx, (int)bmp->ny},
+            bmp->is_placeholder());
+        img_u8.cpy_buf(bmp->get_ro_buf());
+        return ctx->image_preproc->preprocess(img_u8);
+    }
+
+    // [TAG_FN_L22_IMGDEC] preprocess every picture of the prompt on up to LLAMA_FN_L22_IMGDEC_THREADS threads before the
+    // chunks are built; an error is kept and thrown when add_media reaches that picture, as before
+    void preprocess_ahead(const std::vector<std::vector<const mtmd_bitmap *>> & groups) {
+        if (ctx->imgdec_threads <= 1 || ctx->ctx_v == nullptr || ctx->image_preproc == nullptr) {
+            return;
+        }
+        std::vector<const mtmd_bitmap *> list;
+        for (const auto & g : groups) {
+            if (g.empty() || g[0]->is_audio) {
+                continue;
+            }
+            for (const auto * b : g) {
+                list.push_back(b);
+            }
+        }
+        if (list.size() < 2) {
+            return;
+        }
+        pre.resize(list.size());
+        for (size_t i = 0; i < list.size(); ++i) {
+            pre[i].bmp = list[i];
+        }
+        const int64_t t0 = ggml_time_us();
+        mtmd_l22_parallel_for((int) list.size(), ctx->imgdec_threads, [&](int i) {
+            auto & it = pre[(size_t) i];
+            try {
+                if (!it.bmp->is_audio && it.bmp->nx > 0 && it.bmp->ny > 0) {
+                    it.out = preprocess_one(it.bmp);
+                }
+            } catch (...) {
+                it.err = std::current_exception();
+            }
+        });
+        if (llama_fn_l22_passlog_level() >= 1) {
+            llama_fn_l22_log("media", "[TAG_FN_L22_IMGDEC] %zu pictures preprocessed on %d threads in %.1f ms", list.size(),
+                    std::min(ctx->imgdec_threads, (int) list.size()), (ggml_time_us() - t0)/1000.0);
+        }
+    }
+
+    // the picture's preprocessing: from the ahead pass when it is the next one there, else now
+    mtmd_image_preproc_out take_preprocessed(const mtmd_bitmap * bmp) {
+        if (pre_next < pre.size() && pre[pre_next].bmp == bmp) {
+            pre_item it = std::move(pre[pre_next++]);
+            if (it.err) {
+                std::rethrow_exception(it.err);
+            }
+            return std::move(it.out);
+        }
+        return preprocess_one(bmp);
     }
 
     void add_text(const std::vector<llama_token> & tokens) {
@@ -1391,15 +1553,8 @@ struct mtmd_tokenizer {
                     return 2;
                 }
 
-                // convert mtmd_bitmap to clip_image_u8
-                clip_image_u8 img_u8;
-                img_u8.set_size(
-                    {(int)bmp->nx, (int)bmp->ny},
-                    bmp->is_placeholder());
-                img_u8.cpy_buf(bmp->get_ro_buf());
-
-                // preprocess image
-                mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
+                // convert mtmd_bitmap to clip_image_u8 and preprocess it ([TAG_FN_L22_IMGDEC] maybe done ahead)
+                mtmd_image_preproc_out tmp_preproc_out = take_preprocessed(bmp);
 
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {
@@ -1795,6 +1950,21 @@ int32_t mtmd_tokenize_from_parts(const mtmd_context * ctx,
     }
 }
 
+// [TAG_FN_L22_IMGCACHE] a key over everything the encoder reads: every entry's size, flags and pixels
+static mtmd_l22_hash128 mtmd_l22_image_key(const clip_image_f32_batch & b) {
+    mtmd_l22_hash128 h;
+    h.add_u64(b.is_audio ? 1 : 0);
+    h.add_u64(b.entries.size());
+    for (const auto & e : b.entries) {
+        const int32_t meta[] = { e.nx(), e.ny(), e.add_viewsep ? 1 : 0, e.add_newline ? 1 : 0, e.lead_pad,
+                                 e.anyres.grid_x, e.anyres.grid_y, e.anyres.orig_nx, e.anyres.orig_ny };
+        h.add(meta, sizeof(meta));
+        const auto & buf = e.get_ro_buf();
+        h.add(buf.data(), buf.size() * sizeof(float));
+    }
+    return h;
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
@@ -1811,11 +1981,29 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
+    // [TAG_FN_L22_IMGCACHE] the encoder output of the same input (every field of every entry of batch_f32) is re-used
+    mtmd_l22_hash128 key;
+    const bool use_cache = ctx->embd_cache.n_max > 0;
+    if (use_cache) {
+        const int64_t t0 = ggml_time_us();
+        key = mtmd_l22_image_key(image_tokens->batch_f32);
+        if (ctx->embd_cache.get(key, out_embd.size(), out_embd)) {
+            llama_fn_l22_log("media", "[TAG_FN_L22_IMGCACHE] picture %ux%u (%u rows): encoder output from the cache (%.1f ms, %" PRIu64 " hits, %"
+                    PRIu64 " misses)", image_tokens->nx, image_tokens->ny, n_tokens_out, (ggml_time_us() - t0)/1000.0,
+                    ctx->embd_cache.n_hit, ctx->embd_cache.n_miss);
+            return 0;
+        }
+    }
+
     bool ok = clip_image_batch_encode(
         ctx_clip,
         ctx->n_threads,
         &image_tokens->batch_f32,
         out_embd);
+
+    if (ok && use_cache) {
+        ctx->embd_cache.put(key, out_embd.data(), out_embd.size());
+    }
 
     return ok ? 0 : 1;
 }
@@ -2600,16 +2788,28 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     return chunks;
 }
 
-// [TAG_FN_L22_VLEND_HOLD] [TAG_FN_L22_OOMHOOK] round 22 P2. P0 stubs: no hold, no retry
+// [TAG_FN_L22_VLEND_HOLD] [TAG_FN_L22_OOMHOOK] round 22 P2
 void mtmd_lend_hold(mtmd_context * ctx, bool on) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(on);
+    if (ctx != nullptr && ctx->ctx_v != nullptr && ctx->vlend_hold) {
+        clip_lend_hold(ctx->ctx_v, on);
+    }
+}
+
+void mtmd_lend_suspend(mtmd_context * ctx) {
+    if (ctx != nullptr && ctx->ctx_v != nullptr) {
+        clip_lend_suspend(ctx->ctx_v);
+    }
 }
 
 void mtmd_set_lend_oom(mtmd_context * ctx, mtmd_lend_oom_fn fn, void * user_data) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(fn);
-    GGML_UNUSED(user_data);
+    if (ctx != nullptr && ctx->ctx_v != nullptr) {
+        clip_lend_set_oom(ctx->ctx_v, fn, user_data);
+    }
+}
+
+// [TAG_FN_L22_IMGDEC]
+int32_t mtmd_l22_imgdec_threads(const mtmd_context * ctx) {
+    return ctx != nullptr ? ctx->imgdec_threads : 1;
 }
 
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
