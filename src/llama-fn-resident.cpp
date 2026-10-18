@@ -753,23 +753,30 @@ void res_service(res_table * t) {
             if (miss_at < miss.size()) {
                 const size_t avail = fn_avail();
                 const size_t room = avail > t->rewarm_floor ? avail - t->rewarm_floor : 0;
-                // up to 64 MiB per slice: prefetch it, then touch it
-                std::vector<range> sl;
+                // a window of up to 256 MiB per tick: one prefetch for all of it (the reads overlap), then the touches in
+                // order, for at most 500 ms, stopped by any activity
+                std::vector<range> win;
                 size_t b = 0;
-                while (miss_at < miss.size() && b < ((size_t) 64 << 20) && b + miss[miss_at].size() <= room) {
-                    sl.push_back(miss[miss_at]);
-                    b += miss[miss_at].size();
-                    miss_at++;
+                while (miss_at + win.size() < miss.size() && b < ((size_t) 256 << 20) &&
+                       b + miss[miss_at + win.size()].size() <= room) {
+                    b += miss[miss_at + win.size()].size();
+                    win.push_back(miss[miss_at + win.size()]);
                 }
-                if (!sl.empty()) {
-                    fn_prefetch(sl);
-                    size_t done = 0;
-                    if (!res_touch(sl, t->page, act, &done)) {
-                        miss_at -= sl.size(); // stopped: this slice again at the next idle sample
-                    }
-                    t->b_rewarm.fetch_add(done);
-                } else {
+                if (win.empty()) {
                     miss_at = miss.size(); // no room: nothing more this period
+                } else {
+                    fn_prefetch(win);
+                    const int64_t t_end = now + 500000;
+                    size_t i = 0;
+                    for (; i < win.size() && llama_fn_p5_now_us() < t_end && !t->stop.load(); ++i) {
+                        size_t done = 0;
+                        const bool all = res_touch({ win[i] }, t->page, act, &done);
+                        t->b_rewarm.fetch_add(done);
+                        if (!all) {
+                            break; // activity: this block again at the next idle sample
+                        }
+                    }
+                    miss_at += i;
                 }
             }
         }
