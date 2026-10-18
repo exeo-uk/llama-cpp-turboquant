@@ -122,6 +122,14 @@ struct tile_x_sizes {
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
 
+// [TAG_FN_L22_MMQ_Y8] (#30493) the activation y tile is copied in 8-byte loads: exact groups, aligned blocks
+static_assert(MMQ_TILE_Y_K % 4 == 0, "activation y-tile is copied in groups of 2 or 4 ints");
+static_assert(sizeof(block_q8_1_mmq) % 16 == 0, "activation staging rows must stay 16-byte aligned");
+
+// [TAG_FN_L22_MMQ_Y8] [TAG_FN_L22_SKCAP] host switches (mmq.cu): GGML_CUDA_FN_L22_MMQ_Y8, GGML_CUDA_FN_L22_SKCAP
+bool ggml_cuda_fn_l22_mmq_y8();
+bool ggml_cuda_fn_l22_skcap();
+
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
@@ -976,12 +984,30 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// [TAG_FN_L22_MMQ_Y8] (#30493) the y tile copy of mul_mat_q_process_tile in int2 loads: the same bytes as the int loop
+template <int J, int nwarps, int warp_size>
+static __device__ __forceinline__ void ggml_cuda_fn_l22_copy_tile_y(int * __restrict__ tile_y, const int * __restrict__ by0) {
+    constexpr int n2 = J * MMQ_TILE_Y_K / 2;
+    if constexpr (n2 % (nwarps * warp_size) == 0) {
+#pragma unroll
+        for (int l0 = 0; l0 < n2; l0 += nwarps * warp_size) {
+            const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+            ((int2 *) tile_y)[l] = ((const int2 *) by0)[l];
+        }
+    } else {
+#pragma unroll
+        for (int l = threadIdx.y*warp_size + threadIdx.x; l < n2; l += nwarps * warp_size) {
+            ((int2 *) tile_y)[l] = ((const int2 *) by0)[l];
+        }
+    }
+}
+
 // [TAG_UPSTREAM_29948] has_fusion: x and x_gate are the up and gate weights; tile_x_max_i is then in output rows.
 template <ggml_type type, int J, bool fallback, bool has_ids, bool fixup, ggml_prec prec_src1 = GGML_PREC_Q8, bool has_fusion = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
-        const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit,
+        const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit, const bool y8,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
     static_assert(!(fixup && has_fusion), "the fused gate/up path does not split K");
@@ -1018,11 +1044,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            if (y8) {
+                ggml_cuda_fn_l22_copy_tile_y<J, nwarps, warp_size>(tile_y, by0); // [TAG_FN_L22_MMQ_Y8]
+            } else {
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
+            }
             }
         }
 
@@ -1034,11 +1064,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            if (y8) {
+                ggml_cuda_fn_l22_copy_tile_y<J, nwarps, warp_size>(tile_y, by0); // [TAG_FN_L22_MMQ_Y8]
+            } else {
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
+            }
             }
         }
 
@@ -1070,7 +1104,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, has_ids, prec_sr
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
-        const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit,
+        const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit, const bool y8,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -1179,7 +1213,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, has_ids, fixup, prec_src1, has_fusion>
             (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+             glu_op, glu_limit, y8, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
@@ -1273,7 +1307,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, J, fallback, has_ids, fixup, prec_src1>
             (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+             glu_op, glu_limit, y8, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00.z;
@@ -1357,7 +1391,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, J, fallback, has_ids, fixup, prec_src1>
         (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-         glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+         glu_op, glu_limit, y8, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
@@ -1563,7 +1597,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         const dim3 block_nums = has_fusion ? dim3(ntx, nty_fusion, ntzw) : block_nums_xy_tiling;
         mul_mat_q<type, J, fallback, has_ids, prec_src1, has_fusion><<<block_nums, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
-             args.fusion.glu_op, args.fusion.glu_limit,
+             args.fusion.glu_op, args.fusion.glu_limit, ggml_cuda_fn_l22_mmq_y8(),
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1576,9 +1610,20 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+
+    // [TAG_FN_L22_SKCAP] (#30553) GGML_CUDA_FN_L22_SKCAP=1: no more CUDA blocks than work items. Blocks beyond the work get
+    // none but lengthen the fixup scan. Work counts K_vram iterations when they divide a tile, else k-blocks, so the
+    // k split (and the result) does not change.
+    int nblocks_sk = nsm;
+    if (ggml_cuda_fn_l22_skcap()) {
+        const int blocks_per_iter_sk = config.K_vram / ggml_cuda_type_traits<type>::qk;
+        const int nkbc  = ntiles_dst * blocks_per_ne00_fd.z;
+        const int nwork = blocks_per_ne00_fd.z % blocks_per_iter_sk == 0 ? nkbc / blocks_per_iter_sk : nkbc;
+        nblocks_sk = std::min(nsm, nwork);
+    }
+    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nblocks_sk, 1, 1);
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
 
@@ -1593,7 +1638,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     mul_mat_q<type, J, fallback, has_ids, prec_src1, has_fusion><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
-         args.fusion.glu_op, args.fusion.glu_limit,
+         args.fusion.glu_op, args.fusion.glu_limit, ggml_cuda_fn_l22_mmq_y8(),
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1768,11 +1813,15 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 // -------------------------------------------------------------------------------------------------------------------------
 
 // [TAG_UPSTREAM_29948] fusion: fused gate/up/GLU, src0 is the up weight and dst the GLU output.
+// [TAG_FN_L22_GLUQ8] glu != nullptr: src1 is that GLU node (not computed); the quantizer applies it to its gate and up
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_tensor * glu = nullptr);
 
 // [TAG_UPSTREAM_29948] True if dense MMQ computes each dst tile over all of K in one CUDA block (no stream-k split).
 bool ggml_cuda_mmq_tiles_whole_k(ggml_type type, int cc, int64_t nrows_x, int64_t ncols_y, int64_t nchannels_samples_y);
+
+// [TAG_FN_L22_GLUFUSE] the fused gate/up/GLU kernel tiles the GPU well enough without stream-k (mmq.cu)
+bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

@@ -2209,6 +2209,9 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 // [TAG_UPSTREAM_29948] Fused gate/up matmuls + GLU in one MMQ kernel (upstream #29948, prefill widths only).
 // GGML_CUDA_MMQ_GLU_FUSION: 0 = off (default, the old path); 1 = only where unfused MMQ computes each tile over all of K,
 // so the result bits do not change; 2 = also where unfused MMQ splits K with stream-k (last-bit differences, as upstream).
+// [TAG_FN_L22_GLUFUSE] round 22 refresh to the PR head b6e0f0334: the matcher is batch-size independent (graph_optimize
+// adds the same alloc deps for every ubatch size, #29986), the hint and src1-precision checks follow the PR, and both
+// modes fuse only where the fused kernel (no stream-k) tiles the GPU efficiently.
 static int ggml_cuda_mmq_glu_fusion_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_CUDA_MMQ_GLU_FUSION");
@@ -2217,7 +2220,7 @@ static int ggml_cuda_mmq_glu_fusion_mode() {
     return mode;
 }
 
-// Buffer-independent, so graph_optimize can call it before allocation.
+// Buffer- and batch-size independent, so graph_optimize produces the same graph topology for every ubatch size (#29986).
 static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int device) {
     if (ggml_cuda_mmq_glu_fusion_mode() == 0) {
         return false;
@@ -2226,13 +2229,20 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
     const ggml_tensor * x_up = up->src[0];
     const ggml_tensor * y    = up->src[1];
 
-    if (up->op != GGML_OP_MUL_MAT || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32 ||
-            ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
+    if (up->op != GGML_OP_MUL_MAT || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32) {
         return false;
     }
 
     if (!ggml_cuda_should_fuse_mul_mat(up, gate, glu)) {
         return false;
+    }
+
+    // The fused kernel quantizes src1 to Q8_1, only fuse if the src1 precision of up and gate allows it.
+    for (const ggml_tensor * mm : { up, gate }) {
+        const ggml_prec prec_src1 = (ggml_prec) ggml_get_op_params_i32(mm, 3);
+        if (prec_src1 != GGML_PREC_UNDEFINED && prec_src1 != GGML_PREC_Q8 && prec_src1 != GGML_PREC_Q4) {
+            return false;
+        }
     }
 
     // The fused write-back applies SWIGLU_OAI with the default alpha and limit of ggml_cuda_op_swiglu_oai_single.
@@ -2251,12 +2261,15 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
     }
 
     // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    const int cc = ggml_cuda_info().devices[device].cc;
-    return turing_mma_available(cc) && !ggml_cuda_should_use_mmvq(x_up->type, cc, y->ne[1], /*ne01 =*/ x_up->ne[1]) &&
-        ggml_cuda_should_use_mmq(x_up->type, cc, y->ne[1], /*n_experts =*/ 0);
+    return turing_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    // A hinted matmul can be fused, but its unfused path may be faster (e.g. FWHT for GGML_HINT_SRC0_IS_HADAMARD).
+    if (ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
+        return false;
+    }
+
     // The padding of a compute-buffer weight that is a view cannot be cleared, see ggml_cuda_mul_mat.
     const auto bad_padding_clear = [](const ggml_tensor * x) {
         return ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -2266,17 +2279,28 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
         return false;
     }
 
+    // The batch size checks are done here, not in ggml_cuda_mul_mat_q_fusion_matches.
+    const int           device = ggml_cuda_get_device();
+    const int           cc     = ggml_cuda_info().devices[device].cc;
+    const ggml_tensor * x      = up->src[0];
+    const ggml_tensor * y      = up->src[1];
+    if (ggml_cuda_should_use_mmvq(x->type, cc, y->ne[1], /*ne01 =*/ x->ne[1]) || !ggml_cuda_should_use_mmq(x->type, cc, y->ne[1], /*n_experts =*/ 0)) {
+        return false;
+    }
+
     // MMSB and MMQ-SN keep the widths they take from MMQ (multi-stream verify), as in ggml_cuda_mul_mat.
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     for (const ggml_tensor * mm : { up, gate }) {
         if (ggml_cuda_should_use_mmsb(mm->src[0], mm->src[1], mm, cc) || ggml_cuda_should_use_mmqsn(mm->src[0], mm->src[1], mm, cc)) {
             return false;
         }
     }
 
+    // The fused kernel cannot use stream-k, so only fuse if its tiling is efficient.
+    if (!ggml_cuda_mmq_fusion_is_efficient(x->type, x->ne[1], y->ne[1], y->ne[2]*y->ne[3], device)) {
+        return false;
+    }
+
     if (ggml_cuda_mmq_glu_fusion_mode() == 1) {
-        const ggml_tensor * x = up->src[0];
-        const ggml_tensor * y = up->src[1];
         return ggml_cuda_mmq_tiles_whole_k(x->type, cc, x->ne[1], y->ne[1], y->ne[2]*y->ne[3]);
     }
     return true;
@@ -5449,7 +5473,125 @@ static void ggml_cuda_fn_l6_l2pf(ggml_backend_cuda_context * cuda_ctx, const ggm
     ggml_cuda_fn_l6_l2pf_launch(*cuda_ctx, r);
 }
 
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+// [TAG_FN_L22_GLUQ8] (#30489) GGML_CUDA_FN_L22_GLUQ8=1: a GLU whose only consumer is an MMQ matmul (dense or MUL_MAT_ID)
+// a few nodes ahead is computed inside that matmul's Q8_1 activation quantization; the GLU output is never written.
+// Exact (the same silu / gelu expression in registers). #29948's gate/up/GLU fusion consumes its GLU first.
+static bool ggml_cuda_fn_l22_gluq8() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_GLUQ8");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool ggml_cuda_fn_l22_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->buffer == nullptr || b->buffer == nullptr || a->data == nullptr || b->data == nullptr) {
+        return a == b;
+    }
+    const int64_t a_start = (int64_t) a->data;
+    const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const int64_t b_start = (int64_t) b->data;
+    const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+    return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
+}
+
+// the fork's own dispatch (ggml_cuda_mul_mat / ggml_cuda_mul_mat_id) would run dst on MMQ with src1 = glu
+static bool ggml_cuda_fn_l22_glu_mmq_ok(const ggml_tensor * glu, const ggml_tensor * dst, const int cc, const int warp_size) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * gate   = glu->src[0];
+    const ggml_tensor * up     = glu->src[1] != nullptr ? glu->src[1] : gate;
+
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
+    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
+        return false;
+    }
+    if (!ggml_is_quantized(weight->type) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // native FP4 quantizes the activation its own way
+    if (blackwell_mma_available(cc) && (weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_NVFP4)) {
+        return false;
+    }
+    // a padded weight buffer gets cleared on first use; the fused path must not skip that
+    if (weight->buffer == nullptr || (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight) && weight->view_src)) {
+        return false;
+    }
+    // the fused quantizer reads gate / up with float4 loads at the layout of the GLU output
+    const bool layout_ok =
+        gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 &&
+        gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) && glu->ne[0] % 4 == 0 &&
+        ggml_is_contiguous(glu) && ggml_is_contiguous(gate) && ggml_is_contiguous(up) &&
+        ggml_cuda_is_aligned(gate, sizeof(float4)) && ggml_cuda_is_aligned(up, sizeof(float4));
+    if (!layout_ok) {
+        return false;
+    }
+    if (dst->op == GGML_OP_MUL_MAT) {
+        const int64_t ne11 = glu->ne[1];
+        if (ggml_cuda_op_mul_mat_use_fwht(dst) || ggml_fn_l3_get(dst) == GGML_FN_L3_MMV || weight->ne[1] == 1 ||
+                ggml_cuda_should_use_mmvf(weight->type, cc, weight->ne, weight->nb, ne11) ||
+                ggml_cuda_should_use_mmf(weight->type, cc, warp_size, weight->ne, weight->nb, ne11, /*mul_mat_id =*/ false) ||
+                ggml_cuda_should_use_mmsb(weight, glu, dst, cc) || ggml_cuda_should_use_mmqsn(weight, glu, dst, cc) ||
+                ggml_cuda_should_use_mmvq(weight->type, cc, ne11, /*ne01 =*/ weight->ne[1])) {
+            return false;
+        }
+        return ggml_cuda_should_use_mmq(weight->type, cc, ne11, /*n_experts =*/ 0);
+    }
+    // MUL_MAT_ID: one activation row per used expert (a broadcast activation takes the scatter quantizer)
+    const ggml_tensor * ids = dst->src[2];
+    if (ids == nullptr || glu->ne[1] != ids->ne[0] || glu->ne[1] == 1) {
+        return false;
+    }
+    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && dst->ne[2] <= get_mmvq_mmid_max_batch(weight->type, cc)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(weight->type, cc, glu->ne[2], /*n_experts =*/ weight->ne[2]);
+}
+
+// at node i (a GLU): compute its consumer now with the GLU fused in; true marks both nodes done
+static bool ggml_cuda_fn_l22_try_gluq8(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i, std::vector<uint8_t> & fused) {
+    ggml_tensor * glu = cgraph->nodes[i];
+    const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    const int j_end     = std::min(i + 8, cgraph->n_nodes);
+    for (int j = i + 1; j < j_end; ++j) {
+        ggml_tensor * dst = cgraph->nodes[j];
+        if ((dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID) || dst->src[1] != glu) {
+            continue;
+        }
+        // nothing between them may touch dst's memory or produce one of dst's other inputs
+        bool safe = true;
+        for (int k = i + 1; k < j && safe; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            safe = !ggml_cuda_fn_l22_tensors_overlap(dst, n);
+            for (int sidx = 0; sidx < GGML_MAX_SRC && safe; ++sidx) {
+                const ggml_tensor * src = n->src[sidx];
+                safe = src == nullptr || !ggml_cuda_fn_l22_tensors_overlap(dst, src);
+            }
+            for (int sidx = 0; sidx < GGML_MAX_SRC && safe; ++sidx) {
+                for (const ggml_tensor * v = dst->src[sidx]; v != nullptr && safe; v = v->view_src) {
+                    safe = v != n;
+                }
+            }
+        }
+        const int           idxs[2]      = { i, j };
+        const ggml_op       ops[2]       = { GGML_OP_GLU, dst->op };
+        const int           out_nodes[1] = { j };
+        if (safe && ggml_can_fuse_subgraph_ext(cgraph, idxs, 2, ops, out_nodes, 1) && ggml_cuda_fn_l22_glu_mmq_ok(glu, dst, cc, warp_size)) {
+            ggml_cuda_mul_mat_q(*cuda_ctx, dst->src[0], glu, dst->op == GGML_OP_MUL_MAT_ID ? dst->src[2] : nullptr, dst, nullptr, glu);
+            if (ggml_cuda_mmvq_q8_reuse_enabled()) {
+                ggml_cuda_mmvq_q8_cache_note_write(*cuda_ctx, dst); // [TAG_MMVQ_Q8_REUSE] dst is written now, not at j
+            }
+            fused[i] = 1;
+            fused[j] = 1;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<uint8_t> * fn_l22_fused = nullptr) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -6361,6 +6503,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // [TAG_FN_L22_GLUQ8] last: every other fusion that starts at this GLU keeps its place
+    if (fn_l22_fused != nullptr && node->op == GGML_OP_GLU) {
+        ggml_cuda_fn_l22_try_gluq8(cuda_ctx, cgraph, i, *fn_l22_fused);
+    }
+
     return 0;
 }
 
@@ -6507,8 +6654,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // [TAG_FN_L22_GLUQ8] nodes a fusion computed ahead of their place (only with one stream)
+            std::vector<uint8_t> fn_l22_fused;
+            if (ggml_cuda_fn_l22_gluq8() && stream_ctx.concurrent_events.empty()) {
+                fn_l22_fused.assign(cgraph->n_nodes, 0);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (!fn_l22_fused.empty() && fn_l22_fused[i]) { // [TAG_FN_L22_GLUQ8]
+                    prev_i = i;
+                    continue;
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6576,7 +6733,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_fn_l6_l2pf(cuda_ctx, cgraph, i);
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, fn_l22_fused.empty() ? nullptr : &fn_l22_fused);
+                if (!fn_l22_fused.empty() && fn_l22_fused[i]) {
+                    continue; // [TAG_FN_L22_GLUQ8] the GLU went into its consumer's quantization
+                }
 
                 if (nodes_to_skip != 0) {
                     // [TAG_MMVQ_Q8_REUSE] the fused nodes wrote their outputs too

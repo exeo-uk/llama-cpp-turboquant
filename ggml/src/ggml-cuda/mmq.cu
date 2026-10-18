@@ -134,7 +134,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * glu) {
+    GGML_ASSERT(glu == nullptr || (glu == src1 && fusion == nullptr)); // [TAG_FN_L22_GLUQ8]
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -223,6 +224,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (glu != nullptr) { // [TAG_FN_L22_GLUQ8]
+                quantize_glu_mmq_q8_1_cuda(glu, nullptr, src1_q8_1.get(), src0->type, ne10_padded,
+                                           glu->ne[1], glu->ne[2], glu->ne[3], stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -313,8 +317,12 @@ void ggml_cuda_mul_mat_q(
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
+            GGML_ASSERT(glu == nullptr); // [TAG_FN_L22_GLUQ8] the fusion never takes a broadcast activation
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+        } else if (glu != nullptr) { // [TAG_FN_L22_GLUQ8]
+            quantize_glu_mmq_q8_1_cuda(glu, ids_src1.get(), src1_q8_1.get(), src0->type, ne10_padded,
+                                       ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -526,4 +534,51 @@ bool ggml_cuda_mmq_tiles_whole_k(const ggml_type type, const int cc, const int64
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
     return GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90;
+}
+
+// [TAG_FN_L22_GLUFUSE] (#29948 b6e0f0334) the fused gate/up/GLU kernel has no stream-k: fuse only if one CUDA block per tile
+// fills the SMs (>= 90 %). Same tile width as the unfused dense MMQ; the fused tile writes I/2 output rows.
+bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
+    const int    cc    = ggml_cuda_info().devices[device].cc;
+    const int    nsm   = ggml_cuda_info().devices[device].nsm;
+    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+
+    int J_best        = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, /*fallback =*/ false, /*has_ids =*/ false, cc);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best        = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    if (J_best == 0) {
+        return false;
+    }
+    const int64_t nrows_tile = ggml_cuda_mmq_get_config(type, J_best, false, false, cc).I / 2;
+    const int64_t ntiles     = (int64_t) ntiles_J_best * ((nrows_x + nrows_tile - 1)/nrows_tile) * nchannels;
+    const int64_t nwaves     = (ntiles + nsm - 1) / nsm;
+    return 100*ntiles / (nsm*nwaves) >= 90;
+}
+
+// [TAG_FN_L22_MMQ_Y8] (#30493) GGML_CUDA_FN_L22_MMQ_Y8=1: the y tile copy in 8-byte loads (byte-identical)
+bool ggml_cuda_fn_l22_mmq_y8() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_MMQ_Y8");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// [TAG_FN_L22_SKCAP] (#30553) GGML_CUDA_FN_L22_SKCAP=1: stream-k grid capped at the work items (same k split)
+bool ggml_cuda_fn_l22_skcap() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_SKCAP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
 }
