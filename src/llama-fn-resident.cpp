@@ -986,6 +986,7 @@ std::vector<llama_fn_p5_piece> llama_fn_p5_warm_list(const llama_model & model, 
     res_table * t = r.t;
     layer_end.assign((size_t) t->n_layer, 0);
     std::vector<uint8_t> sel;
+    std::vector<std::pair<int, int>> runs;
     std::vector<std::pair<int, int>> P;
     for (int il = 0; il < t->n_layer; ++il) {
         const int li = t->by_il[il];
@@ -1003,18 +1004,10 @@ std::vector<llama_fn_p5_piece> llama_fn_p5_warm_list(const llama_model & model, 
                 }
             }
             for (int k = 0; k < 3; ++k) {
-                const size_t per = std::max<size_t>(1, max_bytes/std::max<size_t>(1, L.nb[k]));
-                for (int e = 0; e < L.n_exp; ) {
-                    if (!sel[e]) {
-                        ++e;
-                        continue;
-                    }
-                    int e1 = e + 1;
-                    while (e1 < L.n_exp && sel[e1] && (size_t) (e1 - e) < per) {
-                        ++e1;
-                    }
-                    out.push_back({ il, k, e, e1, L.base[k] + (size_t) e*L.nb[k], (size_t) (e1 - e)*L.nb[k] });
-                    e = e1;
+                runs.clear();
+                piece_runs(sel.data(), L.n_exp, L.nb[k], max_bytes, runs);
+                for (const auto & r : runs) {
+                    out.push_back({ il, k, r.first, r.second, L.base[k] + (size_t) r.first*L.nb[k], (size_t) (r.second - r.first)*L.nb[k] });
                 }
             }
         }

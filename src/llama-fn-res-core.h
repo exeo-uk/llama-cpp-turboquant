@@ -66,6 +66,23 @@ inline void runs_of(uintptr_t base, size_t nb, const uint8_t * sel, int n, std::
     }
 }
 
+// expert runs [e0, e1) of consecutive selected experts, each at most max_bytes (at least one expert), appended to out
+inline void piece_runs(const uint8_t * sel, int n, size_t nb, size_t max_bytes, std::vector<std::pair<int, int>> & out) {
+    const size_t per = std::max<size_t>(1, max_bytes/std::max<size_t>(1, nb));
+    for (int e = 0; e < n; ) {
+        if (!sel[e]) {
+            ++e;
+            continue;
+        }
+        int e1 = e + 1;
+        while (e1 < n && sel[e1] && (size_t) (e1 - e) < per) {
+            ++e1;
+        }
+        out.push_back({ e, e1 });
+        e = e1;
+    }
+}
+
 // the whole pages inside r (empty when none): pages shared with a neighbour stay untouched
 inline range align_in(range r, size_t page) {
     range o;

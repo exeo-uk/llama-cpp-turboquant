@@ -53,6 +53,19 @@ static void test_runs() {
     runs_of(0, 8, all, 4, rs);
     CHECK(rs.size() == 1 && rs[0].lo == 0 && rs[0].hi == 32);
 
+    // warm pieces: runs cut at max_bytes, at least one expert each
+    std::vector<std::pair<int, int>> pr;
+    piece_runs(sel, 10, 100, 250, pr); // two experts per piece at most
+    CHECK(pr.size() == 4);
+    CHECK(pr[0] == std::make_pair(0, 2) && pr[1] == std::make_pair(3, 4) && pr[2] == std::make_pair(6, 8) &&
+          pr[3] == std::make_pair(8, 9));
+    pr.clear();
+    piece_runs(sel, 10, 100, 10, pr); // smaller than one expert: one expert per piece
+    CHECK(pr.size() == 6);
+    pr.clear();
+    piece_runs(sel, 10, 100, 1 << 20, pr);
+    CHECK(pr.size() == 3 && pr[2] == std::make_pair(6, 9));
+
     // inward: whole pages inside only; outward: every page touched
     range a = align_in({ 4097, 3*4096 + 5 }, 4096);
     CHECK(a.lo == 8192 && a.hi == 12288 && a.size() == 4096);
