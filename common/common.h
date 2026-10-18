@@ -1224,6 +1224,18 @@ std::vector<llama_token> common_tokenize(
                         bool   add_special,
                         bool   parse_special = false);
 
+// [TAG_FN_L22_TOKCACHE] the same ids as common_tokenize, re-using a recent text's ids up to its last special-token
+// boundary inside the shared prefix (common/tokcache.h). cache == nullptr: common_tokenize
+struct common_tokcache;
+struct common_tokcache_stats;
+std::vector<llama_token> common_tokenize_cached(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+                        bool   add_special,
+                        bool   parse_special,
+          common_tokcache    * cache,
+    common_tokcache_stats    * stats = nullptr);
+
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`
 std::string common_token_to_piece(

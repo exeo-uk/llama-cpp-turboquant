@@ -166,6 +166,8 @@ int32_t mtmd_helper_decode_image_chunk(
     const bool use_non_causal = mtmd_decode_use_non_causal(ctx, chunk);
     const scope_non_causal non_causal(lctx, use_non_causal);
 
+    mtmd_lend_suspend(ctx); // [TAG_FN_L22_VLEND_HOLD] no text-model decode while a hold keeps the projector's VRAM
+
     while (i_batch < n_img_batches) { // split into batches
         int pos_offset = i_batch*n_batch;
         int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
@@ -215,6 +217,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         size_t n_tokens;
         const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
         // LOG_INF("decoding text chunk, n_tokens = %zu\n", n_tokens);
+        mtmd_lend_suspend(ctx); // [TAG_FN_L22_VLEND_HOLD]
         llama_batch_ext_ptr text_batch(llama_batch_ext_init(lctx));
         size_t i = 0;
         while (i < n_tokens) { // split into batches

@@ -3,6 +3,8 @@
 #include "clip-model.h"
 #include "clip-graph.h"
 #include "models/models.h"
+#include "mtmd-l22.h" // [TAG_FN_L22_VLEND_SIZE]
+#include "../src/llama-fn-l22.h" // [TAG_FN_L22_PASSLOG] llama_fn_l22_log
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -25,6 +27,7 @@
 #include <limits>
 #include <array>
 #include <functional>
+#include <mutex>
 #include <float.h>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
@@ -203,6 +206,21 @@ struct clip_ctx {
         clip_lend_give_fn give = nullptr;
         void * ud = nullptr;
         uint64_t n = 0;
+
+        // [TAG_FN_L22_VLEND_HOLD] hold > 0: an encode keeps the device side up for the next one (one take per turn)
+        std::recursive_mutex mu;   // an encode (maybe on the media worker) against hold / suspend calls
+        int      hold      = 0;
+        bool     out       = false; // take() called, give() not yet
+        size_t   taken     = 0;     // the bytes the current take was sized for
+        uint64_t n_in_take = 0;     // encodes since that take
+        bool     fresh     = false; // a new scheduler since the take: its buffer size is this picture's
+        // [TAG_FN_L22_OOMHOOK]
+        clip_lend_oom_fn oom    = nullptr;
+        void *           oom_ud = nullptr;
+        // [TAG_FN_L22_VLEND_SIZE]
+        bool               size_on = false;
+        size_t             w       = 0; // weight buffer bytes
+        mtmd_l22_lend_size sz;
     } lend;
 
     void make_sched() {
@@ -250,6 +268,7 @@ struct clip_ctx {
         if (ctx_params.image_max_tokens > 0) {
             model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
         }
+        model.hparams.l22_vlresize = ctx_params.l22_vlresize; // [TAG_FN_L22_VLRESIZE]
 
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
@@ -2098,6 +2117,26 @@ struct clip_model_loader {
                     } break;
                 default:
                     throw std::runtime_error(string_format("%s: unknown vision projector type %s\n", __func__, proj_type.c_str()));
+            }
+
+            // [TAG_FN_L22_VLRESIZE] upstream #30736: the HF processor resizes to the smart_resize size (no padding) and rounds
+            // .5 to even (Python round())
+            if (hparams.l22_vlresize) {
+                switch (model.proj_type) {
+                    case PROJECTOR_TYPE_QWEN2VL:
+                    case PROJECTOR_TYPE_QWEN25VL:
+                    case PROJECTOR_TYPE_QWEN3VL:
+                    case PROJECTOR_TYPE_LING3VL:
+                    case PROJECTOR_TYPE_MIMOVL:
+                    case PROJECTOR_TYPE_DOTS_OCR:
+                    case PROJECTOR_TYPE_EXAONE4_5:
+                        hparams.image_resize_pad      = PAD_NONE;
+                        hparams.image_round_half_even = true;
+                        LOG_INF("%s: [TAG_FN_L22_VLRESIZE] resize as the HF processor (no padding, round half to even)\n", __func__);
+                        break;
+                    default:
+                        break;
+                }
             }
 
             // sanity check
@@ -4543,6 +4582,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 struct clip_encode_status {
     bool graph_built   = false; // the graph builder returned; an exception after this comes from the backend
     bool device_failed = false; // graph allocation or graph compute returned an error
+    bool alloc_failed  = false; // [TAG_FN_L22_OOMHOOK] it was the graph allocation
 };
 
 static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params, clip_encode_status * st) {
@@ -4572,6 +4612,7 @@ static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * 
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         st->device_failed = true;
+        st->alloc_failed  = true;
         return false;
     }
 
@@ -6160,7 +6201,7 @@ static void clip_lend_free_device(clip_ctx * ctx) {
 }
 
 // a new device weight buffer (the same allocation as at load), the weights uploaded from host
-static bool clip_lend_unpark(clip_ctx * ctx) {
+static bool clip_lend_unpark_once(clip_ctx * ctx) {
     ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), ctx->lend.buft);
     if (b == nullptr) {
         // tensors placed before the failure point into the freed buffer: no data again
@@ -6178,6 +6219,75 @@ static bool clip_lend_unpark(clip_ctx * ctx) {
     ggml_backend_synchronize(ctx->backend);
     ctx->lend.parked = false;
     return true;
+}
+
+// [TAG_FN_L22_OOMHOOK] a failed weight buffer allocation asks the OOM hook once (e.g. pins give memory back), then retries
+static bool clip_lend_unpark(clip_ctx * ctx, size_t need) {
+    if (clip_lend_unpark_once(ctx)) {
+        return true;
+    }
+    auto & L = ctx->lend;
+    if (L.oom == nullptr) {
+        return false;
+    }
+    const bool freed = L.oom(L.oom_ud, need);
+    LOG_WRN("%s: [TAG_FN_L22_OOMHOOK] the weight buffer could not be allocated, the OOM hook %s (%.1f MiB)\n", __func__,
+            freed ? "released memory: retrying once" : "released nothing", need/1048576.0);
+    return freed && clip_lend_unpark_once(ctx);
+}
+
+// [TAG_FN_L22_VLEND_SIZE] at park, while the weights are still on the device: the compute buffer of the largest picture
+// (no allocation). c_w is the warm-up picture's, which today's lend already covers
+static void clip_lend_probe_sizes(clip_ctx * ctx, size_t c_w) {
+    auto & L = ctx->lend;
+    const auto & hp = ctx->model.hparams;
+    L.sz = mtmd_l22_lend_size();
+    if (!L.size_on || ctx->model.modality != CLIP_MODALITY_VISION || hp.patch_size <= 0 || hp.warmup_image_size <= 0) {
+        return;
+    }
+    const int ps = hp.patch_size;
+    L.sz.on  = true;
+    L.sz.c_w = c_w;
+    L.sz.n_w = (int64_t) (hp.warmup_image_size / ps) * (int64_t) (hp.warmup_image_size / ps);
+    if (hp.image_max_pixels <= 0) {
+        LOG_INF("%s: [TAG_FN_L22_VLEND_SIZE] no largest picture size: takes are sized from earlier encodes only\n", __func__);
+        return;
+    }
+    const int align = ps * std::max(1, hp.n_merge);
+    const int side  = ((int) std::sqrt((double) hp.image_max_pixels)) / align * align;
+    if (side <= hp.warmup_image_size) {
+        return; // the warm-up picture is the largest one
+    }
+    int bi = -1;
+    for (size_t i = 0; i < ctx->backend_ptrs.size(); ++i) {
+        if (ctx->backend_ptrs[i] == ctx->backend) {
+            bi = (int) i;
+        }
+    }
+    if (bi < 0) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t c_max = 0;
+    try {
+        clip_image_f32_batch b;
+        clip_image_f32 img;
+        img.set_size({ side, side }, false, false);
+        b.entries.push_back(std::move(img));
+        ggml_cgraph * gf = clip_get_graph_builder(ctx, b)->build();
+        std::vector<size_t> sizes(ctx->backend_ptrs.size(), 0);
+        ggml_backend_sched_reserve_size(ctx->sched.get(), gf, sizes.data());
+        c_max = sizes[(size_t) bi];
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: [TAG_FN_L22_VLEND_SIZE] the largest picture's graph failed (%s): takes are sized from earlier encodes only\n",
+                __func__, e.what());
+        return;
+    }
+    L.sz.n_max = (int64_t) (side / ps) * (int64_t) (side / ps);
+    L.sz.c_max = c_max;
+    llama_fn_l22_log("media", "[TAG_FN_L22_VLEND_SIZE] projector compute %.0f MiB at %lld patches (warm-up), %.0f MiB at %lld patches "
+            "(%dx%d, the largest picture), measured in %.1f ms", c_w/1048576.0, (long long) L.sz.n_w, c_max/1048576.0,
+            (long long) L.sz.n_max, side, side, (ggml_time_us() - t0)/1000.0);
 }
 
 size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_give_fn give, void * ud) {
@@ -6226,6 +6336,8 @@ size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_g
     }
     const size_t w = ggml_backend_buffer_get_size(ctx->buf.get());
     const size_t c = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend);
+    L.w = w;
+    clip_lend_probe_sizes(ctx, c); // [TAG_FN_L22_VLEND_SIZE]
     L.buft  = buft;
     L.take  = take;
     L.give  = give;
@@ -6246,50 +6358,143 @@ ggml_backend_dev_t clip_get_device(const struct clip_ctx * ctx) {
     return ggml_backend_get_device(ctx->backend);
 }
 
-// around one encode of a parked context: VRAM back, weights up; at scope exit both freed again and the VRAM returned
+// [TAG_FN_L22_VLEND_HOLD] park (if the device side is up) and give the VRAM back, once per take. Lend mutex held
+static void clip_lend_release(clip_ctx * ctx, const char * why) {
+    auto & L = ctx->lend;
+    if (!L.out) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!L.parked && !ctx->cpu_only) {
+        clip_lend_free_device(ctx);
+    }
+    const int64_t t1 = ggml_time_us();
+    if (L.give) {
+        L.give(L.ud);
+    }
+    if (why != nullptr) {
+        llama_fn_l22_log("media", "[TAG_FN_L22_VLEND_HOLD] %s: %" PRIu64 " encodes on one lend of %.0f MiB, freed in %.1f ms, returned in "
+                "%.1f ms", why, L.n_in_take, L.taken/1048576.0, (t1 - t0)/1000.0, (ggml_time_us() - t1)/1000.0);
+    }
+    L.out       = false;
+    L.taken     = 0;
+    L.n_in_take = 0;
+    L.fresh     = false;
+}
+
+// [TAG_FN_L22_VLEND_SIZE] the bytes to take for an encode: today's bytes, or the weights plus the compute buffer this
+// picture needs when that is more (never less: a short take allocates from nearly full VRAM)
+static size_t clip_lend_need(const clip_ctx * ctx, const clip_image_f32_batch * imgs, int & ne, int & nx, int & ny) {
+    const auto & L = ctx->lend;
+    ne = nx = ny = 0;
+    if (!L.sz.on || imgs == nullptr || imgs->entries.empty()) {
+        return L.bytes;
+    }
+    const int ps = std::max(1, ctx->model.hparams.patch_size);
+    int64_t n = 0;
+    for (const auto & e : imgs->entries) {
+        n += (int64_t) (e.nx() / ps) * (int64_t) (e.ny() / ps);
+    }
+    ne = (int) imgs->entries.size();
+    nx = imgs->entries[0].nx();
+    ny = imgs->entries[0].ny();
+    return std::max(L.bytes, L.w + L.sz.estimate(n, L.sz.find(ne, nx, ny)));
+}
+
+// around one encode of a parked context: VRAM back, weights up; at scope exit both freed again and the VRAM returned.
+// [TAG_FN_L22_VLEND_HOLD] inside a hold the device side stays up for the next encode
 struct clip_lend_scope {
     clip_ctx * ctx;
-    bool active = false;
+    std::unique_lock<std::recursive_mutex> lk;
+    bool active = false; // took the VRAM for this encode
+    bool kept   = false; // found the device side kept by a hold
     bool ok     = true;
+    int ne = 0, nx = 0, ny = 0;
+    size_t need = 0;
     int64_t t0 = 0, t_take = 0, t_up = 0;
     size_t got = 0;
 
-    explicit clip_lend_scope(clip_ctx * c) : ctx(c) {
-        if (!ctx->lend.on || !ctx->lend.parked || ctx->cpu_only) {
+    clip_lend_scope(clip_ctx * c, const clip_image_f32_batch * imgs) : ctx(c) {
+        auto & L = ctx->lend;
+        if (!L.on || ctx->cpu_only) {
+            return; // no lock: a CPU encode can take minutes
+        }
+        lk = std::unique_lock<std::recursive_mutex>(L.mu);
+        if (ctx->cpu_only) {
+            return;
+        }
+        need = clip_lend_need(ctx, imgs, ne, nx, ny);
+        if (!L.parked) {
+            if (L.out && need <= L.taken) {
+                kept = true;
+                L.n_in_take++;
+                return;
+            }
+            clip_lend_release(ctx, "a bigger picture needs a bigger lend"); // then the bigger take below
+        }
+        if (!L.parked) {
             return;
         }
         active = true;
         t0  = ggml_time_us();
-        got = ctx->lend.take ? ctx->lend.take(ctx->lend.ud, ctx->lend.bytes) : 0;
+        got = L.take ? L.take(L.ud, need) : 0;
         t_take = ggml_time_us();
-        ok = clip_lend_unpark(ctx);
+        L.out       = true;
+        L.taken     = need;
+        L.n_in_take = 1;
+        ok = clip_lend_unpark(ctx, need);
+        L.fresh = ok;
         t_up = ggml_time_us();
         if (!ok) {
             LOG_ERR("%s: [TAG_FN_L17_VISION_LEND] the weight buffer (%.1f MiB) could not be allocated: this encode fails\n", __func__,
-                    ctx->lend.bytes/1048576.0);
+                    need/1048576.0);
+        } else if (need > L.bytes) {
+            llama_fn_l22_log("media", "[TAG_FN_L22_VLEND_SIZE] picture %dx%d (%d entries): lend %.0f MiB instead of %.0f MiB",
+                    nx, ny, ne, need/1048576.0, L.bytes/1048576.0);
         }
     }
 
     ~clip_lend_scope() {
-        if (!active) {
+        if (!active && !kept) {
             return;
         }
+        auto & L = ctx->lend;
+        // [TAG_FN_L22_VLEND_SIZE] a compute buffer allocated fresh for this picture: its size is exact for the next one
+        if (L.sz.on && L.fresh && ok && !ctx->cpu_only && !L.parked && ne > 0 && ctx->sched) {
+            L.sz.record(ne, nx, ny, ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend));
+        }
+        L.fresh = false;
+        L.n++;
         const int64_t t_enc = ggml_time_us();
-        if (!ctx->lend.parked && !ctx->cpu_only) {
+        if (L.hold > 0 && ok && !ctx->cpu_only && !L.parked) {
+            if (active) {
+                LOG_INF("%s: [TAG_FN_L22_VLEND_HOLD] encode %" PRIu64 ": VRAM back %.0f MiB in %.1f ms, weights up in %.1f ms, encode "
+                        "%.1f ms, kept for the next encode (hold)\n", "clip_encode", L.n, got/1048576.0, (t_take - t0)/1000.0,
+                        (t_up - t_take)/1000.0, (t_enc - t_up)/1000.0);
+            }
+            return;
+        }
+        if (!active) {
+            clip_lend_release(ctx, "released after the encode");
+            return;
+        }
+        if (!L.parked && !ctx->cpu_only) {
             clip_lend_free_device(ctx);
         }
         const int64_t t_free = ggml_time_us();
-        if (ctx->lend.give) {
-            ctx->lend.give(ctx->lend.ud);
+        if (L.give) {
+            L.give(L.ud);
         }
+        L.out       = false;
+        L.taken     = 0;
+        L.n_in_take = 0;
         const int64_t t_end = ggml_time_us();
-        ctx->lend.n++;
         size_t w = 0;
-        for (const auto & to : ctx->lend.offs) {
+        for (const auto & to : L.offs) {
             w += ggml_nbytes(to.first);
         }
         LOG_INF("%s: [TAG_FN_L17_VISION_LEND] encode %" PRIu64 ": VRAM back %.0f MiB in %.1f ms, weights up in %.1f ms (%.1f GiB/s), "
-                "encode %.1f ms, freed in %.1f ms, returned in %.1f ms\n", "clip_encode", ctx->lend.n, got/1048576.0,
+                "encode %.1f ms, freed in %.1f ms, returned in %.1f ms\n", "clip_encode", L.n, got/1048576.0,
                 (t_take - t0)/1000.0, (t_up - t_take)/1000.0, t_up > t_take ? w/1073741824.0/((t_up - t_take)/1e6) : 0.0,
                 (t_enc - t_up)/1000.0, (t_free - t_enc)/1000.0, (t_end - t_free)/1000.0);
     }
@@ -6298,14 +6503,96 @@ struct clip_lend_scope {
     clip_lend_scope & operator=(const clip_lend_scope &) = delete;
 };
 
+void clip_lend_set_oom(struct clip_ctx * ctx, clip_lend_oom_fn fn, void * ud) {
+    if (ctx == nullptr) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lk(ctx->lend.mu);
+    ctx->lend.oom    = fn;
+    ctx->lend.oom_ud = ud;
+}
+
+void clip_lend_set_size(struct clip_ctx * ctx, bool on) {
+    if (ctx != nullptr) {
+        ctx->lend.size_on = on;
+    }
+}
+
+size_t clip_lend_max_bytes(const struct clip_ctx * ctx) {
+    if (ctx == nullptr || !ctx->lend.on) {
+        return 0;
+    }
+    const auto & L = ctx->lend;
+    size_t m = L.bytes;
+    if (L.sz.on && L.sz.n_max > 0) {
+        m = std::max(m, L.w + L.sz.estimate(L.sz.n_max, nullptr));
+    }
+    return m;
+}
+
+void clip_lend_hold(struct clip_ctx * ctx, bool on) {
+    if (ctx == nullptr || !ctx->lend.on) {
+        return;
+    }
+    auto & L = ctx->lend;
+    std::lock_guard<std::recursive_mutex> lk(L.mu);
+    if (on) {
+        L.hold++;
+    } else if (L.hold > 0 && --L.hold == 0) {
+        clip_lend_release(ctx, "hold released");
+    }
+}
+
+void clip_lend_suspend(struct clip_ctx * ctx) {
+    if (ctx == nullptr || !ctx->lend.on) {
+        return;
+    }
+    auto & L = ctx->lend;
+    std::lock_guard<std::recursive_mutex> lk(L.mu);
+    if (L.hold > 0 && L.out) {
+        clip_lend_release(ctx, "parked for a decode inside the hold");
+    }
+}
+
+void clip_lend_hold_reset(struct clip_ctx * ctx) {
+    if (ctx == nullptr || !ctx->lend.on) {
+        return;
+    }
+    auto & L = ctx->lend;
+    std::lock_guard<std::recursive_mutex> lk(L.mu);
+    L.hold = 0;
+    clip_lend_release(ctx, "holds reset");
+}
+
+// [TAG_FN_L22_OOMHOOK] a lent context whose compute buffer could not be allocated asks the OOM hook once and retries,
+// before the device fallback moves every later encode to the CPU
+static bool clip_encode_impl_lent(clip_ctx * ctx, clip_encode_params * params, clip_encode_status * st) {
+    if (clip_encode_impl(ctx, params, st)) {
+        return true;
+    }
+    auto & L = ctx->lend;
+    if (!st->alloc_failed || !L.on || L.oom == nullptr || ctx->cpu_only) {
+        return false;
+    }
+    const size_t need = L.taken > L.w ? L.taken - L.w : (L.bytes > L.w ? L.bytes - L.w : L.bytes);
+    const bool freed = L.oom(L.oom_ud, need);
+    LOG_WRN("%s: [TAG_FN_L22_OOMHOOK] the encoder's compute buffer could not be allocated, the OOM hook %s (%.1f MiB)\n", __func__,
+            freed ? "released memory: retrying once" : "released nothing", need/1048576.0);
+    if (!freed) {
+        return false;
+    }
+    *st = clip_encode_status();
+    return clip_encode_impl(ctx, params, st);
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
-    clip_lend_scope lend(ctx); // [TAG_FN_L17_VISION_LEND] no-op unless parked
+    clip_lend_scope lend(ctx, params ? params->imgs : nullptr); // [TAG_FN_L17_VISION_LEND] no-op unless parked
     if (!lend.ok) {
         return false;
     }
     if (!clip_device_fallback_eligible(ctx)) {
         clip_encode_status st;
-        return clip_encode_impl(ctx, params, &st);
+        return clip_encode_impl_lent(ctx, params, &st);
     }
 
     // [TAG_MTMD_DEVICE_FALLBACK] the device failed an earlier encode
@@ -6339,7 +6626,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     std::string reason;
     bool threw = false; // [TAG_MTMD_DEVICE_FALLBACK] only a backend that threw may be lost; see backend_abandoned below
     try {
-        if (clip_encode_impl(ctx, params, &st)) {
+        if (clip_encode_impl_lent(ctx, params, &st)) {
             return true;
         }
         if (!st.device_failed) {

@@ -452,6 +452,15 @@ MTMD_API void mtmd_lend_hold(mtmd_context * ctx, bool on);
 typedef bool (*mtmd_lend_oom_fn)(void * user_data, size_t bytes);
 MTMD_API void mtmd_set_lend_oom(mtmd_context * ctx, mtmd_lend_oom_fn fn, void * user_data);
 
+// [TAG_FN_L22_VLEND_HOLD] (P2): park the projector and give its VRAM back now if a hold keeps it out; the hold count stays,
+// the next encode takes again. Call it before any decode of the text model inside a hold: the hot set's give maps back
+// the lowest groups of the KV lend, so a KV lend growth during a hold would make it map the KV cache's new groups.
+// mtmd_helper_decode_image_chunk and mtmd_helper_eval_chunk_single call it. No-op without a hold.
+MTMD_API void mtmd_lend_suspend(mtmd_context * ctx);
+
+// [TAG_FN_L22_IMGDEC] (P2): threads for picture decoding / preprocessing (LLAMA_FN_L22_IMGDEC_THREADS, 1 = serial)
+MTMD_API int32_t mtmd_l22_imgdec_threads(const mtmd_context * ctx);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

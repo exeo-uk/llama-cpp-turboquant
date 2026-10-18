@@ -126,6 +126,35 @@ MAKE_TEST(test_image_preprocessor_dyn_size_extreme_aspect) {
                    str(mtmd_image_preprocessor_dyn_size::calc_target_size(hparams, { 1, 20000 })));
 }
 
+// [TAG_FN_L22_VLRESIZE] upstream #30736: with image_round_half_even a side of an even number plus .5 merged patches rounds
+// down like Python round() in smart_resize; off keeps std::round (the old sizes)
+MAKE_TEST(test_image_preprocessor_dyn_size_l22_vlresize) {
+    // { patch_size, image size, expected with round-half-even, expected without }
+    const std::vector<std::tuple<int, clip_image_size, clip_image_size, clip_image_size>> cases = {
+        { 16, {  768, 400 }, {  768, 384 }, {  768, 416 } },
+        { 16, {  800, 336 }, {  800, 320 }, {  800, 352 } },
+        { 16, {  400, 400 }, {  384, 384 }, {  416, 416 } },
+        { 16, {  640, 240 }, {  640, 256 }, {  640, 256 } },
+        { 14, {  966, 560 }, {  952, 560 }, {  980, 560 } },
+    };
+
+    for (const auto & [patch_size, input, expected_even, expected_old] : cases) {
+        for (const bool even : { true, false }) {
+            clip_hparams hparams;
+            hparams.patch_size = patch_size;
+            hparams.n_merge = 2;
+            hparams.image_round_half_even = even;
+            hparams.set_limit_image_tokens(8, 4096);
+
+            const clip_image_size actual   = mtmd_image_preprocessor_dyn_size::calc_target_size(hparams, input);
+            const clip_image_size expected = even ? expected_even : expected_old;
+            const std::string name = std::to_string(input.width) + "x" + std::to_string(input.height) + (even ? " even" : " old");
+            t.assert_equal(name + " width", expected.width, actual.width);
+            t.assert_equal(name + " height", expected.height, actual.height);
+        }
+    }
+}
+
 //
 // mtmd temporal merge
 //

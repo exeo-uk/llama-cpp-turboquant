@@ -265,9 +265,10 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
  */
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
 
-// L22-REQUEST R-P3-1 (steward stub, owner P2): reads the server text-tool switches of the model before the chat templates
-// are initialised. Stub in server-common.cpp until P2 is merged; the P2 merge replaces this declaration and the stub with
-// P2's (same place, so the merge conflicts here; keeping both is a redefinition error).
+// [TAG_FN_L22] round 22 P2: read the model's switches for the server-side text tools once (LLAMA_FN_L22_JSONFLOAT ->
+// the jinja float output, _TOKCACHE / _TOKCACHE_VERIFY -> the prompt tokenizer cache, _PASSLOG -> timing lines). Call it
+// after the model is loaded and BEFORE the chat templates are initialised. Not called: the environment only.
+// L22-REQUEST: the call belongs in server-context.cpp (P3), see r22/impl/requests.md R-P2-1
 void server_fn_l22_init(const llama_model * model);
 
 // return the last index of character that can form a valid string

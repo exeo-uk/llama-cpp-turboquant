@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <optional>
 
 #define FILENAME "jinja-runtime"
 
@@ -611,11 +612,17 @@ value for_statement::execute_impl(context & ctx) const {
         loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
         loop_obj->insert("previtem", i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
         loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        // [TAG_FN_L22_JSONFLOAT] upstream #30533: each iteration gets its own scope, as in Jinja2
+        std::optional<context> iter_scope;
+        if (l22_jsonfloat()) {
+            iter_scope.emplace(scope);
+        }
+        context & cur = iter_scope ? *iter_scope : scope;
+        cur.set_val("loop", loop_obj);
+        scope_update_fns[i](cur);
         try {
             for (auto & stmt : body) {
-                value val = stmt->execute(scope);
+                value val = stmt->execute(cur);
                 result->push_back(val);
             }
         } catch (const continue_statement::signal &) {
