@@ -41,8 +41,11 @@ enum ggml_moe_bridge_error {
 #define GGML_MOE_BRIDGE_JOB_TAIL  8 // [TAG_FN_L22_X_TAILSKIP] a decode-phase GEN graph with LLAMA_FN_L22_X_TAILSKIP: the host
                                     // may skip the job's tail experts (opt-in, changes answers; P8)
 #define GGML_MOE_BRIDGE_JOB_DEFER 16 // [TAG_FN_L22_X_DEFER] the job's light experts are answered later on the defer channel
-                                    // (opt-in, changes answers; P11)
+                                    // (opt-in, changes answers; P11): a post with it owes a second answer there, under
+                                    // the same ticket (llama_moe_bridge_defer_chan)
 #define GGML_MOE_BRIDGE_JOB_NOPF  32 // [TAG_FN_L22_TBO] R-D5-5: no next-layer prefetch after this job (two-chain decode)
+#define GGML_MOE_BRIDGE_JOB_LIGHT 64 // [TAG_FN_L22_X_DEFER] pool job / sync op only (never on a post): the light part of a
+                                    // deferred job (DEFER = the rest). Both set is invalid
 
 // [TAG_FN_R4_BRIDGE_DMA] the largest PCIe share of one job, in experts
 #define GGML_MOE_BRIDGE_MAX_FETCH 32

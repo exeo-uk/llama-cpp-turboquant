@@ -179,7 +179,11 @@ extern "C" {
         int8_t          tail_rank;           // 0, or skip a cold expert whose best rank in the job is >= tail_rank
         float           tail_w;              // 0, or skip a cold expert whose largest weight in the job is < tail_w
         float           defer_w;             // 0, or the light-expert weight bound of a deferred job
-        uint32_t        l22_flags;           // GGML_MOE_BRIDGE_JOB_TAIL / _DEFER bits of the job
+        uint32_t        l22_flags;           // GGML_MOE_BRIDGE_JOB_TAIL / _DEFER / _LIGHT bits of the job
+        // [TAG_FN_L22_X_DEFER] with w and l22_flags DEFER (the heavy part) or LIGHT (the light part): a cold expert not
+        // dropped by the tail rule is light if its largest weight in the job is < defer_w, or its best rank >= defer_rank
+        int8_t          defer_rank;          // 0, or the light-expert rank bound
+        int32_t *       n_light;             // or NULL: set to the number of distinct light experts of the job
     };
 
     struct ggml_cpu_moe_pool_params {
@@ -233,6 +237,8 @@ extern "C" {
         int   tail_rank;                     // [TAG_FN_L22_X_TAILSKIP] the rule of the sync op (GGML_OP_MOE_HOST_SUM) of a graph
         float tail_w;                        // that carries GGML_MOE_BRIDGE_JOB_TAIL, set process-wide at the pool's creation
                                              // (one bridge per process): the same as a bridged job's tail_rank / tail_w
+        int   defer_rank;                    // [TAG_FN_L22_X_DEFER] the light rule of a sync op with GGML_MOE_BRIDGE_JOB_DEFER
+        float defer_w;                       // or _LIGHT, set process-wide the same way (= a bridged job's defer_rank / defer_w)
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.

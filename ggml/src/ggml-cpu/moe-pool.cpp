@@ -1204,6 +1204,9 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     if (pp->tail_rank > 0 || pp->tail_w > 0.0f) {
         ggml_fn_moe_tail_set(pp->tail_rank, pp->tail_w);     // [TAG_FN_L22_X_TAILSKIP] the sync op's rule
     }
+    if (pp->defer_rank > 0 || pp->defer_w > 0.0f) {
+        ggml_fn_moe_defer_set(pp->defer_rank, pp->defer_w);  // [TAG_FN_L22_X_DEFER] the sync op's light rule
+    }
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -1514,6 +1517,8 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     a.tail_w    = job->tail_w;
     a.defer_w   = job->defer_w;
     a.l22_flags = job->l22_flags;
+    a.defer_rank = job->defer_rank; // [TAG_FN_L22_X_DEFER]
+    a.n_light    = job->n_light;
 
     const bool solo = p->solo && p->n_threads >= 2; // [TAG_FN_R2_BRIDGE_PF]
     const int  nth  = solo ? p->n_threads - 1 : p->n_threads;
