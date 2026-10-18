@@ -121,6 +121,11 @@ struct pfs_state {
     int  ahead_to = -1; // the last position asked for
     // [TAG_FN_L14_PFSD2D] LLAMA_PREFILL_STREAM_D2D=1: the experts the hot set holds go slot -> bank on the device
     bool (*d2d)(ggml_backend_t, int, void * const *, const void * const *, const size_t *) = nullptr;
+    // [TAG_FN_L22_PIN] R-REV-3: a non-blocking test of a copy-stream event (the device backend's proc; null: none). The
+    // banks' tickets (pfs_bank::tk) are touched under tk_mtx only; tk_banks counts the banks that hold some
+    bool (*ev_done)(ggml_backend_event_t) = nullptr;
+    std::mutex       tk_mtx;
+    std::atomic<int> tk_banks{0};
 
     // [TAG_FN_R1_PFS_LEND] LLAMA_PREFILL_STREAM_LEND=1: the banks are a range of the hot set's buffer, borrowed while
     // ubatches stream (lent) and returned before a decode; the aliases are placed there at the first lend
@@ -417,21 +422,42 @@ void pfs_ra_run(pfs_state * s) {
     }
 }
 
-// [TAG_FN_L22_PIN] release the bank's pin tickets once the copies behind them have landed
-void pfs_bank_release_tk(ggml_backend_t copy, pfs_bank & B) {
-    if (B.tk.empty()) {
-        return;
-    }
-    if (B.tk_rec && B.ev_tk) {
-        ggml_backend_event_synchronize(B.ev_tk);
-    } else if (copy) {
-        ggml_backend_synchronize(copy); // no event: everything queued so far
-    }
+// [TAG_FN_L22_PIN] the bank's tickets go back (tk_mtx held; the copies behind them have landed)
+void pfs_bank_drop_tk_locked(pfs_state * s, pfs_bank & B) {
     for (int32_t t : B.tk) {
         llama_fn_pin_release(t);
     }
     B.tk.clear();
     B.tk_rec = false;
+    s->tk_banks.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// [TAG_FN_L22_PIN] release the bank's pin tickets once the copies behind them have landed (waits for them)
+void pfs_bank_release_tk(pfs_state * s, pfs_bank & B) {
+    std::lock_guard<std::mutex> lk(s->tk_mtx);
+    if (B.tk.empty()) {
+        return;
+    }
+    if (B.tk_rec && B.ev_tk) {
+        ggml_backend_event_synchronize(B.ev_tk);
+    } else if (s->copy) {
+        ggml_backend_synchronize(s->copy); // no event: everything queued so far
+    }
+    pfs_bank_drop_tk_locked(s, B);
+}
+
+// [TAG_FN_L22_PIN] R-REV-3: the tickets of every bank whose copies have landed go back now (no wait): the OOM hook, the
+// watcher and the valve can unpin those ranges while the banks stay lent (KEEPLEND, ENDOVERLAP) or wait for a layer
+void pfs_release_landed(pfs_state * s) {
+    if (s->ev_done == nullptr || s->tk_banks.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(s->tk_mtx);
+    for (auto & B : s->banks) {
+        if (!B.tk.empty() && B.tk_rec && B.ev_tk && s->ev_done(B.ev_tk)) {
+            pfs_bank_drop_tk_locked(s, B);
+        }
+    }
 }
 
 std::mutex  g_pfs_init;
@@ -455,7 +481,6 @@ void pfs_run(pfs_state * s) {
     std::vector<const void *>                d2d_src;
     std::vector<size_t>                      d2d_len;
     // [TAG_FN_L22_PIN] [TAG_FN_L22_SSDTIER]
-    std::vector<std::pair<size_t, size_t>>   rr_pin;
     std::vector<std::pair<size_t, size_t>>   rr_stage;
     std::vector<uint8_t>                     dio;
     std::vector<llama_fn_dio_req>            dio_req;
@@ -468,7 +493,14 @@ void pfs_run(pfs_state * s) {
         bool share = false; // [TAG_FN_L22_CPUSHARE] this job copies its late experts after the layer's plan
         {
             std::unique_lock<std::mutex> lk(s->mtx);
-            s->cv.wait(lk, [&]() { return s->stop || !s->queue.empty(); });
+            auto has_job = [&]() { return s->stop || !s->queue.empty(); };
+            // [TAG_FN_L22_PIN] R-REV-3: while banks hold tickets, look at their copies every 2 ms (only this thread adds
+            // tickets, so none appear while it waits)
+            while (!has_job() && s->ev_done != nullptr && s->tk_banks.load(std::memory_order_relaxed) > 0) {
+                s->cv.wait_for(lk, std::chrono::milliseconds(2), has_job);
+                pfs_release_landed(s);
+            }
+            s->cv.wait(lk, has_job);
             if (s->stop) {
                 return;
             }
@@ -570,7 +602,7 @@ void pfs_run(pfs_state * s) {
                     }
                 }
             }
-            pfs_bank_release_tk(s->copy, B); // [TAG_FN_L22_PIN] the bank's last copies have landed (its layer was used)
+            pfs_bank_release_tk(s, B); // [TAG_FN_L22_PIN] the bank's last copies have landed (its layer was used)
             gen5::ev_wait(s->copy, B.ev_free, s->compute);
             dispatching = true;
             return true;
@@ -727,25 +759,45 @@ void pfs_run(pfs_state * s) {
             }
             if (pin_live) {
                 // [TAG_FN_L22_PIN] split at segment edges: pinned segments straight from their pages (a copy never runs past
-                // a registered range), the rest through the ring
+                // a registered range), the rest through the ring. R-REV-3 / R-REV-4: one query per chunk right before its
+                // copy, with the bank owned (no ticket is held while begin() waits), and the copy reads seg.src (the
+                // registered pages: the mapped model, or the arena copy the ticket protects)
                 const uint8_t * src = (const uint8_t *) L.src[k]->data;
-                rr_pin.clear();
                 rr_stage.clear();
+                auto stage = [&](size_t a, size_t b) {
+                    if (!rr_stage.empty() && rr_stage.back().second == a) {
+                        rr_stage.back().second = b;
+                    } else {
+                        rr_stage.push_back({ a, b });
+                    }
+                };
                 for (const auto & r : ranges) {
-                    for (size_t o = r.first; o < r.second; ) {
+                    for (size_t o = r.first; o < r.second && !cancelled; ) {
+                        const size_t want = std::min(s->chunk, r.second - o);
                         llama_fn_pin_seg seg = {};
-                        if (!llama_fn_pin_query(src + o, r.second - o, &seg) || seg.len == 0 || seg.len > r.second - o) {
-                            rr_stage.push_back({ o, r.second });
+                        if (!llama_fn_pin_query(src + o, want, &seg) || seg.len == 0 || seg.len > want) {
+                            stage(o, r.second);
                             break;
                         }
-                        (seg.pinned ? rr_pin : rr_stage).push_back({ o, o + seg.len });
+                        if (!seg.pinned) {
+                            stage(o, o + seg.len);
+                            o += seg.len;
+                            continue;
+                        }
+                        if (!dispatching) {
+                            llama_fn_pin_release(seg.ticket); // begin() may wait for the bank: query again once it is ours
+                            if (!begin()) {
+                                cancelled = true;
+                            }
+                            continue;
+                        }
+                        dispatch({ -1, (const uint8_t *) seg.src, s->off[k] + o, seg.len });
                         if (seg.ticket >= 0) {
                             job_tk.push_back(seg.ticket);
                         }
                         o += seg.len;
                     }
                 }
-                stream_direct(k, rr_pin);
                 if (!cancelled && !rr_stage.empty()) {
                     if (s->n_chunks > 0) {
                         stream_ring(k, rr_stage);
@@ -936,6 +988,7 @@ void pfs_run(pfs_state * s) {
         // [TAG_FN_L22_PIN] this job's tickets stay with the bank until its copies have landed
         if (!job_tk.empty()) {
             if (dispatching) {
+                std::lock_guard<std::mutex> tl(s->tk_mtx);
                 if (!B.ev_tk) {
                     B.ev_tk = gen5::ev_new(s->dev);
                 }
@@ -945,6 +998,9 @@ void pfs_run(pfs_state * s) {
                 } else {
                     B.tk_rec = false; // released after a synchronize of the copy stream
                 }
+                if (B.tk.empty()) {
+                    s->tk_banks.fetch_add(1, std::memory_order_relaxed);
+                }
                 B.tk.insert(B.tk.end(), job_tk.begin(), job_tk.end());
             } else {
                 for (int32_t t : job_tk) {
@@ -953,6 +1009,7 @@ void pfs_run(pfs_state * s) {
             }
             job_tk.clear();
         }
+        pfs_release_landed(s); // [TAG_FN_L22_PIN] R-REV-3: the other banks' landed copies give their tickets back
 
         {
             std::lock_guard<std::mutex> lk(s->mtx);
@@ -1222,7 +1279,7 @@ void pfs_destroy(pfs_state * s) {
         ggml_backend_synchronize(s->copy);
     }
     for (auto & b : s->banks) {
-        pfs_bank_release_tk(s->copy, b); // [TAG_FN_L22_PIN] every copy has landed
+        pfs_bank_release_tk(s, b); // [TAG_FN_L22_PIN] every copy has landed
     }
     if (s->hidden) {
         llama_moe_hot_lend_hide(s->owner, false); // [TAG_FN_L22_KEEPLEND]
@@ -1392,7 +1449,7 @@ static void pfs_return(pfs_state * s) {
         ggml_backend_synchronize(s->copy); // what it dispatched has landed
     }
     for (auto & B : s->banks) {
-        pfs_bank_release_tk(s->copy, B); // [TAG_FN_L22_PIN]
+        pfs_bank_release_tk(s, B); // [TAG_FN_L22_PIN]
     }
     s->lent = false;
     if (s->hidden) {
@@ -1603,6 +1660,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         // [TAG_FN_L3_HOST_POKE] the device backend's flush, if it has one (it does nothing unless the switch is on)
         if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev)) {
             s->poke = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_poke");
+            s->ev_done = (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_event_done");
             if (gen5::env_flag("LLAMA_PREFILL_STREAM_D2D")) { // [TAG_FN_L14_PFSD2D]
                 s->d2d = (bool (*)(ggml_backend_t, int, void * const *, const void * const *, const size_t *))
                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_d2d_batch_async");
@@ -1724,6 +1782,7 @@ bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t
             llama_moe_hot_lend_hide(s->owner, true);
             s->hidden = true;
         }
+        pfs_release_landed(s); // [TAG_FN_L22_PIN] R-REV-3: the kept banks' landed copies give their tickets back
         std::lock_guard<std::mutex> lk(s->mtx);
         s->sums.keeps++;
         return false;

@@ -9128,6 +9128,27 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 #endif
 }
 
+// [TAG_FN_L22_PIN] R-REV-3: true once the event has completed (non-blocking; false while pending or on an error), for the
+// prefill stream's pin tickets (proc "ggml_backend_fn_event_done")
+static bool ggml_backend_fn_event_done(ggml_backend_event_t event) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED(event);
+    return false;
+#else
+    if (event == nullptr || event->context == nullptr) {
+        return false;
+    }
+    const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
+    if (err == cudaSuccess) {
+        return true;
+    }
+    if (err != cudaErrorNotReady) {
+        (void) cudaGetLastError(); // the release then waits on the event (the error shows there)
+    }
+    return false;
+#endif
+}
+
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
@@ -9467,6 +9488,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_fn_register_host_mapped") == 0) {
         return (void *)ggml_backend_cuda_fn_register_host_mapped;
+    }
+    if (strcmp(name, "ggml_backend_fn_event_done") == 0) { // [TAG_FN_L22_PIN] R-REV-3
+        return (void *)ggml_backend_fn_event_done;
     }
     if (strcmp(name, "ggml_backend_cuda_set_passlog_level") == 0) { // [TAG_FN_L22_PASSLOG] R-REV-11
         return (void *)ggml_backend_cuda_set_passlog_level;

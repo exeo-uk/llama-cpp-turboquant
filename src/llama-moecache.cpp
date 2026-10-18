@@ -1352,7 +1352,8 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
                 }
                 if (ok && seg.pinned && seg.len == sz) {
                     hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
-                    ggml_backend_tensor_set_async(mc->up_backend, dsts[k], p, (size_t) j.slot*dsts[k]->nb[2], sz);
+                    // R-REV-4: seg.src = the registered pages the ticket protects (the arena copy in arena mode)
+                    ggml_backend_tensor_set_async(mc->up_backend, dsts[k], seg.src, (size_t) j.slot*dsts[k]->nb[2], sz);
                     mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
                     mc->l22_pin_b.fetch_add(sz, std::memory_order_relaxed);
                     continue;
@@ -4128,7 +4129,7 @@ size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_th
                 break;
             }
             if (seg.pinned) {
-                ggml_backend_tensor_set_async(mc->up_backend, j.dst, p, j.off + o, seg.len);
+                ggml_backend_tensor_set_async(mc->up_backend, j.dst, seg.src, j.off + o, seg.len); // R-REV-4: the registered pages
                 pinned += seg.len;
             } else {
                 rest.push_back({ j.dst, j.off + o, p, seg.len });
