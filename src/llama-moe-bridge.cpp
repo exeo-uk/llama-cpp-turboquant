@@ -1992,10 +1992,10 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         ggml_cpu_moe_pool_stats ps;
         br->pool_get_stats(br->pool, &ps, false);
         LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L22_PRETOUCH] %" PRIu64 " experts queued (%" PRIu64 " dropped), %" PRIu64 " touched, "
-                "%.0f pages and %.1f us each, %.2f process faults each while touching; [TAG_FN_L22_JOBPF] %" PRIu64 " read-ahead "
+                "%.0f pages and %.1f us each, %.2f process faults each while touching; [TAG_FN_L22_JOBPF] %" PRIu64 " experts in %" PRIu64 " read-ahead "
                 "requests, %.1f ranges / %.2f MiB / %.1f us each, %" PRIu64 " refused\n", __func__, br->bid, ps.pt_queued, ps.pt_dropped,
                 ps.pt_experts, ps.pt_experts ? (double) ps.pt_pages/ps.pt_experts : 0.0, ps.pt_experts ? 1e3*ps.pt_ms/ps.pt_experts : 0.0,
-                ps.pt_experts ? (double) ps.pt_faults/ps.pt_experts : 0.0, ps.jpf_calls,
+                ps.pt_experts ? (double) ps.pt_faults/ps.pt_experts : 0.0, ps.jpf_queued, ps.jpf_calls,
                 ps.jpf_calls ? (double) ps.jpf_ranges/ps.jpf_calls : 0.0, ps.jpf_calls ? ps.jpf_mib/ps.jpf_calls : 0.0,
                 ps.jpf_calls ? 1e3*ps.jpf_ms/ps.jpf_calls : 0.0, ps.jpf_fail);
     }

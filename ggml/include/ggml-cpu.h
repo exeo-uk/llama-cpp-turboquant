@@ -227,9 +227,9 @@ extern "C" {
                                              // cold experts the next jobs compute (a given prefetch list, a posted job's later
                                              // experts) that no job of their layer read within the last 64 jobs. Reads only.
         int  pretouch_cpu1;                  // [TAG_FN_L22_PRETOUCH] 1 + the helper's CPU (0: an SMT sibling of a worker's core)
-        int  jobpf;                          // [TAG_FN_L22_JOBPF] 0; 1: before a job, one read-ahead request (Windows:
-                                             // PrefetchVirtualMemory) over its cold experts that no job of the layer read within
-                                             // the last 64 jobs; 2: over all its cold experts. Same values.
+        int  jobpf;                          // [TAG_FN_L22_JOBPF] 0; 1: at a job's post, a helper thread sends one read-ahead
+                                             // request (Windows: PrefetchVirtualMemory) over its cold experts that no job of the
+                                             // layer read within the last 64 jobs; 2: over all its cold experts. Same values.
         int   tail_rank;                     // [TAG_FN_L22_X_TAILSKIP] the rule of the sync op (GGML_OP_MOE_HOST_SUM) of a graph
         float tail_w;                        // that carries GGML_MOE_BRIDGE_JOB_TAIL, set process-wide at the pool's creation
                                              // (one bridge per process): the same as a bridged job's tail_rank / tail_w
@@ -337,7 +337,8 @@ extern "C" {
         uint64_t pt_pages;        // pages it touched
         uint64_t pt_faults;       // process page faults (all threads) while it touched
         double   pt_ms;           // its time touching
-        uint64_t jpf_calls;       // read-ahead requests before jobs
+        uint64_t jpf_queued;      // experts queued for a read-ahead request
+        uint64_t jpf_calls;       // read-ahead requests the helper sent
         uint64_t jpf_ranges;      // (expert, tensor) ranges in them
         uint64_t jpf_fail;        // requests the OS refused
         double   jpf_mib;         // bytes asked for

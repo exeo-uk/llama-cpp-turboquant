@@ -10,12 +10,14 @@
 #include "ggml-moe-bridge.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 static int g_fail   = 0;
@@ -215,14 +217,22 @@ std::vector<float> run_pool(const weights & W, const routing & r, const int32_t 
     TCHECK(ggml_cpu_moe_run(pool, &job) == GGML_STATUS_SUCCESS, "run 2");
     TCHECK(memcmp(out.data(), out2.data(), out.size()*sizeof(float)) == 0, "second job differs");
     if (cfg.pretouch || cfg.jobpf > 0) {
+        // the helper works asynchronously: wait (bounded) until it handled the first job's entries
         ggml_cpu_moe_pool_stats st;
-        ggml_cpu_moe_pool_get_stats(pool, &st, false);
+        for (int k = 0; k < 400; ++k) {
+            ggml_cpu_moe_pool_get_stats(pool, &st, false);
+            if ((cfg.jobpf == 0 || st.jpf_calls >= 1) && (!cfg.pretouch || st.pt_experts >= 1)) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         if (cfg.jobpf > 0) { // the weights here are heap memory: the OS may refuse the read-ahead, the job must not care
-            TCHECK(st.jpf_calls >= 1 && st.jpf_ranges >= 3*st.jpf_calls, "jobpf calls %llu ranges %llu", (unsigned long long) st.jpf_calls,
-                    (unsigned long long) st.jpf_ranges);
+            TCHECK(st.jpf_queued >= 1 && st.jpf_calls >= 1 && st.jpf_ranges >= 3*st.jpf_calls, "jobpf queued %llu calls %llu ranges %llu",
+                    (unsigned long long) st.jpf_queued, (unsigned long long) st.jpf_calls, (unsigned long long) st.jpf_ranges);
         }
         if (cfg.pretouch) {
-            TCHECK(st.pt_queued >= 1, "pretouch queued %llu", (unsigned long long) st.pt_queued);
+            TCHECK(st.pt_queued >= 1 && st.pt_experts >= 1 && st.pt_pages >= 3*st.pt_experts, "pretouch queued %llu touched %llu pages %llu",
+                    (unsigned long long) st.pt_queued, (unsigned long long) st.pt_experts, (unsigned long long) st.pt_pages);
         }
     }
     ggml_cpu_moe_pool_free(pool);

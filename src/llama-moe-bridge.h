@@ -91,8 +91,9 @@
 //                                         an SMT sibling of a worker's core) reads one byte per page of the cold experts the
 //                                         next jobs compute (the device's prediction for the next layer, a posted job's later
 //                                         experts) that no job of their layer read within the last 64 jobs
-//   LLAMA_MOE_POOL_JOBPF=1|2              [TAG_FN_L22_JOBPF] one read-ahead request (PrefetchVirtualMemory) before each job:
-//                                         1 its cold experts no job of the layer read within the last 64 jobs, 2 all of them
+//   LLAMA_MOE_POOL_JOBPF=1|2              [TAG_FN_L22_JOBPF] one read-ahead request (PrefetchVirtualMemory) per job, sent by a
+//                                         helper thread at the post (no system call on the job's path): 1 its cold experts no
+//                                         job of the layer read within the last 64 jobs, 2 all of them
 //   LLAMA_FN_L22_X_STATS=1                [TAG_FN_L22_X_STATS] per job: the cold experts, and how many of them (and how much
 //                                         routing weight) the rank rule (R = 6..9) and the weight rule (< 0.05, < 0.1) would
 //                                         drop; one line per 4096 jobs and when the executor goes idle. Counters only
