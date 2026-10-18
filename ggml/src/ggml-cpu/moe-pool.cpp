@@ -30,6 +30,7 @@
 #else
 #    include <pthread.h>
 #    include <sched.h>
+#    include <sys/mman.h> // [TAG_FN_L22_JOBPF] madvise
 #    include <unistd.h>
 #endif
 
@@ -38,6 +39,14 @@
 #endif
 
 #define GGML_MOE_POOL_MAX_RANK 64 // [TAG_FN_L6_PF]
+#define GGML_MOE_POOL_L22_FRESH 64 // [TAG_FN_L22_JOBPF] [TAG_FN_L22_PRETOUCH] an expert a job of its layer read within this many
+                                   // jobs of that layer counts as resident
+
+// [TAG_FN_L22_JOBPF] the layout of WIN32_MEMORY_RANGE_ENTRY (memoryapi.h hides it below _WIN32_WINNT 0x0602)
+struct moe_mem_range {
+    void * addr;
+    size_t len;
+};
 
 namespace {
 
@@ -462,6 +471,48 @@ struct ggml_cpu_moe_pool {
 #if defined(_WIN32)
     std::vector<HANDLE>     where_th;          // per worker (0: the caller), for GetThreadTimes
 #endif
+
+    // [TAG_FN_L22_POOL_STAGGER] the G of split >= 1 jobs and their prefetches (0: off)
+    int                     stagger = 0;
+    // [TAG_FN_L22_JOBPF] [TAG_FN_L22_PRETOUCH] per layer (up tensor): its jobs so far and the job number of each expert's last
+    // CPU job (0: never); the caller thread only. A job's cold experts (this job) and whether they are stale (> 64 jobs)
+    int                     jobpf    = 0;
+    bool                    l22_track = false;
+    struct l22_layer {
+        uint32_t              clk = 0;
+        std::vector<uint32_t> last;
+    };
+    std::unordered_map<const ggml_tensor *, l22_layer> l22_seen;
+    std::vector<int32_t>    l22_cold;
+    std::vector<uint8_t>    l22_stale;
+    std::vector<moe_mem_range> jpf_ranges_buf;
+    std::atomic<uint64_t>   jpf_calls{0};
+    std::atomic<uint64_t>   jpf_ranges{0};
+    std::atomic<uint64_t>   jpf_bytes{0};
+    std::atomic<uint64_t>   jpf_ticks{0};
+    std::atomic<uint64_t>   jpf_fail{0};
+    // [TAG_FN_L22_PRETOUCH] the helper thread and its ring (one producer: the caller thread; one consumer: the helper)
+    bool                    pretouch = false;
+    int                     pt_cpu   = -1;
+    std::thread             pt_thread;
+    struct pt_entry {
+        const ggml_tensor * t[3];               // gate, up, down
+        int32_t             e;
+    };
+    static constexpr uint32_t PT_RING = 256;
+    pt_entry                pt_ring[PT_RING];
+    alignas(64) std::atomic<uint32_t> pt_head{0};
+    alignas(64) std::atomic<uint32_t> pt_tail{0};
+    std::atomic<bool>       pt_sleeping{false};
+    std::atomic<bool>       pt_stop{false};
+    std::mutex              pt_mtx;
+    std::condition_variable pt_cv;
+    std::atomic<uint64_t>   pt_queued{0};
+    std::atomic<uint64_t>   pt_dropped{0};
+    std::atomic<uint64_t>   pt_experts{0};
+    std::atomic<uint64_t>   pt_pages{0};
+    std::atomic<uint64_t>   pt_ticks{0};
+    std::atomic<uint64_t>   pt_faults{0};
 };
 
 // [TAG_FN_L22_POOLDIAG]
@@ -667,7 +718,7 @@ static void moe_pool_prefetch_pull(ggml_cpu_moe_pool * p, int ith, moe_pf_rec * 
     if (p->split >= GGML_CPU_MOE_SPLIT_STABLE && c_nth >= 2) { // as ggml_cpu_moe_run: one compute thread splits by range
         uint8_t * done = rec && p->pf_done_n_exp == n_exp ? p->pf_done.data() + (size_t) c_ith*n_exp : nullptr;
         b = ggml_fn_moe_prefetch_stable(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, c_ith, c_nth, &p->pf_stop,
-                J.mode, done, p->pf_streams, p->pf_pull);
+                J.mode, done, p->pf_streams, p->pf_pull | (p->stagger << GGML_FN_PF_STAGGER_SHIFT)); // [TAG_FN_L22_POOL_STAGGER]
     } else {
         b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), p->pf_n, c_ith, c_nth, &p->pf_stop, J.mode);
     }
@@ -920,6 +971,176 @@ static void moe_pool_worker(ggml_cpu_moe_pool * p, int ith) {
     }
 }
 
+// ---- [TAG_FN_L22_JOBPF] [TAG_FN_L22_PRETOUCH] ----------------------------------------------------------------------------
+
+// the caller, before a job: the job's cold experts (the table's misses, each once) into l22_cold, and in l22_stale whether no
+// job of the layer read them within the last GGML_MOE_POOL_L22_FRESH jobs of that layer; then they count as read by this job
+static void moe_pool_l22_mark(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, const int32_t * ids, int n) {
+    const int64_t n_exp = l->up->ne[2];
+    ggml_cpu_moe_pool::l22_layer & ly = p->l22_seen[l->up];
+    if (ly.last.size() != (size_t) n_exp) {
+        ly.last.assign((size_t) n_exp, 0);
+    }
+    if (++ly.clk == 0) { // 2^32 jobs of one layer: start over (0 means never)
+        std::fill(ly.last.begin(), ly.last.end(), 0);
+        ly.clk = 1;
+    }
+    const uint32_t clk = ly.clk;
+    p->l22_cold.clear();
+    p->l22_stale.clear();
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_exp || (l->table != nullptr && l->table[e] != l->table_miss) || ly.last[e] == clk) {
+            continue;
+        }
+        const uint32_t prev = ly.last[e];
+        ly.last[e] = clk;
+        p->l22_cold.push_back(e);
+        p->l22_stale.push_back(prev == 0 || clk - prev > GGML_MOE_POOL_L22_FRESH ? 1 : 0);
+    }
+}
+
+// true if no job of layer l read expert e within the last GGML_MOE_POOL_L22_FRESH jobs (as of its next job)
+static bool moe_pool_l22_stale(const ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, int32_t e) {
+    const auto it = p->l22_seen.find(l->up);
+    if (it == p->l22_seen.end() || e < 0 || (size_t) e >= it->second.last.size()) {
+        return true;
+    }
+    const uint32_t prev = it->second.last[e];
+    return prev == 0 || it->second.clk - prev >= GGML_MOE_POOL_L22_FRESH;
+}
+
+// [TAG_FN_L22_JOBPF] one read-ahead request for the gate, up and down slices of the job's stale cold experts (jobpf 1) or of
+// all its cold experts (jobpf 2): the memory manager reads each range once, instead of the job's threads faulting the same
+// pages at the same time. Asynchronous; values are never touched
+static void moe_pool_jobpf(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l) {
+    const ggml_tensor * ts[3] = { l->gate, l->up, l->down };
+    std::vector<moe_mem_range> & rs = p->jpf_ranges_buf;
+    rs.clear();
+    size_t bytes = 0;
+    for (size_t i = 0; i < p->l22_cold.size(); ++i) {
+        if (p->jobpf < 2 && !p->l22_stale[i]) {
+            continue;
+        }
+        const int32_t e = p->l22_cold[i];
+        for (const ggml_tensor * t : ts) {
+            moe_mem_range r;
+            r.addr = (char *) t->data + (size_t) e*t->nb[2];
+            r.len  = t->nb[2];
+            rs.push_back(r);
+            bytes += r.len;
+        }
+    }
+    if (rs.empty()) {
+        return;
+    }
+    const uint64_t t0 = ggml_fn_moe_tick();
+    bool ok = true;
+#if defined(_WIN32)
+    using pvm_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, void *, ULONG);
+    static const pvm_t pvm = (pvm_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    ok = pvm != nullptr && pvm(GetCurrentProcess(), (ULONG_PTR) rs.size(), rs.data(), 0) != 0;
+#elif defined(__linux__) || defined(__APPLE__)
+    static const uintptr_t pg = (uintptr_t) std::max(4096L, sysconf(_SC_PAGESIZE));
+    for (const moe_mem_range & r : rs) {
+        const uintptr_t a0 = (uintptr_t) r.addr & ~(pg - 1);
+        ok = madvise((void *) a0, (size_t) ((uintptr_t) r.addr + r.len - a0), MADV_WILLNEED) == 0 && ok;
+    }
+#else
+    ok = false;
+#endif
+    p->jpf_ticks.fetch_add(ggml_fn_moe_tick() - t0, std::memory_order_relaxed);
+    p->jpf_calls.fetch_add(1, std::memory_order_relaxed);
+    p->jpf_ranges.fetch_add((uint64_t) rs.size(), std::memory_order_relaxed);
+    p->jpf_bytes.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+    p->jpf_fail.fetch_add(ok ? 0 : 1, std::memory_order_relaxed);
+}
+
+// [TAG_FN_L22_PRETOUCH] the caller (the only producer): queue an expert for the helper; a full ring drops it
+static void moe_pool_pt_push(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, int32_t e) {
+    const uint32_t h = p->pt_head.load(std::memory_order_relaxed);
+    if (h - p->pt_tail.load(std::memory_order_acquire) >= ggml_cpu_moe_pool::PT_RING) {
+        p->pt_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ggml_cpu_moe_pool::pt_entry & en = p->pt_ring[h % ggml_cpu_moe_pool::PT_RING];
+    en.t[0] = l->gate;
+    en.t[1] = l->up;
+    en.t[2] = l->down;
+    en.e    = e;
+    p->pt_head.store(h + 1, std::memory_order_seq_cst);
+    p->pt_queued.fetch_add(1, std::memory_order_relaxed);
+}
+
+// after pushes: wake the helper if it sleeps (it sets pt_sleeping under the mutex before it tests the ring, so it either
+// sees the new head or gets this notify)
+static void moe_pool_pt_kick(ggml_cpu_moe_pool * p) {
+    if (p->pt_sleeping.load(std::memory_order_seq_cst)) {
+        {
+            std::lock_guard<std::mutex> lk(p->pt_mtx);
+        }
+        p->pt_cv.notify_one();
+    }
+}
+
+static volatile uint32_t moe_pt_sink = 0;
+
+// the helper: one byte per 4 KiB page of each queued expert's gate, up and down slices, one expert after the other, so at
+// most this thread faults in a range at a time and the job's threads find the pages in the working set. Reads only.
+static void moe_pool_pt_main(ggml_cpu_moe_pool * p) {
+    if (p->pt_cpu >= 0) {
+        pin_current_thread(p->pt_cpu);
+    }
+    for (;;) {
+        const uint32_t t = p->pt_tail.load(std::memory_order_relaxed);
+        if (t == p->pt_head.load(std::memory_order_acquire)) {
+            bool got = false;
+            for (int k = 0; k < 4096 && !got; ++k) { // a short spin: the next job's experts usually come within it
+                moe_pool_relax();
+                got = t != p->pt_head.load(std::memory_order_acquire) || p->pt_stop.load(std::memory_order_relaxed);
+            }
+            if (!got) {
+                std::unique_lock<std::mutex> lk(p->pt_mtx);
+                p->pt_sleeping.store(true, std::memory_order_seq_cst);
+                p->pt_cv.wait(lk, [&] {
+                    return p->pt_head.load(std::memory_order_seq_cst) != t || p->pt_stop.load(std::memory_order_seq_cst);
+                });
+                p->pt_sleeping.store(false, std::memory_order_relaxed);
+            }
+            if (p->pt_stop.load(std::memory_order_acquire)) {
+                break;
+            }
+            continue;
+        }
+        if (p->pt_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+        const ggml_cpu_moe_pool::pt_entry en = p->pt_ring[t % ggml_cpu_moe_pool::PT_RING];
+        p->pt_tail.store(t + 1, std::memory_order_release);
+        const uint64_t t0 = ggml_fn_moe_tick();
+        const uint64_t f0 = moe_proc_faults();
+        uint64_t pages = 0;
+        uint32_t sum   = 0;
+        for (int i = 0; i < 3; ++i) {
+            const ggml_tensor * w = en.t[i];
+            const char * b   = (const char *) w->data + (size_t) en.e*w->nb[2];
+            const char * end = b + w->nb[2];
+            sum += *(const volatile uint8_t *) b;
+            pages++;
+            for (const char * q = (const char *) (((uintptr_t) b & ~(uintptr_t) 4095) + 4096); q < end; q += 4096) {
+                sum += *(const volatile uint8_t *) q;
+                pages++;
+            }
+        }
+        moe_pt_sink = moe_pt_sink + sum;
+        const uint64_t f1 = moe_proc_faults();
+        p->pt_ticks.fetch_add(ggml_fn_moe_tick() - t0, std::memory_order_relaxed);
+        p->pt_faults.fetch_add(f1 > f0 ? f1 - f0 : 0, std::memory_order_relaxed);
+        p->pt_pages.fetch_add(pages, std::memory_order_relaxed);
+        p->pt_experts.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 struct ggml_cpu_moe_pool_params ggml_cpu_moe_pool_params_default(int n_threads) {
     struct ggml_cpu_moe_pool_params p;
     memset(&p, 0, sizeof(p));
@@ -954,6 +1175,13 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     p->pf_pull   = pp->pf_pull & (GGML_FN_PF_FINE_STOP | GGML_FN_PF_VEC);
     p->pf_cap    = std::max(0, pp->pf_cap);
     p->pf_fresh  = std::max(0, pp->pf_fresh);
+    p->stagger   = std::min(std::max(pp->stagger, 0), 16);   // [TAG_FN_L22_POOL_STAGGER]
+    p->jobpf     = std::min(std::max(pp->jobpf, 0), 2);      // [TAG_FN_L22_JOBPF]
+    p->pretouch  = pp->pretouch;                             // [TAG_FN_L22_PRETOUCH]
+    p->l22_track = p->jobpf > 0 || p->pretouch;
+    if (pp->tail_rank > 0 || pp->tail_w > 0.0f) {
+        ggml_fn_moe_tail_set(pp->tail_rank, pp->tail_w);     // [TAG_FN_L22_X_TAILSKIP] the sync op's rule
+    }
 
     std::vector<int> list;
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
@@ -1016,7 +1244,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
             GGML_LOG_INFO("%s: [TAG_FN_L22_POOLDIAG] the pool's waits dump every thread's position after 200 ms\n", __func__);
         }
     }
-    if (p->stats || p->where_on) {
+    if (p->stats || p->where_on || p->l22_track) {
         const auto     t0 = std::chrono::steady_clock::now();
         const uint64_t k0 = ggml_fn_moe_tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -1044,12 +1272,44 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
     for (int k = 1; k < p->n_threads; k++) {
         p->workers.emplace_back(moe_pool_worker, p, k);
     }
+    if (p->pretouch) { // [TAG_FN_L22_PRETOUCH] its CPU: the given one, else an SMT sibling of a worker's core (the last first)
+        int c1 = pp->pretouch_cpu1 > 0 && pp->pretouch_cpu1 <= GGML_MAX_N_THREADS ? pp->pretouch_cpu1 - 1 : -1;
+        for (int k = p->n_threads - 1; k >= 0 && c1 < 0; --k) {
+            const int      c = p->cpus[k];
+            const uint64_t m = c >= 0 ? core_mask_of(c) : 0;
+            for (int b = 0; b < 64 && c1 < 0; ++b) {
+                if (((m >> b) & 1) && b != c && std::find(p->cpus.begin(), p->cpus.end(), b) == p->cpus.end()) {
+                    c1 = b;
+                }
+            }
+        }
+        p->pt_cpu    = c1;
+        p->pt_thread = std::thread(moe_pool_pt_main, p);
+        GGML_LOG_INFO("%s: [TAG_FN_L22_PRETOUCH] a helper thread (CPU %d) reads one byte per page of the cold experts the next "
+                "jobs compute that no job of their layer read within the last %d jobs\n", __func__, c1, GGML_MOE_POOL_L22_FRESH);
+    }
+    if (p->stagger > 0) {
+        GGML_LOG_INFO("%s: [TAG_FN_L22_POOL_STAGGER] split %d jobs: thread i walks its experts from position (i %% %d)*n/%d on\n",
+                __func__, p->split, p->stagger, p->stagger);
+    }
+    if (p->jobpf > 0) {
+        GGML_LOG_INFO("%s: [TAG_FN_L22_JOBPF] a read-ahead request before each job for %s\n", __func__,
+                p->jobpf >= 2 ? "all its cold experts" : "its cold experts no job of the layer read within the last 64 jobs");
+    }
     return p;
 }
 
 void ggml_cpu_moe_pool_free(struct ggml_cpu_moe_pool * p) {
     if (p == nullptr) {
         return;
+    }
+    if (p->pt_thread.joinable()) { // [TAG_FN_L22_PRETOUCH] it reads the weights: gone before anything else
+        p->pt_stop.store(true, std::memory_order_seq_cst);
+        {
+            std::lock_guard<std::mutex> lk(p->pt_mtx);
+        }
+        p->pt_cv.notify_all();
+        p->pt_thread.join();
     }
     moe_pool_prefetch_finish(p); // [TAG_FN_R2_BRIDGE_PF]
     p->stop.store(true, std::memory_order_seq_cst);
@@ -1226,6 +1486,11 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         a.out_nb2 = (size_t) n_embd*n_used*sizeof(float);
     }
     a.wdata = p->work.data();
+    // [TAG_FN_L22_X_TAILSKIP] [TAG_FN_L22_X_DEFER] the job's opt-in rules (zero = today)
+    a.tail_rank = job->tail_rank;
+    a.tail_w    = job->tail_w;
+    a.defer_w   = job->defer_w;
+    a.l22_flags = job->l22_flags;
 
     const bool solo = p->solo && p->n_threads >= 2; // [TAG_FN_R2_BRIDGE_PF]
     const int  nth  = solo ? p->n_threads - 1 : p->n_threads;
@@ -1240,6 +1505,7 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
     // predicted this layer
     a.split = nth >= 2 ? p->split : GGML_CPU_MOE_SPLIT_RANGE;
     a.swpf  = p->swpf; // [TAG_FN_L3_CPU_SWPF]
+    a.stagger = a.split >= GGML_CPU_MOE_SPLIT_STABLE ? p->stagger : 0; // [TAG_FN_L22_POOL_STAGGER]
     if (a.split >= GGML_CPU_MOE_SPLIT_STEAL) {
         const size_t words = (size_t) GGML_FN_MOE_CLAIM_WORDS(n_used*T, ggml_fn_moe_np_max(l->up, l->down), nth);
         if (p->claim.size() < words) {
@@ -1307,6 +1573,13 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         moe_pool_stats_flush(p); // usually done already, after the last job (ggml_cpu_moe_prefetch)
     }
 
+    if (p->l22_track) { // [TAG_FN_L22_JOBPF] [TAG_FN_L22_PRETOUCH] the job's cold experts; the read-ahead before the post
+        moe_pool_l22_mark(p, l, job->ids, n_used*T);
+        if (p->jobpf > 0) {
+            moe_pool_jobpf(p, l);
+        }
+    }
+
     const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
     if (p->where) { // [TAG_FN_L22_POOLDIAG]
         p->where_t_post = ggml_fn_moe_tick();
@@ -1322,6 +1595,25 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
             std::lock_guard<std::mutex> lk(p->mtx);
         }
         p->cv.notify_all();
+    }
+
+    if (p->pretouch && !p->l22_cold.empty()) {
+        // [TAG_FN_L22_PRETOUCH] the job's stale cold experts, the highest id first: a job walks the predicted experts, then the
+        // rest by id, and the workers start at the front
+        int32_t buf[64];
+        int nb = 0;
+        for (size_t i = 0; i < p->l22_cold.size() && nb < 64; ++i) {
+            if (p->l22_stale[i]) {
+                buf[nb++] = p->l22_cold[i];
+            }
+        }
+        std::sort(buf, buf + nb, [](int32_t x, int32_t y) { return x > y; });
+        for (int i = 0; i < nb; ++i) {
+            moe_pool_pt_push(p, l, buf[i]);
+        }
+        if (nb > 0) {
+            moe_pool_pt_kick(p);
+        }
     }
 
     if (!solo) {
@@ -1421,6 +1713,18 @@ enum ggml_status ggml_cpu_moe_prefetch(struct ggml_cpu_moe_pool * p, const struc
         }
         if (p->pf_cap > 0 && p->pf_n > p->pf_cap) {
             p->pf_n = p->pf_cap; // [TAG_FN_L6_PF]
+        }
+        if (p->pretouch) { // [TAG_FN_L22_PRETOUCH] the predicted cold experts of the next layer no recent job read, by rank
+            int nq = 0;
+            for (int i = 0; i < p->pf_n; ++i) {
+                if (moe_pool_l22_stale(p, l, p->pf_list[i])) {
+                    moe_pool_pt_push(p, l, p->pf_list[i]);
+                    nq++;
+                }
+            }
+            if (nq > 0) {
+                moe_pool_pt_kick(p);
+            }
         }
         p->pf_experts.fetch_add((uint64_t) p->pf_n, std::memory_order_relaxed);
         if (p->pf_fix) {
@@ -1600,7 +1904,7 @@ size_t ggml_cpu_moe_prefetch_caller(struct ggml_cpu_moe_pool * p, const volatile
         if (p->pf_fix && p->split >= GGML_CPU_MOE_SPLIT_STABLE) {
             // [TAG_FN_L4_MEM_PFDEV] the pieces compute thread 0 owns in a split >= 1 job, as the workers' pull takes theirs
             b = ggml_fn_moe_prefetch_stable(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode,
-                    nullptr, p->pf_streams, p->pf_pull);
+                    nullptr, p->pf_streams, p->pf_pull | (p->stagger << GGML_FN_PF_STAGGER_SHIFT)); // [TAG_FN_L22_POOL_STAGGER]
         } else {
             b = ggml_fn_moe_prefetch(L->up, L->gate, L->down, p->pf_list.data(), n, 0, p->n_threads, stop, p->pf.mode);
         }
@@ -1643,6 +1947,20 @@ void ggml_cpu_moe_prefetch_stats(struct ggml_cpu_moe_pool * p, uint64_t * jobs, 
 void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_moe_pool_stats * out, bool reset) {
     if (out) {
         memset(out, 0, sizeof(*out));
+    }
+    if (out && p != nullptr) { // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] totals, with or without params.stats
+        const double tpm = p->tick_per_us*1000.0;
+        out->pt_queued  = p->pt_queued.load();
+        out->pt_dropped = p->pt_dropped.load();
+        out->pt_experts = p->pt_experts.load();
+        out->pt_pages   = p->pt_pages.load();
+        out->pt_faults  = p->pt_faults.load();
+        out->pt_ms      = (double) p->pt_ticks.load()/tpm;
+        out->jpf_calls  = p->jpf_calls.load();
+        out->jpf_ranges = p->jpf_ranges.load();
+        out->jpf_fail   = p->jpf_fail.load();
+        out->jpf_mib    = (double) p->jpf_bytes.load()/1048576.0;
+        out->jpf_ms     = (double) p->jpf_ticks.load()/tpm;
     }
     if (p == nullptr || !p->stats) {
         return;

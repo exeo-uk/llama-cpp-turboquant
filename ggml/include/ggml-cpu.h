@@ -220,6 +220,19 @@ extern "C" {
                                              // DRAM traffic beside the device's host accesses at the end of the window)
         bool pin_core;                       // [TAG_FN_L18_FIRSTANS_PIN] a worker may run on every logical CPU of its CPU's
                                              // core (ideal CPU: its own), not only on that one CPU
+        int  stagger;                        // [TAG_FN_L22_POOL_STAGGER] 0, or G (<= 16): in a split >= 1 job thread i walks its
+                                             // experts from act position (i % G)*n/G on, and its prefetch pulls the list from
+                                             // the same share on (at most ~n_threads/G threads in one expert). Same values.
+        bool pretouch;                       // [TAG_FN_L22_PRETOUCH] one helper thread reads one byte per 4 KiB page of the
+                                             // cold experts the next jobs compute (a given prefetch list, a posted job's later
+                                             // experts) that no job of their layer read within the last 64 jobs. Reads only.
+        int  pretouch_cpu1;                  // [TAG_FN_L22_PRETOUCH] 1 + the helper's CPU (0: an SMT sibling of a worker's core)
+        int  jobpf;                          // [TAG_FN_L22_JOBPF] 0; 1: before a job, one read-ahead request (Windows:
+                                             // PrefetchVirtualMemory) over its cold experts that no job of the layer read within
+                                             // the last 64 jobs; 2: over all its cold experts. Same values.
+        int   tail_rank;                     // [TAG_FN_L22_X_TAILSKIP] the rule of the sync op (GGML_OP_MOE_HOST_SUM) of a graph
+        float tail_w;                        // that carries GGML_MOE_BRIDGE_JOB_TAIL, set process-wide at the pool's creation
+                                             // (one bridge per process): the same as a bridged job's tail_rank / tail_w
     };
 
     // [TAG_FN_L3_CPU_SPLIT] how a pool job gives its pieces (32 gate / up rows or 64 down rows of one expert) to the threads.
@@ -317,6 +330,18 @@ extern "C" {
         int      thr_cpu[GGML_CPU_MOE_STATS_MAX_THR];     // its CPU (-1: not pinned)
         double   thr_busy_us[GGML_CPU_MOE_STATS_MAX_THR]; // its gate / up + down time per job (0: it computed nothing)
         double   thr_gbs[GGML_CPU_MOE_STATS_MAX_THR];     // its weight bytes / that time
+        // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] totals since the pool was made (filled without params.stats too)
+        uint64_t pt_queued;       // experts queued for the pre-touch helper
+        uint64_t pt_dropped;      // ... dropped (its ring was full)
+        uint64_t pt_experts;      // experts it touched
+        uint64_t pt_pages;        // pages it touched
+        uint64_t pt_faults;       // process page faults (all threads) while it touched
+        double   pt_ms;           // its time touching
+        uint64_t jpf_calls;       // read-ahead requests before jobs
+        uint64_t jpf_ranges;      // (expert, tensor) ranges in them
+        uint64_t jpf_fail;        // requests the OS refused
+        double   jpf_mib;         // bytes asked for
+        double   jpf_ms;          // the caller's time in them
     };
     // copies the means into st (NULL: only reset) and, if reset, starts a new window. Zeros without params.stats.
     GGML_BACKEND_API void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * pool, struct ggml_cpu_moe_pool_stats * st, bool reset);
