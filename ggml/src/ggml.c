@@ -5866,6 +5866,22 @@ void ggml_flash_attn_ext_set_turbot(
     a->src[8] = gtab;
 }
 
+// [TAG_UPSTREAM_29510]
+void ggml_flash_attn_ext_set_kv_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_rows) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!kv_rows) {
+        a->src[9] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[5] != NULL && a->src[3] == NULL && "kv_rows: the list needs the positional mask");
+    GGML_ASSERT(kv_rows->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_rows));
+    GGML_ASSERT(kv_rows->ne[0] > 0 && kv_rows->ne[1] == 1 && kv_rows->ne[2] == 1 && kv_rows->ne[3] == 1);
+    GGML_ASSERT(a->src[0]->ne[3] == 1 && a->src[1]->ne[3] == 1 && a->src[2]->ne[3] == 1);
+    a->src[9] = kv_rows;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

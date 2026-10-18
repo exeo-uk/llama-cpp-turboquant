@@ -2637,6 +2637,14 @@ extern "C" {
             struct ggml_tensor                 * gtab,
             const struct ggml_turbot_op_params * params);
 
+    // [TAG_UPSTREAM_29510] optional list of the K/V cells the queries need: kv_rows I32 [n_rows], contiguous, cell
+    // indices < K->ne[1], -1 = padding. Sets src[9]. Needs the positional mask (ggml_flash_attn_ext_set_pos) and no
+    // explicit mask. The mask still decides what a query sees, so a backend may ignore the list (same result); the
+    // CUDA turbot FA reads only the listed cells. NULL removes the list.
+    GGML_API void ggml_flash_attn_ext_set_kv_rows(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_rows);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
