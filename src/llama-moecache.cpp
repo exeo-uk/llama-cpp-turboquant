@@ -5324,6 +5324,12 @@ size_t llama_moe_hot_cbuf_release2(const void * owner, size_t need_hide, size_t 
     for (layer_state * ls : newly) {
         hot_write_tables(mc, *ls);
     }
+    // the drain published the worker's last batch into the host tables: the device tables follow now, so a narrow graph
+    // of this FULL period (the tail, a window) never sees a host table that skips what the device table misses
+    if (mc->tbl_dirty && mc->tbl_all) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
     size_t bytes = 0;
     if (prev > a_u) {
         if (!mc->cb_unmap(mc->cb_buf, a_u, prev - a_u)) {
@@ -5358,6 +5364,12 @@ void llama_moe_hot_lend_hide(const void * owner, bool hide) {
     }
     std::lock_guard<std::mutex> slk(mc->step_mtx);
     mc->l22_hide = hide;
+    // narrow graphs come next: the host and device tables agree (a drain at the lend may have published into the host
+    // tables only; the owner's graphs are synchronized)
+    if (mc->tbl_dirty && mc->tbl_all) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
     g_hot_gen.fetch_add(1, std::memory_order_acq_rel); // no graph built under the other state is reused
 }
 
