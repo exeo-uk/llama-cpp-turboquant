@@ -159,6 +159,12 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // [TAG_FN_L22_PASSLOG] the request's arrival at the HTTP handler, the start of the completion handler (after the chat
+    // template) and the end of the tokenization (the pictures decoded); 0 = not known
+    int64_t l22_t_req_us  = 0;
+    int64_t l22_t_tmpl_us = 0;
+    int64_t l22_t_tok_us  = 0;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;

@@ -10,6 +10,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-fn-l22-dump.h" // [TAG_FN_L22_LOGITDUMP]
+#include "server-fn-l22-p3.h"   // [TAG_FN_L22] P3's pure policies (merged image turns, anchors, ring victim, phase)
 
 #include "build-info.h"
 #include "common.h"
@@ -21,6 +22,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "../../src/llama-ext.h" // [TAG_SPEC_PREFILL_TAIL_EXTRACT] llama_set_layer_inp_extract
+#include "../../src/llama-fn-l22.h" // [TAG_FN_L22_PASSLOG] llama_fn_l22_log, llama_fn_l22_switch_on
 
 #include <algorithm>
 #include <atomic>
@@ -50,6 +52,14 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// L22-REQUEST R-P3-1 (P2): server_fn_l22_init lives in server-common.cpp on P2's branch (P2 merges before P3). Delete this
+// stub at the merge: next to P2's declaration it does not compile, so it cannot stay by mistake.
+static void server_fn_l22_init(const llama_model *) {}
+
+// [TAG_FN_L22_PASSLOG] the request's arrival, set by the HTTP handler before the chat template, read by
+// handle_completions_impl on the same thread
+static thread_local int64_t g_l22_t_req_us = 0;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -797,6 +807,11 @@ struct server_batch {
         bool output;
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
+        // [TAG_FN_L22_IMGPASS] rows of a merged image turn: the 4 M-RoPE positions of an image row and the token id
+        // an embedding row stands for (llama_batch_ext_set_token_aux); unset for every other row
+        bool        has_pos4 = false;
+        llama_pos   pos4[GGML_MROPE_SECTIONS] = { 0, 0, 0, 0 };
+        llama_token tok_aux  = LLAMA_TOKEN_NULL;
     };
     std::vector<token> tokens;
     int32_t n_gen_rows = 0; // [TAG_POOL_PREEMPT] leading sampled + draft rows of generating slots
@@ -808,6 +823,13 @@ struct server_batch {
 
     bool has_embd = false;
     std::vector<float> embd;
+
+    // [TAG_FN_L22_IMGPASS] the slot whose merged image turn owns this batch (-1: none), its media chunks / rows, and the
+    // text rows whose input embedding is filled by fill_text_rows()
+    int32_t l22_slot     = -1;
+    int32_t l22_n_media  = 0;
+    int32_t l22_n_mrows  = 0;
+    std::vector<int32_t> l22_text_rows;
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
@@ -838,6 +860,50 @@ struct server_batch {
         return true;
     }
 
+    // [TAG_FN_L22_IMGPASS] one row of a merged image turn: row = n_embd floats (an image row), or nullptr for a text row
+    // whose input embedding fill_text_rows() writes; pos4 = the row's 4 M-RoPE positions; tok_aux = the token it stands for
+    bool add_embd_row(int32_t id_slot, const float * row, const llama_pos * pos4, llama_token tok_aux, bool output, bool is_prompt) {
+        if ((int32_t)tokens.size() >= n_tokens_alloc) {
+            return false;
+        }
+        token t = { id_slot, LLAMA_TOKEN_NULL, pos4[0], output, is_prompt };
+        t.has_pos4 = true;
+        for (int j = 0; j < GGML_MROPE_SECTIONS; ++j) {
+            t.pos4[j] = pos4[j];
+        }
+        t.tok_aux = tok_aux;
+        if (row == nullptr) {
+            l22_text_rows.push_back((int32_t) tokens.size());
+            embd.resize(embd.size() + (size_t) n_embd, 0.0f);
+        } else {
+            embd.insert(embd.end(), row, row + n_embd);
+        }
+        tokens.push_back(t);
+        has_embd = true;
+        return true;
+    }
+
+    // [TAG_FN_L22_IMGPASS] the trunk's input embedding of every pending text row, in one call (bit for bit the host gather)
+    bool fill_text_rows(const llama_model * model) {
+        if (l22_text_rows.empty()) {
+            return true;
+        }
+        std::vector<llama_token> toks;
+        toks.reserve(l22_text_rows.size());
+        for (const int32_t i : l22_text_rows) {
+            toks.push_back(tokens[i].tok_aux);
+        }
+        std::vector<float> rows((size_t) toks.size() * (size_t) n_embd);
+        if (!llama_model_token_embd_rows(model, toks.data(), (int32_t) toks.size(), rows.data())) {
+            return false;
+        }
+        for (size_t k = 0; k < l22_text_rows.size(); ++k) {
+            memcpy(embd.data() + (size_t) l22_text_rows[k] * n_embd, rows.data() + k * (size_t) n_embd, (size_t) n_embd * sizeof(float));
+        }
+        l22_text_rows.clear();
+        return true;
+    }
+
     void clear() {
         tokens.clear();
         n_gen_rows = 0;
@@ -847,6 +913,10 @@ struct server_batch {
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         has_embd          = false;
+        l22_slot          = -1; // [TAG_FN_L22_IMGPASS]
+        l22_n_media       = 0;
+        l22_n_mrows       = 0;
+        l22_text_rows.clear();
     }
 
     int32_t size() const {
@@ -874,7 +944,11 @@ struct server_batch {
             if (has_embd) {
                 // text embeddings broadcast the same position across the M-RoPE sections
                 const llama_pos pos[GGML_MROPE_SECTIONS] = { t.pos, t.pos, t.pos, 0 };
-                view.add_embd({ embd.data() + (size_t) i * n_embd, 1, (size_t) n_embd }, pos, t.id_slot, t.output);
+                const int32_t idx = view.add_embd({ embd.data() + (size_t) i * n_embd, 1, (size_t) n_embd }, t.has_pos4 ? t.pos4 : pos,
+                                                  t.id_slot, t.output);
+                if (t.tok_aux != LLAMA_TOKEN_NULL && idx >= 0) {
+                    view.set_token_aux(idx, t.tok_aux); // [TAG_FN_L22_IMGPASS]
+                }
             } else {
                 view.add(t.token, t.pos, t.id_slot, t.output);
             }
@@ -1178,6 +1252,48 @@ struct server_slot {
     // end of its system + tools block (its first user message, -1 unknown)
     server_keepctx_spill kc_spill;
     server_keepctx_conv  kc_conv;
+
+    // [TAG_FN_L22_MTP_KEEP] the MTP draft keeps its sequence across media chunks (repair_draft_after_media)
+    bool l22_mtp_keep = false;
+
+    // [TAG_FN_L22_IMGPASS] [TAG_FN_L22_VLEND_HOLD] the embeddings of this prompt's media chunks, encoded together under one
+    // lend hold: chunk start idx -> its rows (owned by the mtmd batches, grouped as process_mtmd_chunk groups them)
+    struct l22_media_enc_t {
+        int                          id_task = -1;
+        std::vector<mtmd::batch_ptr> batches;
+        std::map<size_t, float *>    embd;
+        double                       encode_ms = 0.0; // the encodes of the group that holds each chunk, summed
+        double                       lend_ms   = 0.0; // the hold release (park + give)
+
+        void clear() {
+            id_task = -1;
+            embd.clear();
+            batches.clear();
+            encode_ms = 0.0;
+            lend_ms   = 0.0;
+        }
+        float * get(size_t idx) const {
+            const auto it = embd.find(idx);
+            return it == embd.end() ? nullptr : it->second;
+        }
+    } l22_enc;
+
+    // [TAG_FN_L22_PASSLOG] the numbers of the current turn for the kind=turn lines
+    struct l22_turn_t {
+        int64_t t_launch_us = 0;
+        double  kc_ms       = 0.0;   // keepctx_switch (store / restore) before the launch
+        int     kc_what     = 0;     // 1 stored, 2 restored (bits)
+        int     restore     = 0;     // 0 new prompt, 1 prefix kept, 2 checkpoint, 3 none before the edit, 4 cache unused
+        int64_t restore_n   = 0;     // the restored checkpoint's n_tokens
+        int32_t n_common    = 0;     // tokens shared with the cached prompt
+        int32_t n_past      = 0;     // tokens kept
+        int32_t n_batches   = 0;     // prompt batches with rows of this slot
+        int32_t n_merged    = 0;     // merged image-turn batches
+        int32_t n_media     = 0;     // media chunks decoded
+        int32_t n_media_rows = 0;
+        bool    logged_start = false;
+    } l22_turn;
+
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -1370,6 +1486,9 @@ struct server_slot {
         generated_token_probs.clear();
         n_block_verify = 0; // [TAG_FN_L3_MTP_BLOCK]
         json_schema = json();
+
+        l22_enc.clear(); // [TAG_FN_L22_IMGPASS] its batches point into the task's chunks
+        l22_turn = {};
 
         task_prev = std::move(task);
         task.reset();
@@ -1867,6 +1986,10 @@ static int process_mtmd_chunk_decode(const server_slot & slot, size_t idx, float
 
         if (delta > 0 && llama_memory_can_shift(mem_dft)) {
             llama_memory_seq_add(mem_dft, slot.id, -1, -1, delta);
+        } else if (slot.l22_mtp_keep && delta > 0) {
+            // [TAG_FN_L22_MTP_KEEP] an MTP draft of an M-RoPE target cannot shift: keep it. Its attention KV takes the
+            // forward position jump and its GDN state goes on (with MTP_VISION it already holds the image)
+            SLT_DBG(slot, "[TAG_FN_L22_MTP_KEEP] draft kept across the media chunk (pos_dft = %d, delta = %d)\n", (int) pos_dft, (int) delta);
         } else {
             // The draft K cache cannot be re-RoPEd (a turbo K cache via --spec-draft-type-k), or
             // the drafter is somehow ahead. Drop its sequence: it is all-SWA, it re-primes from
@@ -2103,6 +2226,28 @@ private:
         bool    opener_auto = true; //   only for a client that re-rendered its last answer
         bool    lazy      = false; // [TAG_FN_L20_CONVFIX_LAZY] a restore leaves the checkpoints on disk (needs keepctx)
     } cs;
+
+    // [TAG_FN_L22] P3's switches, read once per model load by l22_init() (llama_model_fn_env: the environment, else the
+    // qwen4exp profile). Unset = today's code paths.
+    struct l22_cfg_t {
+        bool        imgpass    = false; // LLAMA_FN_L22_IMGPASS: one prompt pass per image turn (merged batches)
+        bool        imgpass_ok = false; //   the libllama side answers (media token, host embedding rows) and the encode is synchronous
+        int64_t     mask_mib   = 1024;  // LLAMA_FN_L22_IMGPASS_MASK_MIB: merged rows cap in explicit-mask mode
+        bool        vlend_hold = false; // LLAMA_FN_L22_VLEND_HOLD: a turn's media chunks are encoded together under one lend
+        bool        mtp_keep   = false; // LLAMA_FN_L22_MTP_KEEP: the MTP draft keeps its history across media chunks
+        bool        spec_mtp   = false; //   the draft is the MTP head (not a draft model)
+        bool        anchor     = false; // LLAMA_FN_L22_MEDIA_ANCHOR: checkpoints at picture messages are kept first
+        bool        ckpt_keep  = false; // LLAMA_FN_L22_CKPT_KEEP: the keeping rule + checkpoints to disk
+        bool        ckpt_split = false; // LLAMA_FN_L22_CKPT_SPLIT: no new batch edge at n - 4 - n_ubatch
+        bool        keeplend   = false; // LLAMA_FN_L22_KEEPLEND: the prompt-after hint before per-chunk media decodes
+        int32_t     stream_min = 768;   // LLAMA_PREFILL_STREAM_MIN (the PASSLOG path label only)
+        llama_token media_tok  = LLAMA_TOKEN_NULL;
+        bool        logged_off = false; //   the one log line why a merged batch cannot run here
+        // [TAG_FN_L22_PHASE] decodes by phase, and GEN decodes that held a prompt row (must stay 0)
+        uint64_t    n_dec_gen    = 0;
+        uint64_t    n_dec_prompt = 0;
+        uint64_t    n_dec_bad    = 0;
+    } l22;
 
     server_metrics metrics;
 
@@ -2532,6 +2677,8 @@ private:
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
+        l22_init(); // [TAG_FN_L22] before keepctx_init and the chat templates
+
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
@@ -2660,6 +2807,8 @@ private:
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+            slot.l22_mtp_keep = l22.mtp_keep && l22.spec_mtp && ctx_dft != nullptr; // [TAG_FN_L22_MTP_KEEP]
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -3160,7 +3309,10 @@ private:
 
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
+                const int64_t t_kc0 = ggml_time_us();
+                ret->l22_turn.kc_what = 0;
                 keepctx_switch(*ret, task);
+                ret->l22_turn.kc_ms = (ggml_time_us() - t_kc0) / 1000.0; // [TAG_FN_L22_PASSLOG]
             }
 
             update_cache = update_cache && prompt_cache;
@@ -3241,6 +3393,283 @@ private:
         return ret;
     }
 
+    // [TAG_FN_L22] P3's switches (l22_cfg_t); after the model, the draft and the projector are loaded, before keepctx_init
+    void l22_init() {
+        l22 = l22_cfg_t();
+        auto on = [&](const char * name) {
+            return llama_fn_l22_switch_on(llama_model_fn_env(model_tgt, name));
+        };
+        auto num = [&](const char * name, long long def) {
+            const char * e = llama_model_fn_env(model_tgt, name);
+            return e && *e ? strtoll(e, nullptr, 10) : def;
+        };
+        l22.imgpass    = on("LLAMA_FN_L22_IMGPASS");
+        l22.mask_mib   = std::max<long long>(1, num("LLAMA_FN_L22_IMGPASS_MASK_MIB", 1024));
+        l22.vlend_hold = on("LLAMA_FN_L22_VLEND_HOLD");
+        l22.mtp_keep   = on("LLAMA_FN_L22_MTP_KEEP");
+        l22.anchor     = on("LLAMA_FN_L22_MEDIA_ANCHOR");
+        l22.ckpt_keep  = on("LLAMA_FN_L22_CKPT_KEEP");
+        l22.ckpt_split = on("LLAMA_FN_L22_CKPT_SPLIT");
+        l22.keeplend   = on("LLAMA_FN_L22_KEEPLEND");
+        l22.stream_min = (int32_t) std::max<long long>(1, num("LLAMA_PREFILL_STREAM_MIN", 768));
+        l22.spec_mtp   = !params_base.speculative.has_dft() &&
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+
+        if (l22.imgpass && mctx) {
+            // with the P1 stubs (no media token, no host rows) merged batches never run
+            l22.media_tok = llama_model_media_token(model_tgt);
+            const llama_token probe = std::max<llama_token>(0, llama_vocab_bos(vocab));
+            std::vector<float> row((size_t) llama_model_n_embd_inp(model_tgt));
+            const bool rows_ok = llama_model_token_embd_rows(model_tgt, &probe, 1, row.data());
+            l22.imgpass_ok = l22.media_tok != LLAMA_TOKEN_NULL && rows_ok && mtmd_decode_use_mrope(mctx) && !media_async;
+            SRV_INF("[TAG_FN_L22_IMGPASS] one prompt pass per image turn: %s (media token %d, host rows %s, M-RoPE %s, %s encode)\n",
+                    l22.imgpass_ok ? "on" : "off", (int) l22.media_tok, rows_ok ? "yes" : "no",
+                    mtmd_decode_use_mrope(mctx) ? "yes" : "no", media_async ? "async" : "sync");
+        }
+        if (mctx) {
+            // [TAG_FN_L22_OOMHOOK] a failed vision-lend buffer releases pins once and retries (no pins: no retry, as before)
+            mtmd_set_lend_oom(mctx, [](void * ud, size_t bytes) {
+                return llama_fn_pin_on_oom_ext((const llama_model *) ud, bytes);
+            }, (void *) model_tgt);
+        }
+        // L22-REQUEST R-P3-1: P2's server_fn_l22_init (server-common) reads the jinja / tokenizer switches from the profile
+        server_fn_l22_init(model_tgt);
+
+        if (l22.vlend_hold || l22.mtp_keep || l22.anchor || l22.ckpt_keep || l22.ckpt_split || l22.keeplend) {
+            SRV_INF("[TAG_FN_L22] P3 switches: vlend hold %d, MTP keep %d (MTP draft %d), media anchors %d, checkpoint keep %d, "
+                    "checkpoint split %d, keep-lend hint %d\n", l22.vlend_hold, l22.mtp_keep, l22.spec_mtp, l22.anchor,
+                    l22.ckpt_keep, l22.ckpt_split, l22.keeplend);
+        }
+    }
+
+    // [TAG_FN_L22_IMGPASS] the start indices of the media chunks of tokens at or after idx, ascending
+    static std::vector<size_t> l22_media_starts(const server_tokens & tokens, size_t idx) {
+        std::vector<size_t> out;
+        if (idx < tokens.size() && tokens[idx] == LLAMA_TOKEN_NULL) {
+            out.push_back(idx);
+        }
+        for (size_t i = idx; ; ) {
+            const auto [c, next] = tokens.find_next_media_chunk(i);
+            if (c == nullptr) {
+                break;
+            }
+            if (out.empty() || next > out.back()) {
+                out.push_back(next);
+            }
+            i = next;
+        }
+        return out;
+    }
+
+    // [TAG_FN_L22_IMGPASS] [TAG_FN_L22_VLEND_HOLD] encode every media chunk of the prompt from the slot's position that is not
+    // encoded yet, grouped as process_mtmd_chunk groups them (mtmd_batch_add_chunk until refused), under one lend hold
+    // that is released before any decode. 0 = ok, -1 = error (the request fails, as a failed encode does today)
+    int l22_encode_rest(server_slot & slot) {
+        const server_tokens & toks = slot.task->tokens;
+        if (slot.l22_enc.id_task != slot.task->id) {
+            slot.l22_enc.clear();
+            slot.l22_enc.id_task = slot.task->id;
+        }
+        std::vector<size_t> todo;
+        for (const size_t idx : l22_media_starts(toks, slot.prompt.n_tokens())) {
+            if (slot.l22_enc.get(idx) == nullptr) {
+                todo.push_back(idx);
+            }
+        }
+        if (todo.empty()) {
+            return 0;
+        }
+        int res = 0;
+        queue_tasks.yield_to_queue([&]() {
+            bool held = false;
+            if (l22.vlend_hold) {
+                mtmd_lend_hold(slot.mctx, true);
+                held = true;
+            }
+            try {
+                size_t k = 0;
+                while (k < todo.size()) {
+                    const int64_t t0 = ggml_time_us();
+                    mtmd::batch_ptr mb(mtmd_batch_init(slot.mctx));
+                    std::vector<size_t> group;
+                    if (mtmd_batch_add_chunk(mb.get(), toks.find_chunk(todo[k]).get()) != 0) {
+                        SLT_ERR(slot, "[TAG_FN_L22_IMGPASS] media chunk idx = %zu cannot be encoded\n", todo[k]);
+                        res = -1;
+                        break;
+                    }
+                    group.push_back(todo[k++]);
+                    while (k < todo.size() && mtmd_batch_add_chunk(mb.get(), toks.find_chunk(todo[k]).get()) == 0) {
+                        group.push_back(todo[k++]);
+                    }
+                    if (mtmd_batch_encode(mb.get()) != 0) {
+                        SLT_ERR(slot, "[TAG_FN_L22_IMGPASS] failed to encode the media batch from idx = %zu\n", group[0]);
+                        res = -1;
+                        break;
+                    }
+                    size_t n_rows = 0;
+                    for (const size_t idx : group) {
+                        const auto & ch = toks.find_chunk(idx);
+                        float * e = mtmd_batch_get_output_embd(mb.get(), ch.get());
+                        if (e == nullptr) {
+                            res = -1;
+                            break;
+                        }
+                        slot.l22_enc.embd[idx] = e;
+                        n_rows += mtmd_input_chunk_get_n_tokens(ch.get());
+                    }
+                    if (res != 0) {
+                        break;
+                    }
+                    const double ms = (ggml_time_us() - t0) / 1000.0;
+                    slot.l22_enc.encode_ms += ms;
+                    slot.l22_enc.batches.push_back(std::move(mb));
+                    if (llama_fn_l22_passlog_level() >= 1) {
+                        llama_fn_l22_log("media", "slot=%d task=%d encode chunks=%zu rows=%zu from=%zu encode_ms=%.1f hold=%d",
+                                         slot.id, slot.task->id, group.size(), n_rows, group[0], ms, (int) held);
+                    }
+                }
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "[TAG_FN_L22_IMGPASS] exception while encoding media: %s\n", e.what());
+                res = -1;
+            } catch (...) {
+                SLT_ERR(slot, "%s", "[TAG_FN_L22_IMGPASS] unknown exception while encoding media\n");
+                res = -1;
+            }
+            if (held) {
+                const int64_t t0 = ggml_time_us();
+                mtmd_lend_hold(slot.mctx, false);
+                slot.l22_enc.lend_ms += (ggml_time_us() - t0) / 1000.0;
+            }
+        });
+        return res;
+    }
+
+    // [TAG_FN_L22_IMGPASS] where a merged image-turn batch from the slot's position ends (a task token index), or -1 for no
+    // merged batch in this iteration (the per-chunk path runs as today)
+    int64_t l22_plan_merged(const server_slot & slot, int32_t n_batch, bool wait_shared) {
+        if (!l22.imgpass_ok || batch.size() != 0 || pool_preempt || media_async || !slot.mctx) {
+            return -1;
+        }
+        const server_task & t = *slot.task;
+        if (t.type != SERVER_TASK_TYPE_COMPLETION || slot.need_embd() || !slot.can_split() || wait_shared ||
+                t.n_tokens_shared > 0 || slot.share_prefix_stop > 0 || !t.decision.order.empty() ||
+                slot.alora_invocation_start > 0 || lora_all_alora(slot.lora)) {
+            return -1;
+        }
+        const server_tokens & toks  = t.tokens;
+        const int64_t         cur   = (int64_t) slot.prompt.n_tokens();
+        const int64_t         total = (int64_t) t.n_tokens();
+
+        // the rest as segments; an unsupported chunk ends them (the per-chunk path takes it later)
+        std::vector<l22_media_seg> segs;
+        int64_t i = cur;
+        for (const size_t m : l22_media_starts(toks, (size_t) cur)) {
+            if ((int64_t) m > i) {
+                segs.push_back({ false, (int64_t) m - i });
+            }
+            const auto & ch = toks.find_chunk(m);
+            if (mtmd_input_chunk_get_type(ch.get()) != MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+                    mtmd_input_chunk_get_tokens_image(ch.get()) == nullptr ||
+                    mtmd_decode_use_non_causal(slot.mctx, ch.get()) || slot.l22_enc.get(m) == nullptr) {
+                i = total; // stop here
+                break;
+            }
+            const int64_t n = (int64_t) mtmd_input_chunk_get_n_tokens(ch.get());
+            segs.push_back({ true, n });
+            i = (int64_t) m + n;
+        }
+        if (i < total) {
+            segs.push_back({ false, total - i });
+        }
+
+        // the width the context will use for this turn: hint first, then the getter (P4)
+        llama_fn_prompt_after_ext(ctx_tgt, (int32_t) (total - cur));
+        int64_t W = llama_fn_prompt_ubatch_width_ext(ctx_tgt);
+        if (W <= 0) {
+            W = llama_n_ubatch(ctx_tgt);
+        }
+        int64_t cap = n_batch;
+        if (llama_fn_imgpass_mask_mode(model_tgt) == 1) {
+            // explicit [n_kv, rows] F16 masks: rows <= MASK_MIB / (2 x n_kv)
+            int64_t n_kv = W;
+            for (const auto & s : slots) {
+                n_kv += s.prompt.n_tokens();
+            }
+            n_kv = (n_kv + 2047) / 2048 * 2048;
+            cap = std::min<int64_t>(cap, std::max<int64_t>(1, l22.mask_mib * 1024 * 1024 / (2 * n_kv)));
+        }
+        const int64_t rows = l22_media_plan(segs, W, cap);
+        return rows > 0 ? cur + rows : -1;
+    }
+
+    // [TAG_FN_L22_IMGPASS] the media chunk at the slot's position into the merged batch: encoder rows, 4 M-RoPE positions as
+    // mtmd_helper_decode_image_chunk gives them, the media token as the row's token id. false = not possible
+    bool l22_add_media_rows(server_slot & slot) {
+        const size_t idx = slot.prompt.n_tokens();
+        const auto & ch  = slot.task->tokens.find_chunk(idx);
+        const float * embd = slot.l22_enc.get(idx);
+        const mtmd_image_tokens * img = mtmd_input_chunk_get_tokens_image(ch.get());
+        if (embd == nullptr || img == nullptr) {
+            return false;
+        }
+        const size_t n = mtmd_input_chunk_get_n_tokens(ch.get());
+        if ((size_t) batch.size() + n > (size_t) batch.n_tokens_alloc) {
+            return false;
+        }
+        std::vector<mtmd_decoder_pos> dp(n);
+        mtmd_helper_image_get_decoder_pos(img, slot.prompt.tokens.pos_next(), dp.data());
+        for (size_t r = 0; r < n; ++r) {
+            const llama_pos pos4[GGML_MROPE_SECTIONS] = { (llama_pos) dp[r].t, (llama_pos) dp[r].y, (llama_pos) dp[r].x, (llama_pos) dp[r].z };
+            if (!batch.add_embd_row(slot.id, embd + r * (size_t) batch.n_embd, pos4, l22.media_tok, false, true)) {
+                return false;
+            }
+        }
+        slot.prompt.tokens.push_back_placeholder(ch.get());
+        batch.l22_n_media++;
+        batch.l22_n_mrows += (int32_t) n;
+        slot.l22_turn.n_media++;
+        slot.l22_turn.n_media_rows += (int32_t) n;
+        return true;
+    }
+
+    // [TAG_FN_L22_PASSLOG] kind=turn at the prompt start: the time before the slot started and what the cache gave
+    void l22_log_turn_start(server_slot & slot) {
+        if (slot.l22_turn.logged_start || !slot.task || llama_fn_l22_passlog_level() < 1) {
+            return;
+        }
+        slot.l22_turn.logged_start = true;
+        const server_task & t   = *slot.task;
+        const int64_t       now = ggml_time_us();
+        auto ms = [](int64_t a, int64_t b) {
+            return a > 0 && b >= a ? (double) (b - a) / 1000.0 : -1.0;
+        };
+        static const char * restore_s[] = { "new-prompt", "prefix-kept", "checkpoint", "none-before-the-edit", "cache-unused" };
+        const int r = std::clamp(slot.l22_turn.restore, 0, 4);
+        const int k = slot.l22_turn.kc_what;
+        llama_fn_l22_log("turn", "slot=%d task=%d phase=start tokens=%d media=%zu template_ms=%.1f tokenize_ms=%.1f queue_ms=%.1f "
+                "keepctx_ms=%.1f keepctx=%s%s%s%s start_ms=%.1f common=%d kept=%d restore=%s at=%lld re_read=%d",
+                slot.id, t.id, (int) t.n_tokens(), l22_media_starts(t.tokens, 0).size(), ms(t.l22_t_req_us, t.l22_t_tmpl_us),
+                ms(t.l22_t_tmpl_us, t.l22_t_tok_us), ms(t.l22_t_tok_us, slot.l22_turn.t_launch_us), slot.l22_turn.kc_ms,
+                k == 0 ? "none" : "", k & 1 ? "stored," : "", k & 2 ? "restored," : "", k & 4 ? "disk-checkpoint" : "",
+                ms(slot.l22_turn.t_launch_us, now), slot.l22_turn.n_common, slot.l22_turn.n_past, restore_s[r],
+                (long long) (r == 2 ? slot.l22_turn.restore_n : -1), (int) t.n_tokens() - slot.l22_turn.n_past);
+    }
+
+    // [TAG_FN_L22_PASSLOG] kind=turn at the prompt end (before the first token is sampled)
+    void l22_log_turn_end(const server_slot & slot) {
+        if (!slot.task || llama_fn_l22_passlog_level() < 1) {
+            return;
+        }
+        const double prompt_ms = slot.l22_turn.t_launch_us > 0 ? (ggml_time_us() - slot.l22_turn.t_launch_us) / 1000.0 : -1.0;
+        llama_fn_l22_log("turn", "slot=%d task=%d phase=prompt-end prompt_ms=%.1f rows=%d batches=%d merged=%d media=%d media_rows=%d "
+                "encode_ms=%.1f lend_ms=%.1f decodes_gen=%llu decodes_prompt=%llu gen_with_prompt_rows=%llu",
+                slot.id, slot.task->id, prompt_ms, (int) slot.task->n_tokens() - slot.l22_turn.n_past, slot.l22_turn.n_batches,
+                slot.l22_turn.n_merged, slot.l22_turn.n_media, slot.l22_turn.n_media_rows, slot.l22_enc.encode_ms,
+                slot.l22_enc.lend_ms, (unsigned long long) l22.n_dec_gen, (unsigned long long) l22.n_dec_prompt,
+                (unsigned long long) l22.n_dec_bad);
+    }
+
     // [TAG_FN_L18_KEEPCTX] LLAMA_FN_L18_KEEPCTX=1 (also from the model's automatic profile): before a prompt with another
     // prefix replaces a slot's conversation, the conversation goes to a store on disk; a later prompt that continues a
     // stored conversation further than the slot content gets it back (server-keepctx.h). Off beside the RAM prompt cache
@@ -3304,6 +3733,16 @@ private:
             SRV_INF("[TAG_FN_L19_CONVSTORE] on: checkpoint keeping %d, checkpoints to disk %d (gap %d, max %d), store at the "
                     "system block %d, assistant-turn checkpoint %s%d%s\n", cs.ckpt, cs.spill, cs.spill_gap, cs.spill_max, cs.sys,
                     cs.opener < 0 ? "off " : "from ", cs.opener, cs.opener >= 0 && cs.opener_auto ? " (clients that re-render)" : "");
+        }
+        // [TAG_FN_L22_CKPT_KEEP] the keeping rule (+ the user starts 1-2 turns back) and, with the store on, the checkpoints the
+        // ring drops go to disk (unbuffered, the writer thread) instead of being lost
+        if (l22.ckpt_keep) {
+            cs.ckpt = true;
+            if (cs.on) {
+                cs.spill = true;
+            }
+            SRV_INF("[TAG_FN_L22_CKPT_KEEP] checkpoint keeping rule on, checkpoints to disk %s\n",
+                    cs.spill ? "on (needs the conversation store)" : "off (LLAMA_FN_L19_CONVSTORE is off)");
         }
         const char * on = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX");
         if (!on || atoi(on) == 0) {
@@ -3545,6 +3984,7 @@ private:
                               cs.on ? &slot.kc_spill : nullptr, &slot.kc_conv, cs.on ? keepctx_min : 0)) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] stored the outgoing conversation (the new prompt shares %d of its %d tokens%s): %s\n",
                         lcp_cur, n_cur, lose_most ? "" : ", [TAG_FN_L19_CONVSTORE_SYS] only its system block", info.c_str());
+                slot.l22_turn.kc_what |= 1; // [TAG_FN_L22_PASSLOG]
             } else {
                 SLT_WRN(slot, "[TAG_FN_L18_KEEPCTX] the outgoing conversation (%d tokens) is not stored: %s\n", n_cur, info.c_str());
             }
@@ -3582,6 +4022,7 @@ private:
             if (loaded) {
                 SLT_INF(slot, "[TAG_FN_L18_KEEPCTX] restored a stored conversation: %d of the prompt's %zu tokens reused instead of %d: %s\n",
                         use_best, tokens.size(), use_cur, info.c_str());
+                slot.l22_turn.kc_what |= 2; // [TAG_FN_L22_PASSLOG]
                 if (cs.on) {
                     detect_rerender(lcp_best, slot.kc_conv);
                     slot.kc_spill.keep_first(lcp_best); // the prompt goes on differently after lcp_best
@@ -3640,6 +4081,7 @@ private:
                                 "sharing %d tokens (the ring's best: %lld) in %.1f ms%s%s\n", (long long) c.n_tokens, lcp,
                                 (long long) ring_best, (ggml_time_us() - t0) / 1000.0, info.empty() ? "" : ", ", info.c_str());
                         slot.prompt.checkpoints.insert(pos, std::move(c));
+                        slot.l22_turn.kc_what |= 4; // [TAG_FN_L22_PASSLOG] a checkpoint read back from disk
                     } else {
                         SLT_WRN(slot, "[TAG_FN_L19_CONVSTORE_SPILL] reading the checkpoint at n_tokens = %lld failed: %s\n",
                                 (long long) sp_best->n_tokens, info.c_str());
@@ -4423,6 +4865,9 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.l22_turn.t_launch_us  = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
+        slot.l22_turn.logged_start = false;
+
         // [TAG_FN_L21_NANGUARD] a draft of the previous task saw non-finite logits: rebuild from token 0
         if (slot.nf_drop) {
             slot.nf_drop = false;
@@ -5210,12 +5655,38 @@ private:
             }
         }
 
+        // [TAG_FN_L22_MEDIA_ANCHOR] a checkpoint at a picture message (from the task's spans and media chunks, so it holds
+        // for ring, restored and disk checkpoints alike)
+        std::vector<l22_span> an_spans;
+        std::vector<int64_t>  an_media;
+        if (l22.anchor && slot.task) {
+            for (const auto & sp : slot.task->params.message_spans.spans) {
+                an_spans.push_back({ (int64_t) sp.pos, (int64_t) sp.len, sp.role == COMMON_CHAT_ROLE_USER });
+            }
+            const auto & toks = slot.task->tokens;
+            if (toks.size() > 0 && toks[0] == LLAMA_TOKEN_NULL) {
+                an_media.push_back(0);
+            }
+            for (size_t i = 0; ; ) {
+                const auto [c, idx] = toks.find_next_media_chunk(i);
+                if (c == nullptr) {
+                    break;
+                }
+                an_media.push_back((int64_t) idx);
+                i = idx;
+            }
+        }
+        const auto is_anchor = [&](int64_t n) {
+            return !an_media.empty() && l22_ckpt_is_anchor(n, an_spans, an_media, 8 /* ckpt_merge_max */);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         const auto evict_min_step = [&]() {
             int64_t last = -1;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step &&
+                        !is_anchor(it->n_tokens)) { // [TAG_FN_L22_MEDIA_ANCHOR]
                     SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                             it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -5285,7 +5756,9 @@ private:
         // [TAG_FN_L19_CONVSTORE_CKPT] a full ring keeps the useful resume points (the end of the system + tools block, the
         // last user message, about halfway back, the newest: server-convstore.h) instead of the oldest ones, and
         // [TAG_FN_L19_CONVSTORE_SPILL] the one it drops goes to disk
-        if (cs.ckpt && !min_step_always) {
+        // [TAG_FN_L22_CKPT_KEEP] [TAG_FN_L22_MEDIA_ANCHOR] with either switch the ring below (l22_ring) decides instead
+        const bool l22_ring = !min_step_always && (l22.ckpt_keep || !an_media.empty());
+        if (cs.ckpt && !min_step_always && !l22_ring) {
             const int64_t n_new     = slot.prompt.n_tokens() - n_tokens_cur;
             const auto &  spans     = slot.task->params.message_spans;
             const int64_t sys_end   = convstore_first_user(spans);
@@ -5321,6 +5794,53 @@ private:
         // checkpoints within --checkpoint-min-step of an older one, the last user message's and the halfway one included)
         if (!min_step_always && !cs.ckpt && slot.prompt.checkpoints.size() + 1 >= n_ckpt_max) {
             evict_min_step();
+        }
+
+        // [TAG_FN_L22_CKPT_KEEP] [TAG_FN_L22_MEDIA_ANCHOR] a full ring drops plain checkpoints first, then anchors other than the
+        // oldest and the newest (server-fn-l22-p3.h); with the keeping rule (cs.ckpt) the protected points and the user
+        // starts 1-2 turns back stay too. The dropped one goes to disk when the spill is on.
+        if (l22_ring) {
+            const int64_t n_new     = slot.prompt.n_tokens() - n_tokens_cur;
+            const auto &  spans     = slot.task->params.message_spans;
+            const int64_t sys_end   = convstore_first_user(spans);
+            const int64_t last_user = spans.last_user_message_pos();
+            std::vector<int64_t> keep_at;
+            if (l22.ckpt_keep) {
+                std::vector<int64_t> user_starts;
+                for (const auto & sp : spans.spans) {
+                    if (sp.role == COMMON_CHAT_ROLE_USER) {
+                        user_starts.push_back((int64_t) sp.pos);
+                    }
+                }
+                keep_at = l22_prev_user_starts(user_starts, 2);
+            }
+            while (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.size() >= n_ckpt_max) {
+                std::vector<int64_t> ns;
+                std::vector<char>    an;
+                for (const auto & c : slot.prompt.checkpoints) {
+                    ns.push_back(c.n_tokens);
+                    an.push_back(is_anchor(c.n_tokens) ? 1 : 0);
+                }
+                ns.push_back(n_new);
+                an.push_back(is_anchor(n_new) ? 1 : 0);
+                int v = convstore_ckpt_victim_l22(ns, an, cs.ckpt, sys_end, last_user, keep_at);
+                if (v < 0) {
+                    v = 0;
+                }
+                auto it = std::next(slot.prompt.checkpoints.begin(), v);
+                SLT_INF(slot, "[TAG_FN_L22_CKPT_KEEP] ring full (%zu): dropping the checkpoint at n_tokens = %lld%s for one at %lld%s "
+                        "(system block %lld, last user message %lld, keeping rule %d)\n", slot.prompt.checkpoints.size(),
+                        (long long) it->n_tokens, an[v] ? " (media anchor)" : "", (long long) n_new, an.back() ? " (media anchor)" : "",
+                        (long long) sys_end, (long long) last_user, (int) cs.ckpt);
+                convstore_spill(slot, *it, n_new);
+                if (slot.ckpt_spare.empty()) {
+                    slot.ckpt_spare = std::move(it->data_tgt);
+                }
+                slot.prompt.checkpoints.erase(it);
+                if (slot.ckpt_spare.empty() && keepctx) {
+                    keepctx->take_spare(slot.ckpt_spare);
+                }
+            }
         }
 
         while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
@@ -6408,6 +6928,11 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
+                // [TAG_FN_L22_IMGPASS] a merged image turn owns the batch (embedding rows): no other slot adds to it
+                if (batch.l22_slot >= 0 && batch.l22_slot != slot.id) {
+                    return;
+                }
+
                 if (!slot.is_processing() || slot.parked) {
                     return;
                 }
@@ -6523,6 +7048,8 @@ private:
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                slot.l22_turn.n_common = n_past; // [TAG_FN_L22_PASSLOG]
+                                slot.l22_turn.restore  = n_past > 0 ? 1 : 0;
 
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {
@@ -6597,6 +7124,7 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                slot.l22_turn.restore = 4; // [TAG_FN_L22_PASSLOG] cache unused
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -6684,6 +7212,8 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        slot.l22_turn.restore   = 2; // [TAG_FN_L22_PASSLOG]
+                                        slot.l22_turn.restore_n = it->n_tokens;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -6692,6 +7222,7 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        slot.l22_turn.restore = 3; // [TAG_FN_L22_PASSLOG] none before the edit
                                     }
                                 }
                             }
@@ -6719,6 +7250,9 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+
+                        slot.l22_turn.n_past = n_past; // [TAG_FN_L22_PASSLOG]
+                        l22_log_turn_start(slot);
 
                         metrics.add_prompt_cached(n_past);
 
@@ -6828,8 +7362,25 @@ private:
 
                     bool has_mtmd = false;
 
+                    // [TAG_FN_L22_IMGPASS] [TAG_FN_L22_VLEND_HOLD] the rest of the prompt's media chunks are encoded together
+                    // (one lend); with IMGPASS this batch then holds the turn's text and image rows as embeddings up to l22_end
+                    int64_t l22_end  = -1;
+                    bool    l22_fail = false;
+                    if (slot.mctx && !media_async && (l22.imgpass_ok || l22.vlend_hold) &&
+                            !l22_media_starts(input_tokens, slot.prompt.n_tokens()).empty()) {
+                        if (l22_encode_rest(slot) != 0) {
+                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        l22_end = l22_plan_merged(slot, n_batch, wait_shared);
+                        if (l22_end >= 0) {
+                            batch.l22_slot = slot.id;
+                        }
+                    }
+
                     // check if we should process the mtmd chunk
-                    while (true) {
+                    while (l22_end < 0) {
                         auto cur_token_idx = slot.prompt.n_tokens();
                         if (
                             cur_token_idx >= slot.task->n_tokens() ||
@@ -6869,6 +7420,21 @@ private:
                             }
                         }
 
+                        // [TAG_FN_L22_VLEND_HOLD] encoded together with the turn's other chunks (l22_encode_rest)
+                        float * embd_pre = embd_async == nullptr ? slot.l22_enc.get(cur_token_idx) : nullptr;
+
+                        // [TAG_FN_L22_KEEPLEND] M4.1: the prompt rows after this chunk (the most of any slot) before its decode
+                        const size_t n_rows_chunk = mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get());
+                        if (l22.keeplend) {
+                            int32_t n_after = (int32_t) slot.task->n_tokens() - (int32_t) (cur_token_idx + n_rows_chunk);
+                            for (const auto & other : slots) {
+                                if (&other != &slot && other.state == SLOT_STATE_PROCESSING_PROMPT && other.task && !other.parked) {
+                                    n_after = std::max<int32_t>(n_after, (int32_t) other.task->n_tokens() - (int32_t) other.prompt.n_tokens());
+                                }
+                            }
+                            llama_fn_prompt_after_ext(ctx_tgt, std::max<int32_t>(0, n_after));
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -6877,6 +7443,7 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
+                        const int64_t l22_t_chunk0 = ggml_time_us();
                         queue_tasks.yield_to_queue([&]() {
                             // [TAG_MTMD_ENCODE_CATCH] mtmd_batch_encode already turns a std::exception from
                             // the encoder (a Vulkan DeviceLost on the iGPU is a vk::SystemError) into an error
@@ -6888,6 +7455,8 @@ private:
                                 // [TAG_MTMD_ASYNC_ENCODE] async: only the decode is left, the encode ran on the encoder thread
                                 res = embd_async != nullptr
                                     ? process_mtmd_chunk_decode(slot, cur_token_idx, embd_async, n_tokens_out)
+                                    : embd_pre != nullptr
+                                    ? process_mtmd_chunk_decode(slot, cur_token_idx, embd_pre, n_tokens_out)
                                     : process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                             } catch (const std::exception & e) {
                                 SLT_ERR(slot, "exception while processing mtmd chunk: %s\n", e.what());
@@ -6913,6 +7482,17 @@ private:
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
+
+                        // [TAG_FN_L22_PASSLOG] kind=media, one per chunk of the per-chunk path
+                        slot.l22_turn.n_media++;
+                        slot.l22_turn.n_media_rows += (int32_t) n_tokens_out;
+                        if (llama_fn_l22_passlog_level() >= 1) {
+                            llama_fn_l22_log("media", "slot=%d task=%d chunk idx=%zu rows=%zu path=%s %s_ms=%.1f",
+                                             slot.id, slot.task->id, (size_t) cur_token_idx, n_tokens_out,
+                                             (int64_t) n_tokens_out >= l22.stream_min ? "stream" : "cpu",
+                                             (embd_pre || embd_async) ? "decode" : "encode+decode",
+                                             (ggml_time_us() - l22_t_chunk0) / 1000.0);
+                        }
 
                         // add the mtmd chunk to cache
                         {
@@ -6957,12 +7537,64 @@ private:
                     // after this batch is the shared prefix and nothing more
                     const int share_stop = slot.share_prefix_stop;
 
+                    // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                    // create checkpoints that many tokens before the end of the prompt:
+                    //  - 4 + n_ubatch
+                    //  - 4
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                    // [TAG_FN_L22_CKPT_SPLIT] X1: the first one makes no new batch edge; the near_prompt_end rule below then
+                    // checkpoints the batch edge at or before n - 4 - n_ubatch, so no small CPU-path piece appears
+                    auto tail_split_break = [&]() {
+                        static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
+                        bool should_break = false;
+                        int  offset_hit   = 0;
+                        int64_t tail_min_hit = 512; // [TAG_FN_L19_TTFT_CKPT] ckpt_tail_min applies to the last-4 split only
+                        for (int offset : checkpoint_offsets) {
+                            if (l22.ckpt_split && offset != 4) {
+                                continue;
+                            }
+                            const int n_last = std::min(n_batch, offset);
+                            if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                should_break = true;
+                                offset_hit   = offset;
+                                tail_min_hit = n_last == std::min(n_batch, 4) ? ckpt_tail_min : 512;
+                                break;
+                            }
+                        }
+                        // [TAG_FN_L19_CONVSTORE_OPENER] the last 4 tokens (the assistant-turn start) get their checkpoint
+                        // from cs.opener tokens on: a client that drops the last answer's reasoning resumes there
+                        // _OPENER_AUTO: only for a client that re-rendered its last answer
+                        const bool    opener   = cs.opener >= 0 && offset_hit == 4 && (!cs.opener_auto || slot.kc_conv.rerender);
+                        // [TAG_FN_L19_TTFT_CKPT] + [TAG_FN_L19_CONVSTORE_OPENER]: the smaller threshold of the two wins
+                        const int64_t tail_min = opener ? std::min<int64_t>((int64_t) cs.opener, tail_min_hit) : tail_min_hit;
+                        // [TAG_CKPT_TURN_MERGE] the tail split only pays for itself past ckpt_tail_min tokens
+                        return should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= tail_min);
+                    };
+
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch
                            && (share_stop == 0 || (int) slot.prompt.n_tokens() < share_stop)) {
+                        // [TAG_FN_L22_IMGPASS] a merged batch ends at its planned end (a media boundary or the prompt end)
+                        if (l22_end >= 0 && (int64_t) slot.prompt.n_tokens() >= l22_end) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
-                            break; // end of text chunk
+                            if (l22_end < 0) {
+                                break; // end of text chunk
+                            }
+                            // [TAG_FN_L22_IMGPASS] the media chunk's rows go into the merged batch (the plan made sure it fits)
+                            if (!l22_add_media_rows(slot)) {
+                                SLT_ERR(slot, "[TAG_FN_L22_IMGPASS] media chunk idx = %d does not fit the merged batch\n", (int) slot.prompt.n_tokens());
+                                l22_fail = true;
+                                break;
+                            }
+                            if (do_checkpoint && tail_split_break()) {
+                                break;
+                            }
+                            continue;
                         }
 
                         // stop at the end of the shared prefix, the children are started from this state
@@ -6986,11 +7618,19 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
-                            cur_tok,
-                            /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                        if (l22_end >= 0) {
+                            // [TAG_FN_L22_IMGPASS] a text row of a merged batch: its input embedding (filled after the
+                            // loop), the token id as tok_aux, the 1-D position broadcast as for text embeddings
+                            const llama_pos p = slot.prompt.tokens.pos_next();
+                            const llama_pos pos4[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
+                            add_ok &= batch.add_embd_row(slot.id, nullptr, pos4, cur_tok, slot.need_embd(), true);
+                        } else {
+                            add_ok &= batch.add(slot.id,
+                                cur_tok,
+                                /* pos       = */ slot.prompt.tokens.pos_next(),
+                                /* output    = */ slot.need_embd(),
+                                /* is_prompt = */ true);
+                        }
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
@@ -7018,43 +7658,47 @@ private:
                             }
                         }
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            int  offset_hit   = 0;
-                            int64_t tail_min_hit = 512; // [TAG_FN_L19_TTFT_CKPT] ckpt_tail_min applies to the last-4 split only
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    offset_hit   = offset;
-                                    tail_min_hit = n_last == std::min(n_batch, 4) ? ckpt_tail_min : 512;
-                                    break;
-                                }
-                            }
-                            // [TAG_FN_L19_CONVSTORE_OPENER] the last 4 tokens (the assistant-turn start) get their checkpoint
-                            // from cs.opener tokens on: a client that drops the last answer's reasoning resumes there
-                            // _OPENER_AUTO: only for a client that re-rendered its last answer
-                            const bool    opener   = cs.opener >= 0 && offset_hit == 4 && (!cs.opener_auto || slot.kc_conv.rerender);
-                            // [TAG_FN_L19_TTFT_CKPT] + [TAG_FN_L19_CONVSTORE_OPENER]: the smaller threshold of the two wins
-                            const int64_t tail_min = opener ? std::min<int64_t>((int64_t) cs.opener, tail_min_hit) : tail_min_hit;
-                            // [TAG_CKPT_TURN_MERGE] the tail split only pays for itself past ckpt_tail_min tokens
-                            if (should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= tail_min)) {
-                                break;
-                            }
+                        // the tail split (tail_split_break above)
+                        if (do_checkpoint && tail_split_break()) {
+                            break;
                         }
+                    }
+
+                    // [TAG_FN_L22_IMGPASS] the input embeddings of the merged batch's text rows, in one call. A failure drops
+                    // this slot's rows (the batch is its own) and fails the request, as a failed media decode does
+                    if (l22_end >= 0 && !l22_fail && batch.l22_n_media == 0) {
+                        // a checkpoint break came before the first media chunk: the text rows go back to the token path
+                        const std::vector<server_batch::token> rows(batch.tokens.begin() + n_tokens_prev, batch.tokens.end());
+                        batch.clear(); // the batch is this slot's alone
+                        for (const auto & r : rows) {
+                            batch.add(slot.id, r.tok_aux, r.pos, r.output, r.is_prompt);
+                        }
+                        l22_end = -1;
+                    }
+                    if (l22_end >= 0) {
+                        if (!l22_fail && !batch.fill_text_rows(model_tgt)) {
+                            SLT_ERR(slot, "%s", "[TAG_FN_L22_IMGPASS] the text rows' input embeddings failed\n");
+                            l22_fail = true;
+                        }
+                        if (l22_fail) {
+                            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - (size_t) (batch.size() - n_tokens_prev));
+                            batch.clear();
+                            send_error(slot, "failed to process the image turn", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        slot.l22_turn.n_merged++;
                     }
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+
+                    slot.l22_turn.n_batches += n_tokens_cur > 0 ? 1 : 0; // [TAG_FN_L22_PASSLOG]
+
+                    // [TAG_FN_L22_IMGPASS] a merged batch that starts right after a media chunk takes the has_mtmd rule
+                    const bool l22_after_media = l22_end >= 0 && n_tokens_start > 0 && input_tokens[n_tokens_start - 1] == LLAMA_TOKEN_NULL;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
@@ -7068,7 +7712,7 @@ private:
                         const char * v = llama_model_fn_env(model_tgt, "LLAMA_FN_L21_MEDIA_CKPT");
                         return v != nullptr && atoi(v) != 0;
                     }();
-                    const bool is_after_last_media = media_ckpt_on && has_mtmd &&
+                    const bool is_after_last_media = media_ckpt_on && (has_mtmd || l22_after_media) &&
                             slot.task->tokens.find_next_media_chunk(n_tokens_start).first == nullptr;
 
                     // entire prompt has been processed
@@ -7102,7 +7746,7 @@ private:
                     }
 
                     // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && (!has_mtmd || is_after_last_media); // [TAG_FN_L21_MEDIA_CKPT]
+                    do_checkpoint = do_checkpoint && (!(has_mtmd || l22_after_media) || is_after_last_media); // [TAG_FN_L21_MEDIA_CKPT]
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
@@ -7110,6 +7754,15 @@ private:
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                    // [TAG_FN_L22_PASSLOG] kind=media for a merged batch (its decode time follows in decode())
+                    if (l22_end >= 0 && llama_fn_l22_passlog_level() >= 1) {
+                        llama_fn_l22_log("media", "slot=%d task=%d merged rows=%d media=%d media_rows=%d text_rows=%d from=%lld to=%lld "
+                                         "prompt_end=%d checkpoint=%d", slot.id, slot.task->id, (int) n_tokens_cur, batch.l22_n_media,
+                                         batch.l22_n_mrows, (int) n_tokens_cur - batch.l22_n_mrows, (long long) n_tokens_start,
+                                         (long long) slot.prompt.n_tokens(), (int) (slot.prompt.n_tokens() == slot.task->n_tokens()),
+                                         (int) do_checkpoint);
+                    }
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -7146,7 +7799,8 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd) {
+        // [TAG_FN_L22_IMGPASS] the MTP head has no draft model (model_dft null): it reads the target's embedding width
+        if (spec && batch.has_embd && model_dft != nullptr) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
@@ -7261,11 +7915,36 @@ private:
         const auto t_dec0 = common_speculative_probe_enabled()
                               ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
+
+        // [TAG_FN_L22_PHASE] GEN only for a view of generation / verify rows alone; prompt pieces, checkpoint tails, short
+        // follow-ups, media turns and mixed batches run as PROMPT. Only the X levers read it (none is on by default)
+        int64_t n_prompt_rows = 0;
+        for (int i = off; i < off + batch.view.size(); ++i) {
+            n_prompt_rows += batch.tokens[i].is_prompt ? 1 : 0;
+        }
+        const bool phase_gen = l22_phase_gen(batch.view.size(), n_prompt_rows);
+        if (phase_gen) {
+            l22.n_dec_gen++;
+        } else {
+            l22.n_dec_prompt++;
+        }
+        if (phase_gen && n_prompt_rows > 0) {
+            l22.n_dec_bad++; // never: l22_phase_gen refuses a view with a prompt row
+        }
+        GGML_ASSERT(!phase_gen || n_prompt_rows == 0);
+        const int64_t l22_t_dec0 = ggml_time_us();
+
         queue_tasks.yield_to_queue([&]() {
             if (skip_extract) {
                 llama_set_layer_inp_extract(ctx_tgt, false);
             }
-            ret = pool_dbg_fire(off) ? 1 : llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()); // [TAG_POOL_PREEMPT] hook inert unless TURBO_POOL_DEBUG_FAIL
+            if (pool_dbg_fire(off)) { // [TAG_POOL_PREEMPT] hook inert unless TURBO_POOL_DEBUG_FAIL
+                ret = 1;
+            } else {
+                // [TAG_FN_L22_PHASE] set right before the decode, which puts it back to PROMPT when it returns
+                llama_set_decode_phase_ext(ctx_tgt, phase_gen ? LLAMA_FN_PHASE_GEN : LLAMA_FN_PHASE_PROMPT);
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            }
             if (skip_extract) {
                 llama_set_layer_inp_extract(ctx_tgt, true);
             }
@@ -7389,6 +8068,13 @@ private:
             }
         }
 
+        // [TAG_FN_L22_PASSLOG] kind=media: the wall time of a merged image-turn batch (the decode is queued, the draft hook
+        // reads its outputs, so the time covers most of the pass)
+        if (batch.l22_slot >= 0 && llama_fn_l22_passlog_level() >= 1) {
+            llama_fn_l22_log("media", "slot=%d merged-decode rows=%d media=%d decode_ms=%.1f", batch.l22_slot, (int) batch.view.size(),
+                             batch.l22_n_media, (ggml_time_us() - l22_t_dec0) / 1000.0);
+        }
+
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()
@@ -7504,6 +8190,10 @@ private:
                         return;
                     }
                 }
+
+                // [TAG_FN_L22_PASSLOG] the prompt is done: its numbers; [TAG_FN_L22_IMGPASS] the turn's embeddings are not needed
+                l22_log_turn_end(slot);
+                slot.l22_enc.clear();
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -8082,6 +8772,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
+    // [TAG_FN_L22_PASSLOG] request -> here = the body parse and the chat template; here -> tokenized = the pictures too
+    const int64_t l22_t_tmpl = ggml_time_us();
+    const int64_t l22_t_req  = g_l22_t_req_us > 0 ? g_l22_t_req_us : l22_t_tmpl;
+    g_l22_t_req_us = 0;
+    int64_t l22_t_tok = 0;
+
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
@@ -8122,6 +8818,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             SRV_INF("tokenized prompt: %.1f ms, %zu tokens\n", (ggml_time_us() - t_tok0) / 1000.0,
                     inputs.empty() ? (size_t) 0 : inputs[0].size());
         }
+        l22_t_tok = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
@@ -8134,6 +8831,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
+
+            task.l22_t_req_us  = l22_t_req; // [TAG_FN_L22_PASSLOG]
+            task.l22_t_tmpl_us = l22_t_tmpl;
+            task.l22_t_tok_us  = l22_t_tok;
 
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
@@ -8728,6 +9429,7 @@ void server_routes::init_routes() {
     };
 
     this->post_completions = [this](const server_http_req & req) {
+        g_l22_t_req_us = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
@@ -8740,6 +9442,7 @@ void server_routes::init_routes() {
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
+        g_l22_t_req_us = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
@@ -8752,6 +9455,7 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
+        g_l22_t_req_us = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
