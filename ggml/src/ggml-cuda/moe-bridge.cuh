@@ -3,6 +3,7 @@
 // [TAG_MOE_BRIDGE] GGML_OP_MOE_HOST_POST / GGML_OP_MOE_HOST_WAIT, see ggml-moe-bridge.h
 
 #include "common.cuh"
+#include "ggml-fn-l22-prior.h" // [TAG_FN_L22_X_PRIOR] the prior's mark (ggml-cuda.cu tests it before the topk-moe fusion)
 
 struct ggml_cuda_topk_moe_args; // topk-moe.cuh
 
@@ -43,3 +44,11 @@ void ggml_cuda_op_moe_host_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * 
 bool ggml_cuda_fn_l4_topk_post(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, ggml_tensor * weights,
         ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias,
         const ggml_cuda_topk_moe_args & args, ggml_tensor * post);
+
+// [TAG_FN_L22_X_PRIOR] R-P12-1 (ggml-cuda.cu): the route prior's marked pattern at node i: SOFT_MAX of 512 logits (<= 8 rows),
+// RESHAPE, the MUL marked GGML_FN_L22_PRIOR, ARGSORT, VIEW, GET_ROWS [, the norm] [, SCALE]. prior_nodes: its node count,
+// 0 when it does not match (graph metadata only: graph_optimize keeps its nodes allocated as it does for topk-moe).
+// try_prior: the prior / resident top-k in one launch, with the bridge post marked GGML_FN_L4_POST behind it in the same
+// launch when there is one; returns the nodes to skip after i (0: not taken, nothing launched)
+int ggml_cuda_fn_l22_prior_nodes(const ggml_cgraph * cgraph, int i);
+int ggml_cuda_fn_l22_try_prior(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
