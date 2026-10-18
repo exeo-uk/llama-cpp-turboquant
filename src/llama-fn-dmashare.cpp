@@ -259,8 +259,13 @@ bool llama_fn_dmashare_wanted(const llama_model * model, const llama_moe_bridge 
         s->tail.w = s->tail.r > 0 && tw && tw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(tw))) : 0.0f;
         const char * dr = llama_fn_env(*model, "LLAMA_FN_L22_X_DEFER_R");
         const char * dw = llama_fn_env(*model, "LLAMA_FN_L22_X_DEFER_W");
-        s->defer.r = std::min(9, std::max(0, dr && dr[0] ? atoi(dr) : 0));
-        s->defer.w = dw && dw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(dw))) : (s->defer.r > 0 ? 0.0f : 0.1f);
+        // N-P11-1: P11's parse (R 0..127, W 0..1, unset 0; neither rule set: W 0.1); at the P11 merge read
+        // llama_moe_bridge_defer_params instead
+        s->defer.r = std::min(127, std::max(0, dr && dr[0] ? atoi(dr) : 0));
+        s->defer.w = dw && dw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(dw))) : 0.0f;
+        if (s->defer.r == 0 && s->defer.w <= 0.0f) {
+            s->defer.w = 0.1f;
+        }
     }
 
     // the bridged layers, grouped by expert types and shapes
