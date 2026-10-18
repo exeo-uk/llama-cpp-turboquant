@@ -16509,7 +16509,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // [TAG_FN_L22_GLUFUSE] fusion order on a whole FFN: the 27B FFN (#29948 fuses at 1024 tokens), a Flash-Next shared
     // expert (640 rows), a narrow prompt and a decode width (neither fusion)
     test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q5_K, 5120, 17408, 1024));
-    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q4_K, 2560,   640, 1024));
+    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q8_0, 2560,   640, 1024)); // the shared expert is Q8_0 (a K-quant down row of 640 is not a whole 256-block)
     test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q8_0, 2560,   640,  100));
     test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q5_K, 5120, 17408,    2));
     // Flash-Next routed experts in a prompt: MUL_MAT_ID down projection (#30489 only)
