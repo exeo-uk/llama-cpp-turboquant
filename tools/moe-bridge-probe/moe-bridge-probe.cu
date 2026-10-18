@@ -12,11 +12,17 @@
 //   moe-bridge-probe [--log E:/turbot-gates/flashnext/probe.log] [--pinned-mib 4096] [--stream-mib 8192]
 //                    [--threads 16] [--mask 0x55555555] [--quick] [--only rt|hostfn|memops|bw|bwcpu|zc]
 //                    [--zc-file <gguf shard>] [--zc-mib 1024]   (zc: [TAG_FN_L3_CPU_ZC] test 6, only on request)
+//   moe-bridge-probe --only pin [--pin-files a.gguf,b.gguf] [--pin-ladder 4,8,16,32] [--pin-hot-every 0]
+//                    [--alloc-full-mib N] [--alloc-borrow-mib N] [--alloc-vision-mib N] [--lock-mib 1024]
+//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat]
+//                    [TAG_FN_L22_PIN] test 7, only on request: pinned file pages (moe-bridge-pin.cpp)
 //   moe-bridge-probe --selftest [--threads 8] [--experts 64] [--reps 4] [--quick]
 //                    [TAG_MOE_BRIDGE] the ggml bridge ops against the CPU MUL_MAT_ID chain (moe-bridge-selftest.cpp)
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include "moe-bridge-pin.h" // [TAG_FN_L22_PIN]
 
 #include <algorithm>
 #include <atomic>
@@ -706,6 +712,23 @@ int main(int argc, char ** argv) {
     std::string only;
     std::string zc_file = "D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP-00002-of-00005.gguf"; // [TAG_FN_L3_CPU_ZC]
     size_t zc_mib = 1024;
+    pin_probe_args pin; // [TAG_FN_L22_PIN] test 7
+    auto split = [](const std::string & v) {
+        std::vector<std::string> out;
+        size_t a = 0;
+        while (a <= v.size()) {
+            const size_t b = v.find(',', a);
+            const std::string x = v.substr(a, b == std::string::npos ? std::string::npos : b - a);
+            if (!x.empty()) {
+                out.push_back(x);
+            }
+            if (b == std::string::npos) {
+                break;
+            }
+            a = b + 1;
+        }
+        return out;
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
@@ -719,6 +742,16 @@ int main(int argc, char ** argv) {
         else if (a == "--only") { only = next(); }
         else if (a == "--zc-file") { zc_file = next(); }
         else if (a == "--zc-mib") { zc_mib = std::max<size_t>(64, std::min<size_t>(4096, strtoull(next(), nullptr, 10))); }
+        else if (a == "--pin-files") { pin.files = split(next()); } // [TAG_FN_L22_PIN]
+        else if (a == "--pin-ladder") { pin.ladder_gib.clear(); for (const auto & x : split(next())) { pin.ladder_gib.push_back(atof(x.c_str())); } }
+        else if (a == "--pin-hot-every") { pin.hot_every = std::max(0, atoi(next())); }
+        else if (a == "--alloc-full-mib") { pin.full_mib = strtoull(next(), nullptr, 10); }
+        else if (a == "--alloc-borrow-mib") { pin.borrow_mib = strtoull(next(), nullptr, 10); }
+        else if (a == "--alloc-vision-mib") { pin.vision_mib = strtoull(next(), nullptr, 10); }
+        else if (a == "--lock-mib") { pin.lock_mib = std::max<size_t>(256, strtoull(next(), nullptr, 10)); }
+        else if (a == "--pin-margin-mib") { pin.margin_mib = strtoull(next(), nullptr, 10); }
+        else if (a == "--pin-floor-mib") { pin.floor_mib = strtoull(next(), nullptr, 10); }
+        else if (a == "--no-repeat") { pin.repeat = false; }
         else { printf("unknown argument %s\n", a.c_str()); return 1; }
     }
     if (pinned_mib < 64) {
@@ -741,6 +774,16 @@ int main(int argc, char ** argv) {
     if (only.empty() || only == "bw")     { test_bw(pinned_mib, stream_mib, n_threads, mask, false, quick); }
     if (only.empty() || only == "bwcpu")  { test_bw(pinned_mib, stream_mib, n_threads, mask, true, quick); }
     if (only == "zc")                     { test_zc(zc_file, zc_mib, stream_mib, n_threads, mask, quick); } // [TAG_FN_L3_CPU_ZC]
+    if (only == "pin") { // [TAG_FN_L22_PIN] test 7, only on request (the round-22 test's pin block)
+        if (pin.files.empty()) {
+            pin.files.push_back("D:/Projects/LocalAI/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTPq3-00002-of-00005.gguf");
+        }
+        const int rc = moe_bridge_pin_test(pin, say);
+        if (g_log) {
+            fclose(g_log);
+        }
+        return rc;
+    }
 
     say("\nmoe-bridge-probe done. D4: in-graph hop <= 20 us -> spin bridge; 20-40 us -> build, expect the low end;"
         " > 40 us -> check the host-function hop, else stop at F4.\n");
