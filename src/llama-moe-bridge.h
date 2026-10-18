@@ -102,6 +102,12 @@
 //                                         >= R, or whose largest weight is < w, contributes nothing (no renormalization);
 //                                         the sync op of a retried ubatch drops the same experts. R >= n_used: weight rule
 //                                         only. LLAMA_FN_L22_X_TAILSKIP_PF=1: the next-layer prefetch skips ranks >= R
+//   LLAMA_FN_L22_X_DEFER=1|check          [TAG_FN_L22_X_DEFER] CHANGES ANSWERS (spin waits): in one-sequence decode windows the
+//   LLAMA_FN_L22_X_DEFER_W=<w>            graph flags (GGML_MOE_BRIDGE_JOB_DEFER), the host answers a layer's heavy cold experts
+//   LLAMA_FN_L22_X_DEFER_R=<R>            first and its light ones (largest weight < w, or best rank >= R; tail-skipped ones in
+//                                         neither part) on the layer's defer channel; the graph adds them after the next
+//                                         layer's token mixer. check: added in the same layer (plumbing test). Neither rule
+//                                         set: w = 0.1. The sync op of a retried ubatch splits the same way
 
 #include <cstdint>
 
@@ -150,6 +156,10 @@ bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up
 // layer (chain 0 = llama_moe_bridge_layer; P0 stub: false for any other chain)
 int  llama_moe_bridge_n_chains   (const llama_moe_bridge * br);
 bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor * up_exps, int chain, int32_t * id, int32_t * chan);
+// [TAG_FN_L22_X_DEFER] 0 off, 1 defer, 2 check (nullptr: 0); the defer channel of layer channel chan (-1: none); the rule
+int     llama_moe_bridge_defer_mode  (const llama_moe_bridge * br);
+int32_t llama_moe_bridge_defer_chan  (const llama_moe_bridge * br, int32_t chan);
+void    llama_moe_bridge_defer_params(const llama_moe_bridge * br, float * w, int * r);
 
 // [TAG_FN_L3_MTP_COST2] cold-expert counts for the MTP draft-length policy (SPEC_MTP_COST=2). With tracking on, each
 // bridged graph sums over its layers, per token prefix t, the distinct experts of tokens 0..t that are not in the VRAM

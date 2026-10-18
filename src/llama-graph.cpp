@@ -2389,6 +2389,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     moe_bridge_hint_router = nullptr;
     moe_bridge_hint_input  = nullptr;
     moe_bridge_hint_late   = false;
+    const bool x_defer_in = moe_x_defer; // [TAG_FN_L22_X_DEFER] for this call only
+    moe_x_defer = false;
 
     // [TAG_FN_PREFILL_STREAM] large ubatches read this layer's host experts from a VRAM bank the streamer fills; the gate
     // node waits for the bank before the router runs
@@ -2683,6 +2685,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
+        // [TAG_FN_L22_X_DEFER] the light cold experts go to the layer's defer channel (bridged) or a second sum node (sync)
+        const int32_t xd_chan = x_defer_in && fn_x_defer_mode() > 0 ? llama_moe_bridge_defer_chan(br_any, br_chan) : -1;
         if (moe_bridge && br_ring) {
             // [TAG_FN_L3_CPU_DEVPRED] the next layer's router on this input, top hint_k per token, right after the post
             const int hint_k = hint_router ? llama_moe_bridge_hint_k(moe_bridge) : 0;
@@ -2690,11 +2694,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
                                      (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0) |
                                      ((fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0); // [TAG_FN_L22_X_TAILSKIP]
-            br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
+            br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan,
+                    br_flags | (xd_chan >= 0 ? GGML_MOE_BRIDGE_JOB_DEFER : 0)); // [TAG_FN_L22_X_DEFER]
             if (moe_post_mark != 0) {
                 ggml_fn_l3_set(br_ticket, moe_post_mark); // [TAG_FN_L4_POST]
             }
             cb(br_ticket, "ffn_moe_bridge_post", il);
+            if (xd_chan >= 0) {
+                moe_defer_parts[il] = { br_ticket, nullptr, n_embd, n_tokens, br_id, xd_chan }; // [TAG_FN_L22_X_DEFER]
+            }
             res->n_moe_bridge++;
             if (hint && hint_late) {
                 moe_bridge_hints[il] = { hint_router, br_ticket, hint_k, br_id, br_chan }; // [TAG_FN_L6_PFDEV3] built later
@@ -2719,10 +2727,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (fn_x & LLAMA_FN_L22_XB_TAIL) {
                 ggml_moe_host_sum_set_flags(br_ticket, GGML_MOE_BRIDGE_JOB_TAIL); // [TAG_FN_L22_X_TAILSKIP] a retry: same rule
             }
+            if (xd_chan >= 0) {
+                // [TAG_FN_L22_X_DEFER] a retry splits as the bridged job: the heavy part here, the light part as the next
+                // node of the same CPU split (joined where the arch takes it)
+                const int32_t fl = ggml_moe_host_sum_get_flags(br_ticket);
+                ggml_moe_host_sum_set_flags(br_ticket, fl | GGML_MOE_BRIDGE_JOB_DEFER);
+                ggml_tensor * light = ggml_moe_host_sum(ctx0, cur, selected_experts, w2, up_exps, gate_exps, down_exps,
+                        mcache ? mcache->host_table : nullptr, mcache ? mcache->n_slots : 0);
+                ggml_moe_host_sum_set_flags(light, fl | GGML_MOE_BRIDGE_JOB_LIGHT);
+                cb(light, "ffn_moe_bridge_sync_light", il);
+                moe_defer_parts[il] = { nullptr, light, n_embd, n_tokens, br_id, xd_chan };
+            }
             cb(br_ticket, "ffn_moe_bridge_sync", il);
             br_sync = true;
         }
         ggml_build_forward_expand(gf, br_ticket);
+        if (br_sync && xd_chan >= 0) {
+            ggml_build_forward_expand(gf, moe_defer_parts[il].sum); // [TAG_FN_L22_X_DEFER]
+        }
     }
 
     // [TAG_MOE_DMA_SHARE] [TAG_MOE_PREFETCH] a CPU plan node picks the cold experts that go over PCIe to a VRAM bank; its
@@ -3187,6 +3209,31 @@ ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int 
     if (p.hot) {
         out = ggml_add(ctx0, p.hot, out);
         cb(out, "ffn_moe_bridge_sum", il);
+    }
+    ggml_build_forward_expand(gf, out);
+    return out;
+}
+
+// [TAG_FN_L22_X_DEFER]
+int llm_graph_context::fn_x_defer_mode() const {
+    const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
+    if (!(fn_x & LLAMA_FN_L22_XB_DEFER) || ubatch.n_seqs_unq != 1 || br_any == nullptr) {
+        return 0;
+    }
+    return llama_moe_bridge_defer_mode(br_any);
+}
+
+ggml_tensor * llm_graph_context::build_moe_defer_take(int il, ggml_tensor * dep) const {
+    const auto it = moe_defer_parts.find(il);
+    if (it == moe_defer_parts.end()) {
+        return nullptr;
+    }
+    const moe_defer_part p = it->second;
+    moe_defer_parts.erase(it);
+    ggml_tensor * out = p.sum;
+    if (out == nullptr) {
+        out = ggml_moe_host_wait(ctx0, p.ticket, dep, p.n_embd, p.n_tokens, p.id, p.chan);
+        cb(out, "ffn_moe_defer_wait", il);
     }
     ggml_build_forward_expand(gf, out);
     return out;

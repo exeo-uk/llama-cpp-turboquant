@@ -85,6 +85,8 @@ struct ggml_fn_moe_args {
     int             stagger;            // [TAG_FN_L22_POOL_STAGGER] split >= 1, or 0: thread ith walks its experts from act
                                         // position (ith % stagger)*n_act/stagger on (a thief walks a victim's list in the
                                         // victim's order). Piece order only: the same values.
+    int8_t          defer_rank;         // [TAG_FN_L22_X_DEFER] as in ggml_cpu_moe_job
+    int32_t *       n_light;
 };
 
 // [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: the "where am I" words of each thread of a pool job
@@ -156,6 +158,9 @@ bool   ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op);
 // exactly what the bridged job dropped. Zero: no rule.
 void   ggml_fn_moe_tail_set(int rank, float w);
 void   ggml_fn_moe_tail_get(int * rank, float * w);
+// [TAG_FN_L22_X_DEFER] the light rule of a sync op with GGML_MOE_BRIDGE_JOB_DEFER / _LIGHT, set the same way
+void   ggml_fn_moe_defer_set(int rank, float w);
+void   ggml_fn_moe_defer_get(int * rank, float * w);
 // [TAG_FN_R2_BRIDGE_PF] prefetch the pieces thread ith of nth reads in a job of the experts list[0..n) (ascending);
 // stops before the next piece once *stop != 0; returns the bytes covered. mode 0: real loads, 1: software prefetches
 size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,

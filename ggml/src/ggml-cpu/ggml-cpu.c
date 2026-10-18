@@ -2610,8 +2610,16 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     // or above it; then 1 = dropped, 0 = kept
     const int   tail_r = a->tail_rank > 0 ? (int) a->tail_rank : 0;
     const float tail_w = a->w != NULL && a->tail_w > 0.0f ? a->tail_w : 0.0f;
+    // [TAG_FN_L22_X_DEFER] (opt-in, changes answers) a deferred job splits the kept cold experts: light = largest weight
+    // < defer_w or best rank >= defer_rank. DEFER computes the rest, LIGHT only the light ones (A + B = the full sum, other
+    // float order). Bits 3 / 4: a rank below / a weight at or above the light bound. Weighted jobs only
+    const uint32_t xd_fl = a->w != NULL ? a->l22_flags & (GGML_MOE_BRIDGE_JOB_DEFER | GGML_MOE_BRIDGE_JOB_LIGHT) : 0;
+    GGML_ASSERT(xd_fl != (GGML_MOE_BRIDGE_JOB_DEFER | GGML_MOE_BRIDGE_JOB_LIGHT));
+    const int   xd_r = xd_fl && a->defer_rank > 0 ? (int) a->defer_rank : 0;
+    const float xd_w = xd_fl && a->defer_w > 0.0f ? a->defer_w : 0.0f;
+    int32_t n_light = 0;
     uint8_t * tsk = NULL;
-    if (tail_r > 0 || tail_w > 0.0f) {
+    if (tail_r > 0 || tail_w > 0.0f || xd_fl) {
         tsk = tsk_buf;
         memset(tsk, 0, (size_t) n_exp);
         for (int t = 0; t < T; ++t) {
@@ -2621,12 +2629,19 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
                 if (GGML_FN_MOE_TSKIP(e)) {
                     continue;
                 }
+                const float wv = a->w != NULL ? a->w[slot + (size_t) n_used*t] : 0.0f;
                 uint8_t f = 4;
                 if (tail_r > 0 && slot < tail_r) {
                     f |= 1;
                 }
-                if (tail_w > 0.0f && a->w[slot + (size_t) n_used*t] >= tail_w) {
+                if (tail_w > 0.0f && wv >= tail_w) {
                     f |= 2;
+                }
+                if (xd_r > 0 && slot < xd_r) {
+                    f |= 8;
+                }
+                if (xd_w > 0.0f && wv >= xd_w) {
+                    f |= 16;
                 }
                 tsk[e] |= f;
             }
@@ -2636,10 +2651,18 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
                 const int32_t e = GGML_FN_MOE_ID(slot, t);
                 const uint8_t f = tsk[e];
                 if (f & 4) {
-                    tsk[e] = ((tail_r > 0 && !(f & 1)) || (tail_w > 0.0f && !(f & 2))) ? 1 : 0;
+                    const bool tail  = (tail_r > 0 && !(f & 1)) || (tail_w > 0.0f && !(f & 2));
+                    const bool light = !tail && ((xd_r > 0 && !(f & 8)) || (xd_w > 0.0f && !(f & 16)));
+                    n_light += light ? 1 : 0;
+                    const bool drop = tail || (xd_fl == GGML_MOE_BRIDGE_JOB_DEFER && light) ||
+                                      (xd_fl == GGML_MOE_BRIDGE_JOB_LIGHT && !light);
+                    tsk[e] = drop ? 1 : 0;
                 }
             }
         }
+    }
+    if (ith == 0 && a->n_light != NULL) {
+        *a->n_light = n_light; // [TAG_FN_L22_X_DEFER] read by the caller after the job
     }
 
     // 1. the input rows in the dot types of up and gate: every thread makes its own copy, so no barrier
@@ -3331,6 +3354,27 @@ void ggml_fn_moe_tail_get(int * rank, float * w) {
     *w    = wf;
 }
 
+// [TAG_FN_L22_X_DEFER] the sync op's light rule, as the tail rule above
+static atomic_int ggml_fn_moe_defer_r_g = 0;
+static atomic_int ggml_fn_moe_defer_w_g = 0;
+
+void ggml_fn_moe_defer_set(int rank, float w) {
+    int32_t wb = 0;
+    if (w > 0.0f) {
+        memcpy(&wb, &w, sizeof(wb));
+    }
+    atomic_store_explicit(&ggml_fn_moe_defer_r_g, rank > 0 ? rank : 0, memory_order_release);
+    atomic_store_explicit(&ggml_fn_moe_defer_w_g, wb, memory_order_release);
+}
+
+void ggml_fn_moe_defer_get(int * rank, float * w) {
+    const int32_t wb = atomic_load_explicit(&ggml_fn_moe_defer_w_g, memory_order_acquire);
+    float wf = 0.0f;
+    memcpy(&wf, &wb, sizeof(wf));
+    *rank = atomic_load_explicit(&ggml_fn_moe_defer_r_g, memory_order_acquire);
+    *w    = wf;
+}
+
 // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM: the host job of a bridged MoE layer (the CPU MoE pool's weighted mode,
 // ggml_cpu_moe_run with w) on the graph's threads. ggml_fn_moe_compute gives the same values for any thread count (rows
 // and pieces each have one owner, the weighted sum runs per row in slot order), so this equals the bridge's answer.
@@ -3376,7 +3420,8 @@ static void ggml_compute_forward_moe_host_sum(const struct ggml_compute_params *
     a.wdata    = params->wdata;
     // [TAG_FN_L22_X_TAILSKIP] a retried ubatch of a flagged graph drops what the bridged job dropped: the same rule (the
     // bridge's pool set it at its creation), the same marks in ggml_fn_moe_compute
-    if (ggml_moe_host_sum_get_flags(dst) & GGML_MOE_BRIDGE_JOB_TAIL) {
+    const int32_t sum_flags = ggml_moe_host_sum_get_flags(dst);
+    if (sum_flags & GGML_MOE_BRIDGE_JOB_TAIL) {
         int   tr = 0;
         float tw = 0.0f;
         ggml_fn_moe_tail_get(&tr, &tw);
@@ -3384,12 +3429,22 @@ static void ggml_compute_forward_moe_host_sum(const struct ggml_compute_params *
         a.tail_w    = tw;
         a.l22_flags = GGML_MOE_BRIDGE_JOB_TAIL;
     }
+    // [TAG_FN_L22_X_DEFER] the heavy (DEFER) or light (LIGHT) part of a deferred layer, as the bridged jobs split it
+    const uint32_t xd_fl = (uint32_t) sum_flags & (GGML_MOE_BRIDGE_JOB_DEFER | GGML_MOE_BRIDGE_JOB_LIGHT);
+    if (xd_fl) {
+        int   dr = 0;
+        float dw = 0.0f;
+        ggml_fn_moe_defer_get(&dr, &dw);
+        a.defer_rank = (int8_t) MIN(dr, 127);
+        a.defer_w    = dw;
+        a.l22_flags |= xd_fl;
+    }
 
     GGML_ASSERT(a.n_tokens >= 1 && a.n_tokens <= GGML_FN_MOE_MAX_T);
     GGML_ASSERT(params->wsize >= ggml_fn_moe_work_size(a.up, a.gate, a.down, a.n_used, a.n_tokens, params->nth));
 
-    if (params->ith == 0) {
-        ggml_compute_mmid_observe(a.gate, ids); // the routing observation the bridge's job makes
+    if (params->ith == 0 && !(xd_fl & GGML_MOE_BRIDGE_JOB_LIGHT)) {
+        ggml_compute_mmid_observe(a.gate, ids); // the routing observation the bridge's job makes (once per layer)
     }
 
     ggml_fn_moe_compute(&a, params->ith, params->nth, ggml_fn_moe_barrier_tp, params->threadpool);

@@ -1180,6 +1180,19 @@ struct llm_graph_context {
         bool          sync;     // [TAG_FN_R2_BRIDGE_SYNC] ticket is the ggml_moe_host_sum result: no wait
     };
     mutable std::map<int, moe_bridge_post> moe_bridge_posts;
+    // [TAG_FN_L22_X_DEFER] (P11, opt-in, changes answers) set by an arch right before build_moe_ffn, which takes and clears it:
+    // when fn_x_defer_mode() > 0 this layer's light cold experts become a second host answer, kept in moe_defer_parts until
+    // the arch joins it (build_moe_defer_take)
+    mutable bool moe_x_defer = false;
+    struct moe_defer_part {
+        ggml_tensor * ticket;   // the bridged post's ticket (the wait on chan), or nullptr in a sync graph
+        ggml_tensor * sum;      // the sync graph's light sum (ggml_moe_host_sum with JOB_LIGHT), or nullptr
+        int64_t       n_embd;
+        int64_t       n_tokens;
+        int32_t       id;
+        int32_t       chan;     // the layer's defer channel
+    };
+    mutable std::map<int, moe_defer_part> moe_defer_parts;
 
     // [TAG_FN_R4_BRIDGE_DMA] per DMA bank (its up tensor): the last chain that read it in this graph
     mutable std::map<const ggml_tensor *, ggml_tensor *> moe_dma_bank_last;
@@ -1312,6 +1325,11 @@ struct llm_graph_context {
     // [TAG_FN_L6_PFDEV3] the kept hint of layer il: the next router on input ([n_embd, n_tokens]), top-k, to the host;
     // false (nothing built) when layer il has no kept hint
     bool build_moe_bridge_hint(int il, ggml_tensor * input) const;
+    // [TAG_FN_L22_X_DEFER] 0, or the bridge's defer mode (1 defer, 2 check) in a one-sequence graph with fn_gen and the
+    // X_DEFER lever; the light part of layer il ([n_embd, n_tokens], the wait ordered after dep) or nullptr when layer il has
+    // none (taken once)
+    int           fn_x_defer_mode() const;
+    ggml_tensor * build_moe_defer_take(int il, ggml_tensor * dep) const;
 
     //
     // inputs
