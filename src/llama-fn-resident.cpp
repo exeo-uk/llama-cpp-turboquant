@@ -70,6 +70,7 @@ struct res_table {
     std::thread             svc;
     std::atomic<bool>       stop{false};
     std::atomic<bool>       warm_done{false};
+    bool                    lend_known = false; // the lend estimate ran (or nothing lends): the service thread retries until then
     // log counters since the last line
     std::atomic<uint64_t>   n_drop{0};
     std::atomic<uint64_t>   b_drop{0};
@@ -88,15 +89,24 @@ std::atomic<int>         g_res_readers{0};
 
 // a reader of the table: the deleter waits until no reader holds it
 struct res_ref {
-    res_table * t = nullptr;
+    res_table * t       = nullptr;
+    bool        counted = false;
     explicit res_ref(const llama_model * m) {
+        if (g_res.load(std::memory_order_relaxed) == nullptr) {
+            return; // no table: no shared counter traffic for the callers' threads
+        }
         g_res_readers.fetch_add(1);
+        counted = true;
         t = g_res.load();
         if (t != nullptr && t->model != m) {
             t = nullptr;
         }
     }
-    ~res_ref() { g_res_readers.fetch_sub(1); }
+    ~res_ref() {
+        if (counted) {
+            g_res_readers.fetch_sub(1);
+        }
+    }
     res_ref(const res_ref &) = delete;
     res_ref & operator=(const res_ref &) = delete;
 };
@@ -297,10 +307,10 @@ bool res_quiet() {
 // [TAG_FN_L22_RESSET] the layers in the prefill stream's lend range, estimated as llama_moe_hot_lend places it
 // (llama-moecache.cpp) for the banks pfs_take asks for (llama-prefill-stream.cpp): before the first lend the hot set's
 // view does not mark them yet, and their residents would look VRAM-held at ready
-void res_lend_estimate(res_table * t) {
+bool res_lend_estimate(res_table * t) {
     const char * le = getenv("LLAMA_PREFILL_STREAM_LEND");
     if (le == nullptr || atoi(le) == 0) {
-        return;
+        return true;
     }
     const char * nbs = getenv("LLAMA_PREFILL_STREAM_BUFS");
     const int n_bufs = std::max(1, std::min(3, nbs && nbs[0] ? atoi(nbs) : 2));
@@ -315,12 +325,12 @@ void res_lend_estimate(res_table * t) {
             dbuf = c->up_c->buffer;
         }
         if (c->up_c->buffer != dbuf || c->gate_c->buffer != dbuf || c->down_c->buffer != dbuf) {
-            return; // not one device buffer: the stream does not lend
+            return true; // not one device buffer: the stream does not lend
         }
         cl[li] = c;
     }
     if (dbuf == nullptr) {
-        return;
+        return false; // no hot set yet
     }
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(dbuf);
     // the stream sizes its banks with the buffer type of the first host layer's router (llama-moe-gen5.cpp: d.buft)
@@ -339,7 +349,7 @@ void res_lend_estimate(res_table * t) {
     size_t lo = 0;
     size_t hi = 0;
     if (!lend_range(size, llama_moe_hot_cbuf_tail_bytes(), (size_t) n_bufs*bank, align, &lo, &hi)) {
-        return;
+        return true;
     }
     const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(dbuf);
     int n = 0;
@@ -357,6 +367,7 @@ void res_lend_estimate(res_table * t) {
     }
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] %d layers lie in the prefill stream's lend range (%.0f MiB, estimate): their "
             "residents count as streamed\n", __func__, n, (hi - lo)/1048576.0);
+    return true;
 }
 
 // one layer's view from the hot set; entered / left: experts that came into / left a VRAM-held slot. false: unchanged
@@ -694,6 +705,9 @@ void res_service(res_table * t) {
             t_poll = now;
             entered.clear();
             left.clear();
+            if (!t->lend_known) {
+                t->lend_known = res_lend_estimate(t); // the hot set came after the table
+            }
             res_poll(t, &entered, &left);
             if (t->resset) {
                 // drop the host copies of experts that came into VRAM (queued); prefetch the ones that left it
@@ -917,7 +931,7 @@ bool llama_fn_p5_ready(const llama_model & model) {
         delete t;
         return false;
     }
-    res_lend_estimate(t);
+    t->lend_known = res_lend_estimate(t);
     // the first view (the hot set's bookkeeping may be busy for a moment)
     for (int li = 0; li < (int) t->L.size(); ++li) {
         for (int k = 0; k < 20; ++k) {

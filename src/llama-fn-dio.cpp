@@ -35,15 +35,24 @@ std::atomic<dio_model *> g_dio{nullptr};
 std::atomic<int>         g_dio_users{0}; // calls inside the engine now: the free waits for 0
 
 struct dio_ref {
-    dio_model * d = nullptr;
+    dio_model * d       = nullptr;
+    bool        counted = false;
     explicit dio_ref(const llama_model * m) {
+        if (g_dio.load(std::memory_order_relaxed) == nullptr) {
+            return; // off: no shared counter traffic
+        }
         g_dio_users.fetch_add(1);
+        counted = true;
         d = g_dio.load();
         if (d != nullptr && m != nullptr && d->model != m) {
             d = nullptr;
         }
     }
-    ~dio_ref() { g_dio_users.fetch_sub(1); }
+    ~dio_ref() {
+        if (counted) {
+            g_dio_users.fetch_sub(1);
+        }
+    }
     dio_ref(const dio_ref &) = delete;
     dio_ref & operator=(const dio_ref &) = delete;
 };
