@@ -1139,6 +1139,28 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         return mixed;
     };
 
+    // [TAG_FN_L22_X_DEFER] (P11, opt-in, changes answers; one-sequence decode windows of a bridged graph, plan 3.8) mode 1:
+    // the light cold experts of layer il join the residual after layer il + 1's token mixer, with layer il's own FFN combine
+    // weights (the combine is linear in the block output), so only that mixer misses them; mode 2 (check): they join in
+    // layer il. Not deferred: the last layer (the MTP head and the output read it), a layer before a PLE layer (the PLE
+    // block reads the residual first), a steered layer
+    const int xd_mode = fn_x_defer_mode();
+    ggml_tensor * xd_inject = nullptr; // the FFN inject of the layer whose light part is pending
+    const auto xd_eligible = [&](int jl) {
+        return xd_mode > 0 && jl + 1 < n_layer && !hparams.is_ple(jl + 1) && !(cvec != nullptr && cvec->tensor_for(jl) != nullptr);
+    };
+    const auto xd_join = [&](ggml_tensor * res, ggml_tensor * light, ggml_tensor * w_inject, int jl) {
+        // layer jl's combine weights again: sharing its fused combine's weights would give them a second reader
+        ggml_tensor * w_s = ggml_scale(ctx0, w_inject, 1.0f / (float) hc);
+        if (l3.hcfuse) {
+            ggml_fn_l3_set(w_s, GGML_FN_L3_HCW); // scale -> sigmoid -> scale -> hc post in one launch
+        }
+        ggml_tensor * w = ggml_scale(ctx0, ggml_sigmoid(ctx0, w_s), 2.0f);
+        ggml_tensor * out = build_hc_combine_post(res, light, w, jl);
+        cb(out, "ffn_moe_defer_join", jl);
+        return out;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -1169,6 +1191,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+        }
+
+        if (xd_mode == 1 && il > 0) {
+            // [TAG_FN_L22_X_DEFER] layer il - 1's light part, after this layer's token mixer (the wait right before its use)
+            if (ggml_tensor * light = build_moe_defer_take(il - 1, cur)) {
+                res_hc = xd_join(res_hc, light, xd_inject, il - 1);
+            }
+            xd_inject = nullptr;
         }
 
         if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
@@ -1211,10 +1241,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 l6_early = e && e[0] && e[0] != '0';
             }
         }
+        moe_x_defer = xd_eligible(il); // [TAG_FN_L22_X_DEFER] build_moe_ffn takes it
         cur = build_layer_ffn(cur, il);
+        moe_x_defer = false;
         moe_bridge_hint_late = false;
         l6_hint_res    = nullptr;
         l6_hint_inject = nullptr;
+        if (xd_mode == 1 && moe_defer_parts.count(il) > 0) {
+            xd_inject = inject; // [TAG_FN_L22_X_DEFER] this layer's FFN combine weights, for the join in layer il + 1
+        } else if (xd_mode == 2) {
+            if (ggml_tensor * light = build_moe_defer_take(il, cur)) {
+                cur = ggml_add(ctx0, cur, light); // [TAG_FN_L22_X_DEFER] check: the same rows in this layer, other order
+            }
+        }
         cb(cur, "ffn_out", il);
 
         res_hc = w_ffn ? build_hc_combine_post(res_hc, cur, w_ffn, il) : build_hc_combine(res_hc, cur, inject, il);
@@ -1224,6 +1263,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     l3_expand_deferred(); // [TAG_FN_L3_GPU_DEFER] nothing is left here; build_layer_ffn takes them
+    if (!moe_defer_parts.empty()) {
+        // [TAG_FN_L22_X_DEFER] never expected: the host still answers them (no hang), their rows are lost
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("qwen4exp: [TAG_FN_L22_X_DEFER] %zu light parts were not joined\n", moe_defer_parts.size());
+        }
+        moe_defer_parts.clear();
+    }
 
     // the MTP head reads the hc-wide residual, before the final mixer
     if (cparams.embeddings_nextn) {
