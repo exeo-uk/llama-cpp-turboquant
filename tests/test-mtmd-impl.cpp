@@ -3,9 +3,15 @@
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
 #include "mtmd-internal.h"
+#include "clip.h" // [TAG_FN_L22_VLBATCH]
+#include "clip-impl.h"
+#include "ggml.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <random>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -267,6 +273,298 @@ MAKE_TEST(test_audio_preprocessor_conformer) {
     for (const auto & [bin, frame, expected] : cases) {
         const float actual = mel.data[bin * mel.n_len + frame];
         t.assert_true("mel[" + std::to_string(bin) + "][" + std::to_string(frame) + "] = " + std::to_string(actual) + ", expected " + std::to_string(expected), std::fabs(actual - expected) < 1e-3f);
+    }
+}
+
+//
+// [TAG_FN_L22_VLBATCH] batched Qwen3-VL encode (round 22 P2b)
+//
+
+MAKE_TEST(test_fn_l22_vlbatch_admit) {
+    auto still = [](int nx, int ny, int px_w, int px_h) {
+        mtmd_fn_l22_vlb_info r;
+        r.image     = true;
+        r.n_entries = 1;
+        r.nx        = nx;
+        r.ny        = ny;
+        r.pos       = 1;
+        r.px_w      = px_w;
+        r.px_h      = px_h;
+        r.n_tokens  = nx * ny;
+        return r;
+    };
+    const auto a = still(32, 32, 1024, 1024); // 1024 rows
+    t.assert_equal("same-size stills", 0, mtmd_fn_l22_vlbatch_admit(a, a, 1024, 2116));
+    t.assert_equal("exactly the cap", 0, mtmd_fn_l22_vlbatch_admit(a, a, 1024, 2048));
+    t.assert_equal("over the cap", 2, mtmd_fn_l22_vlbatch_admit(a, a, 2048, 2116));
+    auto pair = a;
+    pair.n_entries = 2;
+    t.assert_equal("video pair next", 3, mtmd_fn_l22_vlbatch_admit(a, pair, 1024, 1 << 20));
+    t.assert_equal("video pair first", 3, mtmd_fn_l22_vlbatch_admit(pair, a, 1024, 1 << 20));
+    t.assert_equal("other grid", 3, mtmd_fn_l22_vlbatch_admit(a, still(32, 26, 1024, 832), 1024, 1 << 20));
+    t.assert_equal("same grid, other pixel size", 3, mtmd_fn_l22_vlbatch_admit(a, still(32, 32, 1024, 1056), 1024, 1 << 20));
+    auto ph = a;
+    ph.placeholder = true;
+    t.assert_equal("placeholder", 3, mtmd_fn_l22_vlbatch_admit(a, ph, 1024, 1 << 20));
+    t.assert_equal("placeholder first", 3, mtmd_fn_l22_vlbatch_admit(ph, a, 1024, 1 << 20));
+    mtmd_fn_l22_vlb_info audio;
+    audio.n_entries = 1;
+    audio.n_tokens  = 100;
+    t.assert_equal("audio", 3, mtmd_fn_l22_vlbatch_admit(a, audio, 1024, 1 << 20));
+    auto other_pos = a;
+    other_pos.pos = 0;
+    t.assert_equal("other position type", 3, mtmd_fn_l22_vlbatch_admit(a, other_pos, 1024, 1 << 20));
+}
+
+MAKE_TEST(test_fn_l22_vlbatch_split_plan) {
+    auto plan_str = [](int n, int kmax) {
+        const auto plan = clip_fn_l22_split_plan(n, [kmax](int k) { return k <= kmax; });
+        std::string s;
+        for (const int k : plan) {
+            s += (s.empty() ? "" : ",") + std::to_string(k);
+        }
+        return s;
+    };
+    t.assert_equal("4 of 4", std::string("4"), plan_str(4, 4));
+    t.assert_equal("4, fits 3", std::string("2,2"), plan_str(4, 3));
+    t.assert_equal("5, fits 2", std::string("2,2,1"), plan_str(5, 2));
+    t.assert_equal("3, fits 1", std::string("1,1,1"), plan_str(3, 1));
+    t.assert_equal("3, fits nothing", std::string("1,1,1"), plan_str(3, 0));
+    t.assert_equal("1", std::string("1"), plan_str(1, 4));
+    t.assert_equal("12, fits 5", std::string("4,4,4"), plan_str(12, 5));
+    t.assert_equal("0", std::string(""), plan_str(0, 4));
+}
+
+// a tiny qwen3vl_merger mmproj (2 blocks, n_embd 32, 2 heads, patch 16) with seeded random weights
+static bool fn_l22_write_qwen3vl_gguf(const std::string & path, bool deepstack) {
+    const int n_embd = 32, n_ff = 64, n_layer = 2, patch = 16, image_size = 64, proj = 24, n_pos_grid = 16;
+    ggml_init_params ip = { (size_t) 16 << 20, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    gguf_context * g = gguf_init_empty();
+    std::mt19937 rng(1234 + (deepstack ? 1 : 0));
+
+    gguf_set_val_str (g, "general.architecture", "clip");
+    gguf_set_val_bool(g, "clip.has_vision_encoder", true);
+    gguf_set_val_str (g, "clip.projector_type", "qwen3vl_merger");
+    gguf_set_val_bool(g, "clip.use_gelu", true);
+    gguf_set_val_u32 (g, "clip.vision.image_size", image_size);
+    gguf_set_val_u32 (g, "clip.vision.patch_size", patch);
+    gguf_set_val_u32 (g, "clip.vision.embedding_length", n_embd);
+    gguf_set_val_u32 (g, "clip.vision.feed_forward_length", n_ff);
+    gguf_set_val_u32 (g, "clip.vision.block_count", n_layer);
+    gguf_set_val_u32 (g, "clip.vision.attention.head_count", 2);
+    gguf_set_val_f32 (g, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
+    gguf_set_val_u32 (g, "clip.vision.projection_dim", proj);
+    gguf_set_val_u32 (g, "clip.vision.spatial_merge_size", 2);
+    const float mean[3] = { 0.5f, 0.5f, 0.5f };
+    const float stdv[3] = { 0.5f, 0.5f, 0.5f };
+    gguf_set_arr_data(g, "clip.vision.image_mean", GGUF_TYPE_FLOAT32, mean, 3);
+    gguf_set_arr_data(g, "clip.vision.image_std",  GGUF_TYPE_FLOAT32, stdv, 3);
+
+    auto add = [&](const std::string & name, ggml_type type, std::vector<int64_t> ne, float scale, float offset = 0.0f) {
+        ggml_tensor * tt = ggml_new_tensor(ctx, type, (int) ne.size(), ne.data());
+        ggml_set_name(tt, name.c_str());
+        std::uniform_real_distribution<float> u(-scale, scale);
+        const int64_t n = ggml_nelements(tt);
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = offset + u(rng);
+            if (type == GGML_TYPE_F32) {
+                ((float *) tt->data)[i] = v;
+            } else {
+                ((ggml_fp16_t *) tt->data)[i] = ggml_fp32_to_fp16(v);
+            }
+        }
+        gguf_add_tensor(g, tt);
+    };
+
+    add("v.patch_embd.weight",   GGML_TYPE_F16, { patch, patch, 3, n_embd }, 0.05f);
+    add("v.patch_embd.weight.1", GGML_TYPE_F16, { patch, patch, 3, n_embd }, 0.05f);
+    add("v.patch_embd.bias",     GGML_TYPE_F32, { n_embd }, 0.1f);
+    add("v.position_embd.weight", GGML_TYPE_F32, { n_embd, n_pos_grid }, 0.5f);
+    for (int il = 0; il < n_layer; ++il) {
+        const std::string p = "v.blk." + std::to_string(il) + ".";
+        add(p + "attn_qkv.weight", GGML_TYPE_F16, { n_embd, 3 * n_embd }, 0.2f);
+        add(p + "attn_qkv.bias",   GGML_TYPE_F32, { 3 * n_embd }, 0.1f);
+        add(p + "attn_out.weight", GGML_TYPE_F16, { n_embd, n_embd }, 0.2f);
+        add(p + "attn_out.bias",   GGML_TYPE_F32, { n_embd }, 0.1f);
+        add(p + "ffn_up.weight",   GGML_TYPE_F16, { n_embd, n_ff }, 0.2f);
+        add(p + "ffn_up.bias",     GGML_TYPE_F32, { n_ff }, 0.1f);
+        add(p + "ffn_down.weight", GGML_TYPE_F16, { n_ff, n_embd }, 0.2f);
+        add(p + "ffn_down.bias",   GGML_TYPE_F32, { n_embd }, 0.1f);
+        add(p + "ln1.weight", GGML_TYPE_F32, { n_embd }, 0.1f, 1.0f);
+        add(p + "ln1.bias",   GGML_TYPE_F32, { n_embd }, 0.1f);
+        add(p + "ln2.weight", GGML_TYPE_F32, { n_embd }, 0.1f, 1.0f);
+        add(p + "ln2.bias",   GGML_TYPE_F32, { n_embd }, 0.1f);
+    }
+    if (deepstack) {
+        add("v.deepstack.0.norm.weight", GGML_TYPE_F32, { 4 * n_embd }, 0.1f, 1.0f);
+        add("v.deepstack.0.norm.bias",   GGML_TYPE_F32, { 4 * n_embd }, 0.1f);
+        add("v.deepstack.0.fc1.weight",  GGML_TYPE_F16, { 4 * n_embd, 4 * n_embd }, 0.1f);
+        add("v.deepstack.0.fc1.bias",    GGML_TYPE_F32, { 4 * n_embd }, 0.1f);
+        add("v.deepstack.0.fc2.weight",  GGML_TYPE_F16, { 4 * n_embd, proj }, 0.1f);
+        add("v.deepstack.0.fc2.bias",    GGML_TYPE_F32, { proj }, 0.1f);
+    }
+    add("v.post_ln.weight", GGML_TYPE_F32, { n_embd }, 0.1f, 1.0f);
+    add("v.post_ln.bias",   GGML_TYPE_F32, { n_embd }, 0.1f);
+    add("mm.0.weight", GGML_TYPE_F16, { 4 * n_embd, 4 * n_embd }, 0.1f);
+    add("mm.0.bias",   GGML_TYPE_F32, { 4 * n_embd }, 0.1f);
+    add("mm.2.weight", GGML_TYPE_F16, { 4 * n_embd, proj }, 0.1f);
+    add("mm.2.bias",   GGML_TYPE_F32, { proj }, 0.1f);
+
+    const bool ok = gguf_write_to_file(g, path.c_str(), false);
+    gguf_free(g);
+    ggml_free(ctx);
+    return ok;
+}
+
+static clip_image_f32 fn_l22_random_image(std::mt19937 & rng, int nx, int ny) {
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> buf((size_t) nx * ny * 3);
+    for (auto & v : buf) {
+        v = u(rng);
+    }
+    clip_image_f32 img;
+    img.set_size({ nx, ny }, false, false);
+    img.cpy_buf(buf);
+    return img;
+}
+
+static double fn_l22_max_abs_diff(const float * a, const float * b, size_t n) {
+    double m = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        m = std::max(m, (double) std::fabs(a[i] - b[i]));
+    }
+    return m;
+}
+
+MAKE_TEST(test_fn_l22_vlbatch_encode) {
+    const double tol = 1e-5;
+    for (const bool deepstack : { false, true }) {
+        for (const auto fa : { CLIP_FLASH_ATTN_TYPE_AUTO, CLIP_FLASH_ATTN_TYPE_DISABLED }) {
+            const std::string tag = std::string(deepstack ? "deepstack" : "plain") + (fa == CLIP_FLASH_ATTN_TYPE_DISABLED ? ", no FA" : ", FA auto");
+            const std::string path = (std::filesystem::temp_directory_path() /
+                ("test-fn-l22-vlbatch-" + std::to_string(deepstack ? 1 : 0) + std::to_string((int) fa) + ".gguf")).string();
+            if (!t.assert_true("write the synthetic mmproj (" + tag + ")", fn_l22_write_qwen3vl_gguf(path, deepstack))) {
+                continue;
+            }
+            clip_context_params cp = {};
+            cp.use_gpu         = false;
+            cp.device          = nullptr;
+            cp.flash_attn_type = fa;
+            cp.image_min_tokens = -1;
+            cp.image_max_tokens = -1;
+            cp.warmup          = true;
+            cp.no_alloc        = false;
+            auto res = clip_init(path.c_str(), cp);
+            clip_ctx * ctx = res.ctx_v;
+            if (!t.assert_true("clip_init (" + tag + ")", ctx != nullptr)) {
+                std::filesystem::remove(path);
+                continue;
+            }
+
+            t.assert_true("off until enabled (" + tag + ")", !clip_fn_l22_batch_on(ctx) && !clip_support_batch(ctx));
+            t.assert_true("enable (" + tag + ")", clip_fn_l22_enable_batch(ctx));
+            t.assert_true("support_batch unchanged (" + tag + ")", !clip_support_batch(ctx) && clip_fn_l22_batch_on(ctx));
+            t.assert_equal("warm-up reserve rows (" + tag + ")", 46 * 46, clip_fn_l22_reserve_tokens(ctx));
+
+            std::mt19937 rng(42);
+            std::vector<clip_image_f32> imgs;
+            for (int i = 0; i < 4; ++i) {
+                imgs.push_back(fn_l22_random_image(rng, 64, 96));
+            }
+            const int    n_tok = clip_n_output_tokens(ctx, &imgs[0]);
+            const size_t per   = (size_t) n_tok * (size_t) clip_n_mmproj_embd(ctx);
+            t.assert_equal("rows per 64x96 picture (" + tag + ")", 6, n_tok);
+            t.assert_equal("projector width (" + tag + ")", deepstack ? 48 : 24, clip_n_mmproj_embd(ctx));
+
+            // single pictures: today's path
+            std::vector<std::vector<float>> single(4);
+            for (int i = 0; i < 4; ++i) {
+                clip_image_f32_batch b;
+                b.entries.push_back(imgs[i]);
+                single[i].resize(per);
+                t.assert_true("single encode " + std::to_string(i) + " (" + tag + ")", clip_image_batch_encode(ctx, 2, &b, single[i]));
+            }
+            t.assert_true("pictures differ (" + tag + ")", fn_l22_max_abs_diff(single[0].data(), single[1].data(), per) > 1e-3);
+
+            auto encode_batch = [&](int first, int n, int fn_n, std::vector<float> & out) {
+                clip_image_f32_batch b;
+                for (int i = 0; i < n; ++i) {
+                    b.entries.push_back(imgs[first + i]);
+                }
+                b.fn_n_images = fn_n;
+                return clip_image_batch_encode(ctx, 2, &b, out);
+            };
+            auto check_vs_single = [&](const std::string & what, const std::vector<float> & out, int first, int n) {
+                for (int i = 0; i < n; ++i) {
+                    const double d = fn_l22_max_abs_diff(out.data() + per * i, single[first + i].data(), per);
+                    t.log(what + " picture " + std::to_string(i) + ": max|d| " + std::to_string(d));
+                    t.assert_true(what + " picture " + std::to_string(i) + " equals the single encode (" + tag + ")", d <= tol);
+                }
+            };
+
+            // one graph of 3
+            {
+                std::vector<float> out(per * 3);
+                const uint64_t s0 = clip_fn_l22_n_split(ctx);
+                t.assert_true("batch of 3 (" + tag + ")", encode_batch(0, 3, 3, out));
+                t.assert_equal("batch of 3 not split (" + tag + ")", s0, clip_fn_l22_n_split(ctx));
+                check_vs_single("batch of 3", out, 0, 3);
+            }
+            // B = 2: stills vs the legacy frame pair
+            {
+                std::vector<float> out(per * 2);
+                t.assert_true("batch of 2 stills (" + tag + ")", encode_batch(1, 2, 2, out));
+                check_vs_single("batch of 2", out, 1, 2);
+                std::vector<float> pair(per);
+                t.assert_true("2 entries without the flag = one frame pair (" + tag + ")", encode_batch(1, 2, 0, pair));
+                t.assert_true("the frame pair is not picture 1 (" + tag + ")", fn_l22_max_abs_diff(pair.data(), single[1].data(), per) > 1e-4);
+            }
+            // forced limits: split into groups, same output
+            {
+                const size_t n1 = clip_fn_l22_need_bytes(ctx, 64, 96, 1);
+                const size_t n2 = clip_fn_l22_need_bytes(ctx, 64, 96, 2);
+                const size_t n3 = clip_fn_l22_need_bytes(ctx, 64, 96, 3);
+                const size_t n4 = clip_fn_l22_need_bytes(ctx, 64, 96, 4);
+                t.log("compute bytes for 1/2/3/4 pictures: " + std::to_string(n1) + " / " + std::to_string(n2) + " / " +
+                      std::to_string(n3) + " / " + std::to_string(n4));
+                t.assert_true("compute grows with the batch (" + tag + ")", n1 < n2 && n2 < n3 && n3 < n4);
+
+                clip_fn_l22_set_test_limit(ctx, (n1 + n2) / 2);
+                std::vector<float> out(per * 4);
+                uint64_t s0 = clip_fn_l22_n_split(ctx);
+                t.assert_true("batch of 4, limit for 1 (" + tag + ")", encode_batch(0, 4, 4, out));
+                t.assert_equal("split once (" + tag + ")", s0 + 1, clip_fn_l22_n_split(ctx));
+                check_vs_single("groups 1+1+1+1", out, 0, 4);
+
+                clip_fn_l22_set_test_limit(ctx, (n2 + n3) / 2);
+                std::fill(out.begin(), out.end(), 0.0f);
+                s0 = clip_fn_l22_n_split(ctx);
+                t.assert_true("batch of 4, limit for 2 (" + tag + ")", encode_batch(0, 4, 4, out));
+                t.assert_equal("split again (" + tag + ")", s0 + 1, clip_fn_l22_n_split(ctx));
+                check_vs_single("groups 2+2", out, 0, 4);
+
+                clip_fn_l22_set_test_limit(ctx, n4);
+                std::fill(out.begin(), out.end(), 0.0f);
+                s0 = clip_fn_l22_n_split(ctx);
+                t.assert_true("batch of 4, limit for 4 (" + tag + ")", encode_batch(0, 4, 4, out));
+                t.assert_equal("no split at the exact need (" + tag + ")", s0, clip_fn_l22_n_split(ctx));
+                check_vs_single("one graph of 4", out, 0, 4);
+                clip_fn_l22_set_test_limit(ctx, 0);
+            }
+            // a batch of two sizes is rejected, no abort
+            {
+                clip_image_f32_batch b;
+                b.entries.push_back(imgs[0]);
+                b.entries.push_back(fn_l22_random_image(rng, 96, 64));
+                b.fn_n_images = 2;
+                std::vector<float> out(per * 2);
+                t.assert_true("two sizes rejected (" + tag + ")", !clip_image_batch_encode(ctx, 2, &b, out));
+            }
+
+            clip_free(ctx);
+            std::filesystem::remove(path);
+        }
     }
 }
 

@@ -22,7 +22,10 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <cmath>
+#include <string>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -537,6 +540,9 @@ struct mtmd_context {
     int  imgdec_threads = 1;     // LLAMA_FN_L22_IMGDEC_THREADS: picture preprocessing threads in mtmd_tokenize
     mutable mtmd_l22_embd_cache      embd_cache; // LLAMA_FN_L22_IMGCACHE: encoder outputs by content
     std::unique_ptr<common_tokcache> tokcache;   // LLAMA_FN_L22_TOKCACHE: the text parts of mtmd_tokenize
+    // [TAG_FN_L22_VLBATCH] round 22 P2b: same-size Qwen3-VL stills share one encoder graph up to this many rows (0: off)
+    int32_t fn_vlbatch_cap   = 0;
+    bool    fn_vlbatch_check = false; // LLAMA_FN_L22_VLBATCH=check: also encode each picture alone and log the difference
 
     // TODO @ngxson : add timings
 
@@ -651,6 +657,28 @@ struct mtmd_context {
         }
         if (ctx_a) {
             init_audio();
+        }
+        // [TAG_FN_L22_VLBATCH] 1: cap = the larger of --mtmd-batch-max-tokens and the warm-up picture's rows (the lend and
+        // the compute buffer stay today's size); N >= 64: cap N rows; check: 1 + each picture also encoded alone, compared
+        if (ctx_v && !no_alloc) {
+            const char * v = l22_env("LLAMA_FN_L22_VLBATCH");
+            if (llama_fn_l22_switch_on(v) && clip_fn_l22_enable_batch(ctx_v)) {
+                std::string s;
+                for (const char * c = v; *c; ++c) {
+                    if (!isspace((unsigned char) *c)) {
+                        s.push_back((char) tolower((unsigned char) *c));
+                    }
+                }
+                fn_vlbatch_check = s == "check";
+                const long    n       = std::strtol(v, nullptr, 10);
+                const int32_t reserve = clip_fn_l22_reserve_tokens(ctx_v);
+                fn_vlbatch_cap = n >= 64 ? (int32_t) std::min<long>(n, INT32_MAX) : std::max(batch_max_tokens, reserve);
+                if (n > 1 && n < 64) {
+                    LOG_WRN("%s: [TAG_FN_L22_VLBATCH] %ld rows is below 64: the automatic cap is used\n", __func__, n);
+                }
+                LOG_WRN("%s: [TAG_FN_L22_VLBATCH] on: same-size pictures share one encoder graph up to %d rows (warm-up reserve %d "
+                        "rows)%s\n", __func__, fn_vlbatch_cap, reserve, fn_vlbatch_check ? ", check mode" : "");
+            }
         }
         // [TAG_FN_L17_VISION_LEND] the projector's VRAM serves the text model's hot set between encodes
         if (ctx_v && text_model && !no_alloc && llama_fn_vision_lend_wanted(text_model, clip_get_device(ctx_v))) {
@@ -2261,6 +2289,40 @@ void mtmd_batch_free(mtmd_batch * batch) {
     }
 }
 
+// [TAG_FN_L22_VLBATCH]
+int32_t mtmd_fn_l22_vlbatch_admit(const mtmd_fn_l22_vlb_info & first, const mtmd_fn_l22_vlb_info & next, int32_t n_tokens_now, int32_t cap) {
+    if (!first.image || !next.image || first.placeholder || next.placeholder || first.n_entries != 1 || next.n_entries != 1) {
+        return 3;
+    }
+    if (first.nx != next.nx || first.ny != next.ny || first.pos != next.pos || first.px_w != next.px_w || first.px_h != next.px_h) {
+        return 3;
+    }
+    if ((int64_t) n_tokens_now + next.n_tokens > cap) {
+        return 2;
+    }
+    return 0;
+}
+
+static mtmd_fn_l22_vlb_info mtmd_fn_l22_vlb_info_of(const mtmd_input_chunk * chunk) {
+    mtmd_fn_l22_vlb_info r;
+    if (chunk == nullptr || chunk->type != MTMD_INPUT_CHUNK_TYPE_IMAGE || !chunk->tokens_image) {
+        return r;
+    }
+    const auto & it = *chunk->tokens_image;
+    r.image       = true;
+    r.placeholder = it.is_placeholder();
+    r.n_entries   = (int) it.batch_f32.entries.size();
+    r.nx          = (int) it.nx;
+    r.ny          = (int) it.ny;
+    r.pos         = (int) it.pos;
+    if (!it.batch_f32.entries.empty()) {
+        r.px_w = it.batch_f32.entries[0].nx();
+        r.px_h = it.batch_f32.entries[0].ny();
+    }
+    r.n_tokens = (int) it.n_tokens();
+    return r;
+}
+
 int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_ERR("%s: text chunk is not supported in batch\n", __func__);
@@ -2277,6 +2339,16 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
         // batch must have at least one chunk
         batch->entries.push_back(chunk);
         return 0;
+    }
+
+    // [TAG_FN_L22_VLBATCH] same-size Qwen3-VL stills (deterministic: the server's probe and its job ask twice)
+    if (batch->ctx->fn_vlbatch_cap > 0 && ctx == batch->ctx->ctx_v && chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        const int32_t r = mtmd_fn_l22_vlbatch_admit(mtmd_fn_l22_vlb_info_of(batch->entries[0]), mtmd_fn_l22_vlb_info_of(chunk),
+                                                    batch->n_tokens(), batch->ctx->fn_vlbatch_cap);
+        if (r == 0) {
+            batch->entries.push_back(chunk);
+        }
+        return r;
     }
 
     if (!clip_support_batch(ctx)) {
@@ -2298,6 +2370,98 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
     return 3; // "cannot batch" error code
 }
 
+// [TAG_FN_L22_VLBATCH] a batch of same-size stills: the pictures the cache does not hold go through one encoder graph
+// (clip splits it when it needs more compute than the lend gives); each picture is its own cache entry, keyed as a
+// single encode keys it. Output: the chunks' rows one after another, as mtmd_batch_get_output_embd reads them
+static int32_t mtmd_fn_l22_vlbatch_encode(mtmd_batch * batch) {
+    mtmd_context * ctx = batch->ctx;
+    const size_t n      = batch->entries.size();
+    const size_t n_embd = (size_t) ctx->n_embd_out();
+    std::vector<size_t> off(n), len(n);
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto * c = batch->entries[i];
+        if (!c->tokens_image || c->tokens_image->batch_f32.entries.size() != 1) {
+            LOG_ERR("%s: [TAG_FN_L22_VLBATCH] chunk %zu is not a single still picture\n", __func__, i);
+            return 1;
+        }
+        off[i] = total;
+        len[i] = mtmd_input_chunk_get_n_tokens(c) * n_embd;
+        total += len[i];
+    }
+    batch->output_embd.resize(total);
+
+    const int64_t t0 = ggml_time_us();
+    const bool use_cache = ctx->embd_cache.n_max > 0 && !ctx->fn_vlbatch_check;
+    std::vector<mtmd_l22_hash128> keys(n);
+    std::vector<size_t> todo;
+    std::vector<float> tmp;
+    for (size_t i = 0; i < n; ++i) {
+        if (use_cache) {
+            keys[i] = mtmd_l22_image_key(batch->entries[i]->tokens_image->batch_f32);
+            if (ctx->embd_cache.get(keys[i], len[i], tmp)) {
+                std::memcpy(batch->output_embd.data() + off[i], tmp.data(), len[i] * sizeof(float));
+                continue;
+            }
+        }
+        todo.push_back(i);
+    }
+
+    std::vector<float> out;
+    if (!todo.empty()) {
+        clip_image_f32_batch mb;
+        size_t n_out = 0;
+        for (const size_t i : todo) {
+            mb.entries.push_back(batch->entries[i]->tokens_image->batch_f32.entries[0]);
+            n_out += len[i];
+        }
+        mb.fn_n_images = todo.size() > 1 ? (int32_t) todo.size() : 0;
+        out.resize(n_out);
+        if (!clip_image_batch_encode(ctx->ctx_v, ctx->n_threads, &mb, out)) {
+            LOG_ERR("%s: [TAG_FN_L22_VLBATCH] failed to encode %zu pictures\n", __func__, todo.size());
+            return 1;
+        }
+        size_t o = 0;
+        for (const size_t i : todo) {
+            std::memcpy(batch->output_embd.data() + off[i], out.data() + o, len[i] * sizeof(float));
+            if (use_cache) {
+                ctx->embd_cache.put(keys[i], out.data() + o, len[i]);
+            }
+            o += len[i];
+        }
+    }
+    const auto & it0 = *batch->entries[0]->tokens_image;
+    llama_fn_l22_log("media", "[TAG_FN_L22_VLBATCH] vlbatch n=%zu encoded=%zu cached=%zu grid=%ux%u rows=%zu ms=%.1f", n, todo.size(),
+            n - todo.size(), it0.nx, it0.ny, n_embd > 0 ? total / n_embd : (size_t) 0, (ggml_time_us() - t0)/1000.0);
+
+    // check mode: every batched picture once more alone; the batched output is kept
+    if (ctx->fn_vlbatch_check && todo.size() > 1) {
+        for (const size_t i : todo) {
+            clip_image_f32_batch sb;
+            sb.entries.push_back(batch->entries[i]->tokens_image->batch_f32.entries[0]);
+            std::vector<float> single(len[i]);
+            if (!clip_image_batch_encode(ctx->ctx_v, ctx->n_threads, &sb, single)) {
+                LOG_WRN("%s: [TAG_FN_L22_VLBATCH] check: the single encode of picture %zu failed\n", __func__, i);
+                continue;
+            }
+            const float * b = batch->output_embd.data() + off[i];
+            double max_d = 0.0, sum_d2 = 0.0, dot = 0.0, nb = 0.0, ns = 0.0;
+            for (size_t j = 0; j < len[i]; ++j) {
+                const double d = (double) b[j] - (double) single[j];
+                max_d   = std::max(max_d, std::fabs(d));
+                sum_d2 += d * d;
+                dot    += (double) b[j] * single[j];
+                nb     += (double) b[j] * b[j];
+                ns     += (double) single[j] * single[j];
+            }
+            const double cosv = nb > 0.0 && ns > 0.0 ? dot / std::sqrt(nb * ns) : 1.0;
+            LOG_WRN("%s: [TAG_FN_L22_VLBATCH] check picture %zu of %zu (%ux%u): max|d| %.3g rms(d) %.3g cos %.9f\n", __func__, i + 1,
+                    n, it0.nx, it0.ny, max_d, len[i] > 0 ? std::sqrt(sum_d2 / (double) len[i]) : 0.0, cosv);
+        }
+    }
+    return 0;
+}
+
 static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
     if (batch->entries.empty()) {
         LOG_ERR("%s: batch is empty\n", __func__);
@@ -2308,6 +2472,11 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
             LOG_ERR("%s: chunk is placeholder\n", __func__);
             return 1;
         }
+    }
+
+    // [TAG_FN_L22_VLBATCH] only the admit rule forms such batches (same-size stills of the vision context)
+    if (batch->ctx->fn_vlbatch_cap > 0 && batch->entries.size() > 1 && batch->entries[0]->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        return mtmd_fn_l22_vlbatch_encode(batch);
     }
 
     // represent the whole batch as one single chunk
