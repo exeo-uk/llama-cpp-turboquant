@@ -584,7 +584,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        s,
         int                  il) {
     const auto * mctx_cur   = inp->mctx;
-    const auto   kv_head    = mctx_cur->get_head();
+    // [TAG_FN_L22_TBO] one sequence of a two-chain graph writes its own cache rows (rs_seq_off 0 otherwise)
+    const auto   kv_head    = mctx_cur->get_head() + (uint32_t) rs_seq_off;
     const uint32_t mem_size = mctx_cur->get_size();
 
     const int64_t S_v          = s->ne[0];
@@ -616,6 +617,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     //   sequence, the op replays the live part of the old ring before the new tokens, then the committed state and the
     //   new ring go back into the caches (the CUDA backend writes both from the kernel and skips the two copies)
     if (ggml_tensor * ring_all = mctx_cur->get_ring_l(il); ring_all != nullptr) {
+        GGML_ASSERT(rs_seq_off == 0 && "[TAG_FN_L22_TBO] the replay layout has no chains");
         const int64_t ring_row = ring_all->ne[0];
         const int32_t n_ring   = (int32_t) mctx_cur->get_n_rs_seq();
 

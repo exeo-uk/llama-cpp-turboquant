@@ -1144,6 +1144,11 @@ struct llm_graph_context {
     // (llama_fn_kvrows_args::mctx), null otherwise
     mutable const void * fn_attn_kv_mctx = nullptr;
     mutable bool moe_bridge_defer = false;
+    // [TAG_FN_L22_TBO] set by an arch while it builds one chain of a two-chain decode graph (D5, llama-fn-tbo.h): the
+    // chain's bridge channel set and its keys in moe_bridge_posts / moe_bridge_hints (chain 0 = today's keys). moe_tbo:
+    // the graph is a two-chain build (no DMA fetch, no next-layer prefetch, no deferred light rows). 0 / false elsewhere
+    mutable int32_t moe_bridge_chain = 0;
+    mutable bool    moe_tbo          = false;
     // [TAG_FN_L3_GPU_MMV] a ggml-fn-l3.h mark build_moe_ffn puts on the router mat-vec (0 = none, every model but qwen4exp)
     mutable int32_t moe_router_mark = 0;
     // [TAG_FN_L6_PRESYNC] ggml-fn-l3.h GGML_FN_L6_* bits for that router mat-vec (0 = none, every model but qwen4exp)

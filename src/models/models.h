@@ -109,6 +109,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // [TAG_FN_L4_GDNSTALL] set by an arch: build_recurrent_attn puts the copy of the pre-ubatch state ([TAG_RS_SNAP_DEPTH])
     // here instead of into the graph, and the arch adds it later (nullptr = into the graph at once, every model but qwen4exp)
     std::vector<ggml_tensor *> * rs_snap_defer = nullptr;
+
+    // [TAG_FN_L22_TBO] set by an arch while it builds one sequence of a two-chain decode graph: build_recurrent_attn writes
+    // that sequence's cache rows (kv_head + rs_seq_off); 0 = every sequence of the ubatch from kv_head (every other graph)
+    int32_t rs_seq_off = 0;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2562,6 +2566,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     // a model of its own while the log level is demoted, so the real model still logs its line at INFO.
     mutable std::atomic<int> l3_logged{-1};
     mutable std::atomic<int> l4_logged{-1}; // [TAG_FN_L4_GPUMOE]
+    mutable std::atomic<bool> tbo_on_logged{false};  // [TAG_FN_L22_TBO] the first two-chain graph
+    mutable std::atomic<bool> tbo_off_logged{false}; // [TAG_FN_L22_TBO] the first two-sequence graph the gate refused
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2745,6 +2751,36 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
+
+        // [TAG_FN_L22_TBO] two-chain decode (D5, LLAMA_FN_L22_TBO, llama-fn-tbo.h): a ubatch of two sequences is built as one
+        // row chain per sequence. tbo_c: the chain being built (-1: none, every other graph); nt() / nseq(): the rows and
+        // sequences the layer builders see (the ubatch's outside a chain). Gathers of recurrent rows stay whole (all
+        // sequences, before either chain writes a cell); a chain reads its column (tbo_col) and writes cell head + tbo_c.
+        int     tbo_c = -1;
+        int64_t tbo_T = 0;
+        int64_t nt()   const { return tbo_c >= 0 ? tbo_T : n_tokens; }
+        int64_t nseq() const { return tbo_c >= 0 ? 1 : (int64_t) ubatch.n_seqs; }
+        ggml_tensor * tbo_col(ggml_tensor * rows) const;
+        struct tbo_state; // qwen4exp.cpp
+        std::shared_ptr<tbo_state> tbo;
+        // the gate on this graph's parameters and inputs: 0 = an ordinary graph, else the walk order (1 interleaved, 2 sequential)
+        int  tbo_decide(llm_graph_input_mem_hybrid * inp, llm_graph_input_kpool * inp_kpool);
+        ggml_tensor * build_tbo_trunk(
+                llm_graph_input_mem_hybrid * inp,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * inp_out_ids,
+                    ggml_tensor * ple_emb,
+                    ggml_tensor * res_hc,
+                            int * sections,
+                            int   order);
+        void tbo_enter(int c);
+        void tbo_leave();
+        void tbo_begin(int c, int il);
+        void tbo_finish(int c, int il);
+        // build_layer_ffn in a chain: keeps the bridge placeholder and the shared expert for tbo_finish
+        ggml_tensor * tbo_pend(int il, ggml_tensor * moe_out, ggml_tensor * shexp);
 
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
