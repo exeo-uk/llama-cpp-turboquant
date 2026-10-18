@@ -17,6 +17,8 @@
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-arena.h"  // [TAG_FN_L14_ARENA]
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
+#include "llama-fn-l22.h"    // [TAG_FN_L22_P4] pins, direct I/O, residency, PASSLOG
+#include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -33,11 +35,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -73,6 +77,12 @@ struct pfs_bank {
 
     ggml_backend_event_t ev_done = nullptr; // copy stream, after the copies of holds
     ggml_backend_event_t ev_free = nullptr; // compute stream, at the last release
+
+    // [TAG_FN_L22_PIN] pin tickets of the copies dispatched into this bank, released once ev_tk (copy stream, after
+    // those copies) has completed: at the bank's next job, at a return of the banks, at the end
+    std::vector<int32_t> tk;
+    ggml_backend_event_t ev_tk = nullptr;
+    bool                 tk_rec = false;
 };
 
 struct pfs_job {
@@ -142,6 +152,29 @@ struct pfs_state {
     uint64_t           ub_bytes = 0;
     uint64_t           ub_d2d   = 0; // [TAG_FN_L14_PFSD2D]
     double             ub_wait  = 0.0;
+
+    // [TAG_FN_L22_P4] round 22 (all off unless llama_prefill_stream_l22_config turned them on)
+    llama_pfs_l22_cfg   l22;
+    const llama_model * model      = nullptr;
+    int64_t             rows_after = 0;     // [TAG_FN_L22_KEEPLEND] prompt rows still to come after the next ubatch
+    bool                tail_now   = false; // [TAG_FN_L22_ENDOVERLAP] the next ubatch is a prompt's narrow last part
+    bool                async_ret  = false; // [TAG_FN_L22_ENDOVERLAP] the next return queues the refill (upload worker)
+    bool                hidden     = false; // [TAG_FN_L22_KEEPLEND] the lent layers are hidden from the hot chains
+    llama_pfs_l22_sums  sums;               // under mtx
+    uint64_t            ub_pinned  = 0;     // this ubatch (under mtx)
+    uint64_t            ub_ssd     = 0;
+    // [TAG_FN_L22_READAHEAD] the read-ahead thread: woken at gate 0 of each ubatch (ra_gen), it samples every layer once
+    // and prefetches the missing ones in stream order
+    std::thread             ra_thr;
+    std::mutex              ra_mtx;
+    std::condition_variable ra_cv;
+    uint64_t                ra_gen  = 0;
+    bool                    ra_stop = false;
+    std::unique_ptr<std::atomic<uint16_t>[]> l_miss; // by position: sampled share out of RAM, permille (the read-ahead)
+    std::atomic<uint64_t>   l_miss_gen{0};           // the generation l_miss belongs to (0: none yet)
+    // [TAG_FN_L22_SSDTIER] direct I/O has read for the stream (1), refused before it ever read (-1), not tried (0): the
+    // read-ahead leaves the direct-I/O experts out only once it has read, so a refusing reader costs no read-ahead
+    std::atomic<int>        dio_state{0};
 };
 
 pfs_state * g_pfs = nullptr;
@@ -175,6 +208,190 @@ bool pfs_pages_missing(const pfs_layer & L) {
     return false;
 #endif
 }
+
+// [TAG_FN_L22_READAHEAD] the same sample as a share (0..1) of the layer's sampled pages that are out of the working set;
+// -1 when the query is not possible
+double pfs_missing_share(const pfs_layer & L) {
+#ifdef _WIN32
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
+    for (int k = 0; k < 3; ++k) {
+        if (!L.src[k] || !L.src[k]->data) {
+            continue;
+        }
+        const char * p0 = (const char *) L.src[k]->data;
+        for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
+            PSAPI_WORKING_SET_EX_INFORMATION x = {};
+            x.VirtualAddress = (void *) (p0 + o);
+            q.push_back(x);
+        }
+    }
+    if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
+        return -1.0;
+    }
+    size_t out = 0;
+    for (const auto & x : q) {
+        out += x.VirtualAttributes.Valid ? 0 : 1;
+    }
+    return (double) out / (double) q.size();
+#else
+    GGML_UNUSED(L);
+    return -1.0;
+#endif
+}
+
+// [TAG_FN_L22_SSDTIER] the experts of a layer that go through direct I/O in this job (empty: none)
+void pfs_dio_experts(const pfs_state * s, const pfs_layer & L, double miss, std::vector<uint8_t> & out) {
+    out.clear();
+    if (s->l22.ssdtier <= 0 || !s->model || !L.src[0]) {
+        return;
+    }
+    const int64_t n_exp = L.src[0]->ne[2];
+    const bool whole = s->l22.ssdtier >= 2 && miss > 0.5;
+    bool any = whole;
+    out.assign((size_t) n_exp, whole ? 1 : 0);
+    if (!whole) {
+        for (int64_t e = 0; e < n_exp; ++e) {
+            if (llama_fn_res_class(s->model, L.il, (int) e) == LLAMA_FN_RES_SSD) {
+                out[(size_t) e] = 1;
+                any = true;
+            }
+        }
+    }
+    if (!any) {
+        out.clear();
+    }
+}
+
+// [TAG_FN_L22_READAHEAD] the read-ahead thread: at each new ubatch (gate 0) one sample of every layer, then the layers
+// with pages out of RAM are prefetched in stream order, at most ra_call bytes per call; the experts that go through direct
+// I/O are left out (their pages never come through the mapping in a prompt)
+void pfs_ra_run(pfs_state * s) {
+    llama_fn_thread_name("prefill-readahead");
+    uint64_t done = 0;
+    std::vector<int>    miss;
+    std::vector<uint8_t> dio;
+    for (;;) {
+        uint64_t g = 0;
+        {
+            std::unique_lock<std::mutex> lk(s->ra_mtx);
+            s->ra_cv.wait(lk, [&]() { return s->ra_stop || s->ra_gen != done; });
+            if (s->ra_stop) {
+                return;
+            }
+            g = s->ra_gen;
+            done = g;
+        }
+        const int np = (int) s->layers.size();
+        miss.clear();
+        double sum = 0.0;
+        int    n_q = 0;
+        for (int p = 0; p < np; ++p) {
+            const double sh = pfs_missing_share(s->layers[p]);
+            s->l_miss[p].store((uint16_t) (sh < 0 ? 0 : std::min(1000.0, sh*1000.0 + 0.5)), std::memory_order_relaxed);
+            if (sh >= 0) {
+                sum += sh;
+                n_q++;
+            }
+            if (sh > 0.02) {
+                miss.push_back(p);
+            }
+        }
+        s->l_miss_gen.store(g, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->sums.miss_share  = n_q > 0 ? sum / n_q : 0.0;
+            s->sums.miss_layers = (uint32_t) miss.size();
+        }
+        if (llama_fn_warm_running()) {
+            continue; // [TAG_FN_L15_WARM] the warm pass brings the pages in itself
+        }
+        for (int p : miss) {
+            {
+                std::lock_guard<std::mutex> lk(s->ra_mtx);
+                if (s->ra_stop || s->ra_gen != g) {
+                    break; // a newer ubatch: sample again
+                }
+            }
+            const pfs_layer & L = s->layers[p];
+            const double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
+            if (s->dio_state.load(std::memory_order_relaxed) == 1) {
+                pfs_dio_experts(s, L, sh, dio);
+                if (s->l22.ssdtier >= 2 && sh > 0.5) {
+                    continue; // read by direct I/O as a whole
+                }
+            } else {
+                dio.clear(); // direct I/O has not read yet: the mapped pages are what the stream reads
+            }
+            std::vector<std::pair<const void *, size_t>> rr;
+            size_t bytes = 0;
+            for (int k = 0; k < 3; ++k) {
+                if (!L.src[k] || !L.src[k]->data) {
+                    continue;
+                }
+                const uint8_t * base = (const uint8_t *) L.src[k]->data;
+                if (dio.empty()) {
+                    rr.push_back({ base, L.nbytes[k] });
+                    bytes += L.nbytes[k];
+                    continue;
+                }
+                const size_t  nb    = L.src[k]->nb[2];
+                const int64_t n_exp = (int64_t) dio.size();
+                for (int64_t e = 0; e < n_exp; ) {
+                    if (dio[(size_t) e]) {
+                        ++e;
+                        continue;
+                    }
+                    int64_t e1 = e + 1;
+                    while (e1 < n_exp && !dio[(size_t) e1]) {
+                        ++e1;
+                    }
+                    rr.push_back({ base + (size_t) e*nb, (size_t) (e1 - e)*nb });
+                    bytes += (size_t) (e1 - e)*nb;
+                    e = e1;
+                }
+            }
+            // one call per ra_call bytes at most
+            std::vector<std::pair<const void *, size_t>> part;
+            size_t in_part = 0;
+            for (const auto & r : rr) {
+                for (size_t o = 0; o < r.second; ) {
+                    const size_t n = std::min(r.second - o, s->l22.ra_call - in_part);
+                    part.push_back({ (const uint8_t *) r.first + o, n });
+                    in_part += n;
+                    o += n;
+                    if (in_part >= s->l22.ra_call) {
+                        llama_fn_prefetch_ranges(part);
+                        part.clear();
+                        in_part = 0;
+                    }
+                }
+            }
+            if (!part.empty()) {
+                llama_fn_prefetch_ranges(part);
+            }
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->sums.ra_bytes += bytes;
+        }
+    }
+}
+
+// [TAG_FN_L22_PIN] release the bank's pin tickets once the copies behind them have landed
+void pfs_bank_release_tk(ggml_backend_t copy, pfs_bank & B) {
+    if (B.tk.empty()) {
+        return;
+    }
+    if (B.tk_rec && B.ev_tk) {
+        ggml_backend_event_synchronize(B.ev_tk);
+    } else if (copy) {
+        ggml_backend_synchronize(copy); // no event: everything queued so far
+    }
+    for (int32_t t : B.tk) {
+        llama_fn_pin_release(t);
+    }
+    B.tk.clear();
+    B.tk_rec = false;
+}
+
 std::mutex  g_pfs_init;
 
 size_t align_up(size_t x, size_t a) {
@@ -195,6 +412,11 @@ void pfs_run(pfs_state * s) {
     std::vector<void *>                      d2d_dst;
     std::vector<const void *>                d2d_src;
     std::vector<size_t>                      d2d_len;
+    // [TAG_FN_L22_PIN] [TAG_FN_L22_SSDTIER]
+    std::vector<std::pair<size_t, size_t>>   rr_pin;
+    std::vector<std::pair<size_t, size_t>>   rr_stage;
+    std::vector<uint8_t>                     dio;
+    std::vector<llama_fn_dio_req>            dio_req;
 
     for (;;) {
         pfs_job job;
@@ -223,7 +445,8 @@ void pfs_run(pfs_state * s) {
         pfs_bank &        B = s->banks[L.bank];
         llama_fn_warm_wait_layer(L.il); // [TAG_FN_L15_WARM] the warm pass brings this layer in first
         // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
-        if (s->ahead > 0 && !L.src_pinned && !llama_fn_warm_running()) {
+        // [TAG_FN_L22_READAHEAD] not while the round-22 read-ahead thread runs (it covers every layer of the pass)
+        if (s->ahead > 0 && !L.src_pinned && !s->l22.readahead && !llama_fn_warm_running()) {
             const int np = (int) s->layers.size();
             llama_memory_ranges mr;
             for (int d = 1; d <= s->ahead && d < np; ++d) {
@@ -251,6 +474,22 @@ void pfs_run(pfs_state * s) {
         bool cancelled   = false;
         size_t bytes = 0;
         size_t bytes_d2d = 0;
+        size_t bytes_pin = 0; // [TAG_FN_L22_PIN] dispatched straight from host pages (slot -1)
+        size_t bytes_ssd = 0; // [TAG_FN_L22_SSDTIER] read into the ring by direct I/O
+        std::vector<int32_t> job_tk; // [TAG_FN_L22_PIN] tickets of this job's pinned segments
+        // [TAG_FN_L22_SSDTIER] the experts of this layer that go through direct I/O (empty: none)
+        if (s->l22.ssdtier > 0 && s->dio_state.load(std::memory_order_relaxed) != -1) { // -1: the reader refuses
+            double miss = 0.0;
+            if (s->l22.ssdtier >= 2) {
+                miss = s->l_miss && s->l_miss_gen.load(std::memory_order_acquire) != 0 ?
+                       s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(L);
+            }
+            pfs_dio_experts(s, L, miss, dio);
+        } else {
+            dio.clear();
+        }
+        // [TAG_FN_L22_PIN] pinned segments through llama_fn_pin_query instead of the load-time flag (P6's registry)
+        const bool pin_live = s->l22.pin && llama_fn_pin_active();
 
         // true while this job is still wanted
         auto alive = [&]() -> bool {
@@ -269,6 +508,7 @@ void pfs_run(pfs_state * s) {
                 B.complete = false;
                 B.consumed = false;
             }
+            pfs_bank_release_tk(s->copy, B); // [TAG_FN_L22_PIN] the bank's last copies have landed (its layer was used)
             gen5::ev_wait(s->copy, B.ev_free, s->compute);
             dispatching = true;
             return true;
@@ -278,6 +518,8 @@ void pfs_run(pfs_state * s) {
             if (it.slot >= 0) {
                 gen5::ev_record(s->chunk_ev[it.slot], s->copy);
                 s->chunk_state[it.slot] = 2;
+            } else {
+                bytes_pin += it.n;
             }
             if (s->poke) {
                 s->poke(s->copy); // [TAG_FN_L3_HOST_POKE] the copy starts now, while this thread stages the next chunk
@@ -295,24 +537,27 @@ void pfs_run(pfs_state * s) {
             return true;
         };
 
-        // the byte ranges of tensor k in `ranges` from the host: through the ring, a slot filled by one copy of its pieces
-        auto stream_ranges = [&](int k) {
+        // the byte ranges rr of tensor k straight from the host (pinned pages: no staging ring), in chunks
+        auto stream_direct = [&](int k, const std::vector<std::pair<size_t, size_t>> & rr) {
             const uint8_t * src = (const uint8_t *) L.src[k]->data;
-            if (L.src_pinned) {
-                for (const auto & r : ranges) {
-                    for (size_t o = r.first; o < r.second && !cancelled; o += s->chunk) {
-                        if (!dispatching && !begin()) {
-                            cancelled = true;
-                            break;
-                        }
-                        dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) });
+            for (const auto & r : rr) {
+                for (size_t o = r.first; o < r.second && !cancelled; o += s->chunk) {
+                    if (!dispatching && !begin()) {
+                        cancelled = true;
+                        break;
                     }
+                    dispatch({ -1, src + o, s->off[k] + o, std::min(s->chunk, r.second - o) });
                 }
-                return;
             }
+        };
+        // the byte ranges rr of tensor k from the host: through the ring, a slot filled by one copy of its pieces
+        // [TAG_FN_L22_SSDTIER] the experts of dio are read into the slot by direct I/O instead (a refusal: the mapped read)
+        auto stream_ring = [&](int k, const std::vector<std::pair<size_t, size_t>> & rr) {
+            const uint8_t * src = (const uint8_t *) L.src[k]->data;
+            const size_t    nb  = L.src[k]->nb[2];
             size_t ri = 0;
-            size_t ro = ranges.empty() ? 0 : ranges[0].first;
-            while (ri < ranges.size() && !cancelled) {
+            size_t ro = rr.empty() ? 0 : rr[0].first;
+            while (ri < rr.size() && !cancelled) {
                 const int slot = next_slot;
                 next_slot = (next_slot + 1) % s->n_chunks;
                 if (s->chunk_state[slot] == 1 && !flush()) { // the ring is full of staged chunks of this job
@@ -327,17 +572,68 @@ void pfs_run(pfs_state * s) {
                 size_t pos = 0;
                 segs.clear();
                 pieces.clear();
-                while (pos < s->chunk && ri < ranges.size()) {
-                    const size_t n = std::min(s->chunk - pos, ranges[ri].second - ro);
-                    segs.push_back({ dst + pos, src + ro, n });
+                dio_req.clear();
+                while (pos < s->chunk && ri < rr.size()) {
+                    const size_t n = std::min(s->chunk - pos, rr[ri].second - ro);
+                    if (dio.empty() || nb == 0) {
+                        segs.push_back({ dst + pos, src + ro, n });
+                    } else {
+                        // [TAG_FN_L22_SSDTIER] split at expert edges into runs of the same path
+                        for (size_t o = ro; o < ro + n; ) {
+                            const size_t e  = o / nb;
+                            const bool   dd = e < dio.size() && dio[e] != 0;
+                            size_t o1 = std::min(ro + n, (e + 1)*nb);
+                            while (o1 < ro + n) {
+                                const size_t e2 = o1 / nb;
+                                if ((e2 < dio.size() && dio[e2] != 0) != dd) {
+                                    break;
+                                }
+                                o1 = std::min(ro + n, (e2 + 1)*nb);
+                            }
+                            if (dd) {
+                                dio_req.push_back({ src + o, o1 - o, dst + pos + (o - ro) });
+                            } else {
+                                segs.push_back({ dst + pos + (o - ro), src + o, o1 - o });
+                            }
+                            o = o1;
+                        }
+                    }
                     pieces.push_back({ slot, dst + pos, s->off[k] + ro, n });
                     pos += n;
                     ro  += n;
-                    if (ro == ranges[ri].second && ++ri < ranges.size()) {
-                        ro = ranges[ri].first;
+                    if (ro == rr[ri].second && ++ri < rr.size()) {
+                        ro = rr[ri].first;
                     }
                 }
-                s->pool.copy_list(segs.data(), (int) segs.size());
+                int dio_tk = -1;
+                if (!dio_req.empty()) {
+                    dio_tk = llama_fn_dio_submit(s->model, dio_req.data(), (int) dio_req.size());
+                    if (dio_tk < 0) {
+                        int unknown = 0;
+                        s->dio_state.compare_exchange_strong(unknown, -1); // refused before it ever read
+                        for (const auto & r : dio_req) {
+                            segs.push_back({ (uint8_t *) r.dst, (const uint8_t *) r.src, r.len });
+                        }
+                    }
+                }
+                if (!segs.empty()) {
+                    s->pool.copy_list(segs.data(), (int) segs.size());
+                }
+                if (dio_tk >= 0) {
+                    if (llama_fn_dio_wait(dio_tk)) {
+                        s->dio_state.store(1, std::memory_order_relaxed);
+                        for (const auto & r : dio_req) {
+                            bytes_ssd += r.len;
+                        }
+                    } else {
+                        // a failed read: the mapped bytes (same values)
+                        segs.clear();
+                        for (const auto & r : dio_req) {
+                            segs.push_back({ (uint8_t *) r.dst, (const uint8_t *) r.src, r.len });
+                        }
+                        s->pool.copy_list(segs.data(), (int) segs.size());
+                    }
+                }
                 s->chunk_state[slot] = 1;
                 for (const item & it : pieces) {
                     if (dispatching) {
@@ -360,6 +656,44 @@ void pfs_run(pfs_state * s) {
                     cancelled = true;
                 }
             }
+        };
+        // the byte ranges of tensor k in `ranges` from the host
+        auto stream_ranges = [&](int k) {
+            if (pin_live) {
+                // [TAG_FN_L22_PIN] split at segment edges: pinned segments straight from their pages (a copy never runs past
+                // a registered range), the rest through the ring
+                const uint8_t * src = (const uint8_t *) L.src[k]->data;
+                rr_pin.clear();
+                rr_stage.clear();
+                for (const auto & r : ranges) {
+                    for (size_t o = r.first; o < r.second; ) {
+                        llama_fn_pin_seg seg = {};
+                        if (!llama_fn_pin_query(src + o, r.second - o, &seg) || seg.len == 0 || seg.len > r.second - o) {
+                            rr_stage.push_back({ o, r.second });
+                            break;
+                        }
+                        (seg.pinned ? rr_pin : rr_stage).push_back({ o, o + seg.len });
+                        if (seg.ticket >= 0) {
+                            job_tk.push_back(seg.ticket);
+                        }
+                        o += seg.len;
+                    }
+                }
+                stream_direct(k, rr_pin);
+                if (!cancelled && !rr_stage.empty()) {
+                    if (s->n_chunks > 0) {
+                        stream_ring(k, rr_stage);
+                    } else {
+                        stream_direct(k, rr_stage); // no ring (every layer was pinned at load): pageable copies
+                    }
+                }
+                return;
+            }
+            if (L.src_pinned) {
+                stream_direct(k, ranges);
+                return;
+            }
+            stream_ring(k, ranges);
         };
         // [TAG_FN_L14_PFSD2D] the runs of experts with (held = true) or without a hot slot, as byte ranges of tensor k
         const int64_t n_exp = L.src[0]->ne[2];
@@ -454,6 +788,26 @@ void pfs_run(pfs_state * s) {
             }
             staged.clear();
         }
+        // [TAG_FN_L22_PIN] this job's tickets stay with the bank until its copies have landed
+        if (!job_tk.empty()) {
+            if (dispatching) {
+                if (!B.ev_tk) {
+                    B.ev_tk = gen5::ev_new(s->dev);
+                }
+                if (B.ev_tk) {
+                    gen5::ev_record(B.ev_tk, s->copy);
+                    B.tk_rec = true;
+                } else {
+                    B.tk_rec = false; // released after a synchronize of the copy stream
+                }
+                B.tk.insert(B.tk.end(), job_tk.begin(), job_tk.end());
+            } else {
+                for (int32_t t : job_tk) {
+                    llama_fn_pin_release(t); // nothing was dispatched
+                }
+            }
+            job_tk.clear();
+        }
 
         {
             std::lock_guard<std::mutex> lk(s->mtx);
@@ -464,6 +818,12 @@ void pfs_run(pfs_state * s) {
                 s->ub_bytes  += bytes;
                 s->ctr.d2d_bytes += bytes_d2d; // [TAG_FN_L14_PFSD2D]
                 s->ub_d2d        += bytes_d2d;
+                s->ub_pinned     += bytes_pin; // [TAG_FN_L22_P4]
+                s->ub_ssd        += bytes_ssd;
+                s->sums.bytes_pinned += bytes_pin;
+                s->sums.bytes_ssd    += bytes_ssd;
+                s->sums.bytes_staged += bytes > bytes_pin + bytes_ssd ? bytes - bytes_pin - bytes_ssd : 0; // mapped reads
+                s->sums.bytes_d2d    += bytes_d2d;
             } else if (B.holds == job.pos && dispatching) {
                 B.holds    = -1; // partly written
                 B.consumed = true;
@@ -531,9 +891,18 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
             s->ub_bytes = 0;
             s->ub_d2d   = 0;
             s->ub_wait  = 0.0;
+            s->ub_pinned = 0; // [TAG_FN_L22_P4]
+            s->ub_ssd    = 0;
+            s->sums.ubatches++;
             had = B.holds == 0 && B.complete;
             if (had) {
                 s->ctr.reused++;
+            }
+            // [TAG_FN_L22_READAHEAD] a new pass: the read-ahead samples every layer once and prefetches what is out
+            if (s->l22.readahead && s->ra_thr.joinable()) {
+                std::lock_guard<std::mutex> rlk(s->ra_mtx);
+                s->ra_gen = s->gen;
+                s->ra_cv.notify_one();
             }
         }
         s->cv.notify_all();
@@ -561,6 +930,7 @@ void pfs_gate_op(ggml_tensor * dst, int ith, int nth, void * ud) {
     std::lock_guard<std::mutex> lk(s->mtx);
     s->ctr.wait_s += w;
     s->ub_wait    += w;
+    s->sums.wait_ms += w*1e3; // [TAG_FN_L22_P4]
 }
 
 void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
@@ -592,6 +962,14 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
                     s->ctr.ubatches, s->layers.size(), dt*1e3, s->ub_bytes/1073741824.0,
                     dt > 0 ? s->ub_bytes/1073741824.0/dt : 0.0, s->ub_wait*1e3, s->ub_d2d/1073741824.0);
         }
+        // [TAG_FN_L22_PASSLOG] level 2: one line per streamed ubatch
+        if (s->l22.passlog >= 2 && L->pos == (int) s->layers.size() - 1) {
+            const double dt = (ggml_time_us() - s->t_ub0) / 1e6;
+            llama_fn_l22_log("pass", "ubatch=%" PRIu64 " layers=%zu ms=%.1f host_gib=%.2f pinned_gib=%.2f ssd_gib=%.2f d2d_gib=%.2f "
+                    "gate_wait_ms=%.1f miss_share=%.3f miss_layers=%u", s->ctr.ubatches, s->layers.size(), dt*1e3,
+                    s->ub_bytes/1073741824.0, s->ub_pinned/1073741824.0, s->ub_ssd/1073741824.0, s->ub_d2d/1073741824.0,
+                    s->ub_wait*1e3, s->sums.miss_share, s->sums.miss_layers);
+        }
     }
     s->cv.notify_all();
 }
@@ -606,9 +984,24 @@ void pfs_destroy(pfs_state * s) {
     if (s->thr.joinable()) {
         s->thr.join();
     }
+    if (s->ra_thr.joinable()) { // [TAG_FN_L22_READAHEAD]
+        {
+            std::lock_guard<std::mutex> lk(s->ra_mtx);
+            s->ra_stop = true;
+        }
+        s->ra_cv.notify_all();
+        s->ra_thr.join();
+    }
     s->pool.stop();
     if (s->copy) {
         ggml_backend_synchronize(s->copy);
+    }
+    for (auto & b : s->banks) {
+        pfs_bank_release_tk(s->copy, b); // [TAG_FN_L22_PIN] every copy has landed
+    }
+    if (s->hidden) {
+        llama_moe_hot_lend_hide(s->owner, false); // [TAG_FN_L22_KEEPLEND]
+        s->hidden = false;
     }
     if (s->lent) {
         llama_moe_hot_unlend(s->owner); // [TAG_FN_R1_PFS_LEND] the hot set gets its range back (no copy runs any more)
@@ -617,6 +1010,7 @@ void pfs_destroy(pfs_state * s) {
     for (auto & b : s->banks) {
         if (b.ev_done) { ggml_backend_event_free(b.ev_done); }
         if (b.ev_free) { ggml_backend_event_free(b.ev_free); }
+        if (b.ev_tk)   { ggml_backend_event_free(b.ev_tk); }
         if (b.buf)     { ggml_backend_buffer_free(b.buf); }
     }
     for (auto * e : s->chunk_ev) {
@@ -683,6 +1077,13 @@ static bool pfs_take(pfs_state * s) {
             B.used_pos = -1;
         }
         s->ctr.lends++;
+        // [TAG_FN_L22_REFILL] (c) bank 0 starts filling now, before the first gate (which keeps a running or finished copy
+        // of layer 0); the slot snapshot of its device copies is taken by the streamer, and no hot-set step runs before
+        // that gate
+        if (s->l22.prestage && !s->layers.empty()) {
+            s->queue.push_back({ 0, s->gen });
+            s->cv.notify_all();
+        }
     }
     s->lent = true;
     return true;
@@ -710,8 +1111,20 @@ static void pfs_return(pfs_state * s) {
     if (s->copy) {
         ggml_backend_synchronize(s->copy); // what it dispatched has landed
     }
+    for (auto & B : s->banks) {
+        pfs_bank_release_tk(s->copy, B); // [TAG_FN_L22_PIN]
+    }
     s->lent = false;
-    llama_moe_hot_unlend(s->owner);
+    if (s->hidden) {
+        llama_moe_hot_lend_hide(s->owner, false); // [TAG_FN_L22_KEEPLEND] the lent layers' hot chains come back with them
+        s->hidden = false;
+    }
+    if (s->async_ret) {
+        s->async_ret = false;
+        llama_moe_hot_unlend_async(s->owner); // [TAG_FN_L22_ENDOVERLAP] refill through the upload worker
+    } else {
+        llama_moe_hot_unlend(s->owner);
+    }
 }
 
 bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_desc> & layers, const llama_moe_gen5_device & d, const void * owner) {
@@ -962,6 +1375,21 @@ bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t
     if (want == s->lent) {
         return false;
     }
+    // [TAG_FN_L22_KEEPLEND] a narrow ubatch of the owner's graphs (not a reserve, not a switch to SMALL: n_tokens 0) keeps
+    // the banks while prompt rows follow it (KEEPLEND), or when it is a prompt's narrow last part (ENDOVERLAP). The lent
+    // layers' tables say "not hot" for every expert (llama_moe_hot_lend), but their zero slot may hold bank bytes now:
+    // the hot set hides those layers from the hot chains until the banks go back (the bridge / CPU computes them), and
+    // the hide bumps the hot generation, so no graph built under the other state is reused
+    if (!want && sched && n_tokens > 0 && ((s->l22.keeplend && s->rows_after > 0) || (s->l22.endoverlap && s->tail_now))) {
+        if (!s->hidden) {
+            ggml_backend_sched_synchronize(sched); // the owner's last graph is done before the tables / lookups change
+            llama_moe_hot_lend_hide(s->owner, true);
+            s->hidden = true;
+        }
+        std::lock_guard<std::mutex> lk(s->mtx);
+        s->sums.keeps++;
+        return false;
+    }
     if (sched) {
         ggml_backend_sched_synchronize(sched); // the owner's last graph is done: nothing reads the slots or the banks
     }
@@ -970,4 +1398,77 @@ bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t
     }
     pfs_return(s);
     return true;
+}
+
+// [TAG_FN_L22_P4] ----------------------------------------------------------------------------------------------------
+
+void llama_prefill_stream_l22_config(const void * owner, const llama_model * model, const llama_pfs_l22_cfg & cfg) {
+    std::lock_guard<std::mutex> init_lock(g_pfs_init);
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return;
+    }
+    s->model = model;
+    s->l22   = cfg;
+    if (s->l22.ra_call == 0) {
+        s->l22.ra_call = (size_t) 2048 << 20;
+    }
+    if (!s->lend) {
+        s->l22.keeplend   = false; // only a lending stream returns its banks between ubatches
+        s->l22.endoverlap = false;
+        s->l22.prestage   = false;
+    }
+    if (s->l22.readahead && !s->ra_thr.joinable() && !s->layers.empty()) {
+        s->l_miss.reset(new std::atomic<uint16_t>[s->layers.size()]);
+        for (size_t p = 0; p < s->layers.size(); ++p) {
+            s->l_miss[p].store(0);
+        }
+        s->ra_thr = std::thread(pfs_ra_run, s);
+    }
+    if (s->l22.keeplend || s->l22.endoverlap || s->l22.prestage || s->l22.readahead || s->l22.ssdtier > 0 || s->l22.pin) {
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_P4] round 22:%s%s%s%s%s%s\n",
+                s->l22.keeplend ? " KEEPLEND (narrow ubatches with prompt rows after them keep the banks)" : "",
+                s->l22.endoverlap ? " ENDOVERLAP (the prompt's last part keeps them, the answer's first step returns them)" : "",
+                s->l22.prestage ? " REFILL (layer 0 copied at the lend)" : "",
+                s->l22.readahead ? " READAHEAD (every layer sampled at gate 0)" : "",
+                s->l22.ssdtier > 0 ? (s->l22.ssdtier >= 2 ? " SSDTIER=2" : " SSDTIER=1") : "",
+                s->l22.pin ? " PIN (pinned segments straight to the banks)" : "");
+    }
+}
+
+void llama_prefill_stream_l22_set_after(const void * owner, int64_t rows_after, bool tail) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return;
+    }
+    s->rows_after = rows_after; // the owner's thread only (with before_ubatch)
+    s->tail_now   = tail;
+}
+
+void llama_prefill_stream_l22_async_return(const void * owner, bool on) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return;
+    }
+    s->async_ret = on && s->lent;
+}
+
+bool llama_prefill_stream_l22_lent(const void * owner) {
+    const pfs_state * s = g_pfs;
+    return s && s->owner == owner && s->lent;
+}
+
+llama_pfs_l22_sums llama_prefill_stream_l22_take(const void * owner) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    llama_pfs_l22_sums r = s->sums;
+    const double miss = s->sums.miss_share;
+    const uint32_t ml = s->sums.miss_layers;
+    s->sums = {};
+    s->sums.miss_share  = miss; // the last sample stays
+    s->sums.miss_layers = ml;
+    return r;
 }
