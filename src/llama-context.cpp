@@ -8,6 +8,7 @@
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
+#include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1737,6 +1738,11 @@ llama_context::llama_context(
                         bridge_rb ? (int) cparams.n_rs_seq : 0);
         vram_account("bridge"); // [TAG_FN_L3_VRAM_ACCOUNT]
 
+        // [TAG_FN_L22_CPUSHARE] P16: the share mode before the stream exists (mode 1 lays its banks out with a zero expert)
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            l22_cps_mode = llama_fn_cpushare_configure(model, this);
+        }
+
         // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM] before the reserve: the graphs it builds use the gen5 banks
         // [TAG_FN_MERGE] with a host bridge the DMA share / prefetch stay off (they need the CPU split the bridge removes)
         llama_moe_gen5_init(model, this, backend_ptrs, moe_bridge != nullptr);
@@ -1766,6 +1772,7 @@ llama_context::llama_context(
                 if (armed) {
                     llama_moe_bridge_free(br);
                     br = nullptr;
+                    llama_fn_cpushare_free(owner); // [TAG_FN_L22_CPUSHARE]
                     llama_moe_gen5_free(owner);
                 }
             }
@@ -1857,6 +1864,7 @@ llama_context::~llama_context() {
     llama_moe_hot_state_save(this);    // [TAG_FN_L3_POLICY_STATE] LLAMA_MOE_HOT_STATE: counts + residents, owner only
     llama_moe_bridge_free(moe_bridge); // [TAG_MOE_BRIDGE] no graph runs now
     moe_bridge = nullptr;
+    llama_fn_cpushare_free(this); // [TAG_FN_L22_CPUSHARE] its pin tickets go back before the stream goes
     llama_moe_gen5_free(this); // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 
     llama_moe_trace_flush(); // [TAG_FN_MOE_TRACE]
@@ -2180,7 +2188,14 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
+        // [TAG_FN_L22_PHASE] R-P11-6 / R-P12-4: with an answer-changing lever set the tg graph (every row an output) is
+        // reserved as a GEN-phase graph, so the nodes the levers add there are in the reserve (no growth at their first step)
+        const int32_t phase0 = fn_phase;
+        if (fn_l22_x.any()) {
+            fn_phase = LLAMA_FN_PHASE_GEN;
+        }
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        fn_phase = phase0;
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -3812,6 +3827,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } fn_phase_reset_on_exit{fn_phase};
 
+    // [TAG_FN_L22_CPUSHARE] after a decode that ran CPU share layers: its PASSLOG line, and any compute buffer that grew
+    struct cps_log_on_exit {
+        llama_context *      c  = nullptr;
+        ggml_backend_sched_t s0 = nullptr;
+        std::vector<size_t>  b0;
+        ~cps_log_on_exit() {
+            if (c) {
+                c->l22_cps_log(s0, b0);
+            }
+        }
+    } cps_log_exit;
+    if (l22_cps_mode > 0 && sched) {
+        cps_log_exit.c  = this;
+        cps_log_exit.s0 = sched.get();
+        for (auto & backend : backends) {
+            cps_log_exit.b0.push_back(ggml_backend_sched_get_buffer_size(sched.get(), backend.get()));
+        }
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -5050,14 +5084,16 @@ void llama_context::output_reorder() {
 // [TAG_FN_L22_SCHEDBUF] qwen4exp with LLAMA_FN_L22_SCHEDBUF: the budget measured at this width's last reserve (the real
 // graphs x 3/2 + 8192) instead of the n_tokens x 40 formula, never above it; every other model the formula
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    // [TAG_FN_L22_CPUSHARE] a share layer adds ~10 nodes and no reserve graph streams: room for them
+    const uint32_t extra = l22_cps_mode > 0 ? 16u*model.hparams.n_layer() : 0u;
     const uint32_t res = graph_max_nodes_base(n_tokens);
     if (l22.schedbuf && !l22_nodes.empty()) {
         const auto it = l22_nodes.find(n_tokens);
         if (it != l22_nodes.end() && it->second > 0 && it->second < res) {
-            return it->second;
+            return it->second + extra;
         }
     }
-    return res;
+    return res + extra;
 }
 
 uint32_t llama_context::graph_max_nodes_base(uint32_t n_tokens) const {
@@ -7463,6 +7499,43 @@ void llama_context::l22_init() {
                 l22.schedbuf ? " SCHEDBUF" : "", l22.sampstatic ? " SAMPSTATIC" : "", l22.graphkeep ? " GRAPHKEEP-marks" : "");
     }
     l22p_init(); // [TAG_FN_L22_P10]
+}
+
+// [TAG_FN_L22_CPUSHARE] the end of a decode call: one PASSLOG line when share layers ran (their sums since the last line,
+// the stream's share counters as differences), a WARN when a compute buffer grew meanwhile (device memory after ready)
+void llama_context::l22_cps_log(ggml_backend_sched_t s0, const std::vector<size_t> & b0) {
+    constexpr double MiB = 1024.0*1024.0;
+    const llama_fn_cps_sums cs = llama_fn_cpushare_take();
+    if (cs.layers == 0) {
+        return;
+    }
+    if (sched && sched.get() == s0 && b0.size() == backends.size()) {
+        for (size_t i = 0; i < backends.size(); ++i) {
+            const size_t b1 = ggml_backend_sched_get_buffer_size(sched.get(), backends[i].get());
+            if (b1 > b0[i] && l22_cps_n_grow++ < 8) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_CPUSHARE] the %s compute buffer grew %.1f -> %.1f MiB in a decode with CPU share "
+                        "layers\n", __func__, ggml_backend_name(backends[i].get()), b0[i]/MiB, b1/MiB);
+            }
+        }
+    }
+    if (l22.passlog < 1) {
+        return;
+    }
+    const llama_pfs_share_counters sc = llama_prefill_stream_share_counters();
+    const llama_pfs_share_counters & p = l22_cps_sc0;
+    llama_fn_l22_log("pass", "sub=cps mode=%d rows=%lld ubatches=%llu layers=%llu cpu_experts=%llu cpu_pairs=%llu cpu_tokens=%llu "
+            "k_mean=%.2f skip_cpu_mib=%.0f skip_unrouted_mib=%.0f late_mib=%.0f cpu_ms=%.1f dropped=%llu cut_cap=%llu pins_off=%llu "
+            "stream_jobs=%llu stream_skip_mib=%.0f stream_late_mib=%.0f plan_wait_ms=%.1f timeouts=%llu invalidated=%llu "
+            "plan_us=%.0f dma_gbs=%.1f rls_e=%.1f rls_r=%.2f grow=%llu", l22_cps_mode, (long long) cs.rows,
+            (unsigned long long) cs.ubatches, (unsigned long long) cs.layers, (unsigned long long) cs.cpu_experts,
+            (unsigned long long) cs.cpu_pairs, (unsigned long long) cs.cpu_tokens, cs.budget_k/(double) cs.layers,
+            cs.skip_cpu/MiB, cs.skip_unr/MiB, cs.late_bytes/MiB, cs.cpu_ms, (unsigned long long) cs.dropped,
+            (unsigned long long) cs.cut_cap, (unsigned long long) cs.pins_off, (unsigned long long) (sc.jobs - p.jobs),
+            (sc.skip_bytes - p.skip_bytes)/MiB, (sc.late_bytes - p.late_bytes)/MiB, sc.plan_wait_ms - p.plan_wait_ms,
+            (unsigned long long) (sc.timeouts - p.timeouts), (unsigned long long) (sc.invalidated - p.invalidated),
+            sc.plan_us_ewma, sc.dma_bpu_ewma > 0 ? sc.dma_bpu_ewma*1e6/1e9 : 0.0, cs.rls_e, cs.rls_r,
+            (unsigned long long) l22_cps_n_grow);
+    l22_cps_sc0 = sc;
 }
 
 // [TAG_FN_L22_OOMHOOK] before a device allocation of need bytes with pins active: DXGI LOCAL headroom below need + 512 MiB
