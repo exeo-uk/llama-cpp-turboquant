@@ -245,7 +245,7 @@ using fn_reg_fn_t   = bool (*)(void *, size_t);
 using fn_unreg_fn_t = void (*)(void *);
 using fn_devptr_t   = void * (*)(const void *); // R-P14-5 (P7): cudaHostGetDevicePointer of a registered address
 using fn_regmap_t   = bool (*)(void *, size_t, void **); // R-P14-5 (P7): register Portable | ReadOnly | Mapped + device pointer
-using fn_oomfn_t    = bool (*)(size_t, void *);
+using fn_oomfn_t    = bool (*)(size_t, int, void *);   // need, after_failure, ud (P7's ggml_cuda_fn_l22_oom_fn_t)
 using fn_set_oom_t  = void (*)(fn_oomfn_t, void *);    // R-P7-2 (P7): ggml-cuda calls it once before failing an allocation
 
 std::atomic<uint64_t> g_default_luid{0};
@@ -579,9 +579,21 @@ bool fn_touch(fn_pin_state * st, const uint8_t * p, size_t n) {
     return true;
 }
 
-// ggml-cuda's allocation hook (R-P7-2): one unpin before a graph instantiate or a pool growth fails
-bool fn_cuda_oom(size_t need, void * ud) {
+// ggml-cuda's allocation hook (R-P7-2), before a graph instantiate or a VMM pool growth: after_failure 0 = pre-check,
+// unpin only when LOCAL headroom < need + 512 MiB (on_oom unpins for good); 1 = the allocation failed, unpin once
+bool fn_cuda_oom(size_t need, int after_failure, void * ud) {
     (void) ud;
+    if (after_failure == 0) {
+        fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+        if (st == nullptr || !st->reg.any_active()) {
+            return false;
+        }
+        bool ok = false;
+        const int64_t head = fn_local_headroom(st, &ok);
+        if (!ok || head >= (int64_t) need + (int64_t) (512*FN_MIB)) {
+            return false;
+        }
+    }
     return llama_fn_pin_on_oom(need);
 }
 
