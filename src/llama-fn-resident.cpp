@@ -49,6 +49,8 @@ struct res_layer {
     std::vector<int32_t>                     slot;
     std::vector<float>                       cnt;
     std::vector<uint8_t>                     vol;
+    int32_t                                  b_lo = -1; // [TAG_FN_L22_UBPLAN] P10 R2: the last borrow slots [b_lo, b_hi) seen
+    int32_t                                  b_hi = -1;
 };
 
 struct res_table {
@@ -60,6 +62,7 @@ struct res_table {
     bool                    resset  = false;
     bool                    rewarm  = false;
     int                     ssd     = 0;
+    bool                    borrow_ram = false; // [TAG_FN_L22_UBPLAN] P10 R2: residents of the 16K reserve's borrow slots stream
     size_t                  floor_b = (size_t) 4096 << 20; // LLAMA_FN_L15_WARM_FREE_MIB
     size_t                  rewarm_floor = (size_t) 6 << 30;
     std::atomic<uint64_t>   gen{1};
@@ -383,6 +386,21 @@ bool res_poll_layer(res_table * t, int li, std::vector<std::pair<int, int>> * en
     if (r < 0) {
         std::fill(s.begin(), s.end(), -1); // no hot set (yet): every expert is the host's
         std::fill(v.begin(), v.end(), 0);
+    }
+    // [TAG_FN_L22_UBPLAN] [TAG_FN_L22_BIGUB2] P10 R2: with UBPLAN / BIGUB2 the borrow slots go out in every 16K FULL period
+    // and the stream reads their experts from RAM then: they lose their VRAM without a choice (vol), so RAM class. A busy
+    // query keeps the last range (a stale one only keeps pages); no borrow anywhere or no hot set clears it.
+    if (t->borrow_ram) {
+        int32_t lo = -1, hi = -1;
+        if (r > 0 && llama_moe_hot_borrow_range(L.t[0], &lo, &hi)) {
+            L.b_lo = lo;
+            L.b_hi = hi;
+        } else if (r < 0 || llama_moe_hot_cb_borrow_bytes() == 0) {
+            L.b_lo = L.b_hi = -1;
+        }
+        for (int e = 0; e < L.n_exp && L.b_lo >= 0; ++e) {
+            v[e] = s[e] >= L.b_lo && s[e] < L.b_hi ? 1 : v[e];
+        }
     }
     bool changed = false;
     for (int e = 0; e < L.n_exp; ++e) {
@@ -893,6 +911,8 @@ bool llama_fn_p5_ready(const llama_model & model) {
     t->resset = resset;
     t->rewarm = rewarm;
     t->ssd    = ssd;
+    t->borrow_ram = llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_UBPLAN")) ||
+                    llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_BIGUB2")); // [TAG_FN_L22_UBPLAN] P10 R2
     t->floor_b = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
