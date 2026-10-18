@@ -108,6 +108,9 @@
 //                                         neither part) on the layer's defer channel; the graph adds them after the next
 //                                         layer's token mixer. check: added in the same layer (plumbing test). Neither rule
 //                                         set: w = 0.1. The sync op of a retried ubatch splits the same way
+//   LLAMA_FN_L22_TBO=1|2                  [TAG_FN_L22_TBO] (lookup; spin waits; two sequences per graph fit) a second channel
+//                                         per bridged layer for the two-chain decode graph (D5, llama-fn-tbo.h); its posts
+//                                         carry GGML_MOE_BRIDGE_JOB_NOPF (no next-layer prefetch between the chains)
 
 #include <cstdint>
 
@@ -118,8 +121,8 @@ struct llama_moe_bridge;
 // nullptr when disabled or not possible here (the reason is logged). max_t_cap > 0: graphs wider than that never take
 // the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole). seq_t_cap > 0: nor graphs
 // with more tokens of one sequence ([TAG_FN_L13_BRIDGE_SEQS]: the ring is per sequence, so 2 streams of 3 tokens fit)
-// [TAG_FN_L22_TBO] R-D5-3: n_chains >= 2 asks for a second channel per bridged layer (two-chain decode, D5); P0 stub:
-// ignored (one chain)
+// [TAG_FN_L22_TBO] n_chains >= 2 asks for a second channel per bridged layer (two-chain decode, D5). The bridge also makes
+// it by itself when LLAMA_FN_L22_TBO is on (qwen4exp, spin waits) and two sequences of seq_t_cap tokens fit max_t_cap
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0, int seq_t_cap = 0,
         int n_chains = 1);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
@@ -152,8 +155,8 @@ bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens);
 int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);
-// [TAG_FN_L22_TBO] R-D5-3: the chains of the bridge (nullptr: 0; P0 stub: 1) and the channel of chain `chain` for this
-// layer (chain 0 = llama_moe_bridge_layer; P0 stub: false for any other chain)
+// [TAG_FN_L22_TBO] the channel sets of the bridge (nullptr: 0, else 1 or 2) and the channel of chain `chain` for this
+// layer (chain 0 = llama_moe_bridge_layer; false for a chain the bridge does not have)
 int  llama_moe_bridge_n_chains   (const llama_moe_bridge * br);
 bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor * up_exps, int chain, int32_t * id, int32_t * chan);
 // [TAG_FN_L22_X_DEFER] 0 off, 1 defer, 2 check (nullptr: 0); the defer channel of layer channel chan (-1: none); the rule

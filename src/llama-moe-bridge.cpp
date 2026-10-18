@@ -1,6 +1,7 @@
 #include "llama-moe-bridge.h"
 #include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
 #include "llama-fn-prior.h" // [TAG_FN_L22_X_PRIOR]
+#include "llama-fn-tbo.h" // [TAG_FN_L22_TBO] two-chain decode: the channel layout
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -299,6 +300,10 @@ struct llama_moe_bridge {
     };
     std::vector<chan> chans;
     std::unordered_map<const ggml_tensor *, int> by_up;
+    // [TAG_FN_L22_TBO] two-chain decode (D5): chans holds n_chains copies of the n_chan0 layer channels, chain c's channel of
+    // layer channel i at c*n_chan0 + i (fn_tbo::chan_layout); by_up names chain 0's. One chain: n_chan0 == chans.size()
+    int n_chan0  = 0;
+    int n_chains = 1;
 
     ggml_cpu_moe_pool *      pool = nullptr;
     ggml_cpu_moe_pool_params pool_params = {};
@@ -838,6 +843,9 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
     if (j.chan < 0 || j.chan >= (int) br->pf_next.size() || j.x == nullptr || j.n_tokens < 1 || j.n_tokens > br->max_t) {
         return;
     }
+    if (j.flags & GGML_MOE_BRIDGE_JOB_NOPF) {
+        return; // [TAG_FN_L22_TBO] a two-chain graph: the other chain's job comes next, the DRAM is never idle
+    }
     const int nc = br->pf_next[j.chan];
     if (nc < 0 || (br->hint_k <= 0 && br->pf_router[nc].empty())) {
         return;
@@ -950,7 +958,7 @@ static void br_exec_main(llama_moe_bridge * br) {
                 g_gate_busy.fetch_add(1, std::memory_order_acq_rel);
             }
             const bool ok = br_run(&job, br);
-            if ((job.flags & GGML_MOE_BRIDGE_JOB_DEFER) && br->xd_base >= 0 && job.chan >= 0 && job.chan < (int) br->chans.size()) {
+            if ((job.flags & GGML_MOE_BRIDGE_JOB_DEFER) && br->xd_base >= 0 && job.chan >= 0 && job.chan < br->n_chan0) {
                 // [TAG_FN_L22_X_DEFER] the light part is owed before the heavy part is answered, so reset() never sees the
                 // bridge idle while the light part still reads this channel's x / ids / w; once taken it is always answered
                 ggml_moe_bridge_job jb;
@@ -984,7 +992,7 @@ static void br_exec_main(llama_moe_bridge * br) {
             if (br->diag) {
                 br->dg_t_last_job.store(br_now_ns(), std::memory_order_release);
             }
-            if (br->pf_on && ok) {
+            if (br->pf_on && ok && !(job.flags & GGML_MOE_BRIDGE_JOB_NOPF)) { // [TAG_FN_L22_TBO] no prefetch between chains
                 br_prefetch_next(br, pool, job); // [TAG_FN_R2_BRIDGE_PF]
                 if (br->exec_on) {
                     // [TAG_FN_L3_HOST_EXEC] this thread computes a share of the next job: pull it in until that job is posted
@@ -1116,7 +1124,6 @@ bool llama_moe_bridge_wanted(const llama_model & model) {
 }
 
 llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap, int seq_t_cap, int n_chains) {
-    (void) n_chains; // [TAG_FN_L22_TBO] R-D5-3: P0 stub, one chain (D5 adds the second)
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
     }
@@ -1412,6 +1419,31 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
 
+    // [TAG_FN_L22_TBO] two-chain decode (D5, qwen4exp, LLAMA_FN_L22_TBO, spin waits): a second channel per bridged layer, right
+    // after the layer channels and before the PLE and defer channels, when two sequences fit one graph (the context asks
+    // for 2 chains, or the ring holds two sequences of seq_t tokens: --parallel 2 and more). Mapped before ready, with
+    // the bridge's one allocation (no device allocation after ready)
+    br->n_chan0 = (int) br->chans.size();
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        const int  tbo = fn_tbo::parse_mode(llama_fn_env(model, "LLAMA_FN_L22_TBO"));
+        const bool two = n_chains >= 2 || (br->seq_t > 0 && br->max_t >= 2*br->seq_t);
+        if (tbo > 0 && two && br->mode == GGML_MOE_BRIDGE_WAIT_SPIN) {
+            br->chans.reserve((size_t) br->n_chan0*2);
+            for (int i = 0; i < br->n_chan0; ++i) {
+                llama_moe_bridge::chan c;
+                c.il        = br->chans[i].il;
+                c.up        = br->chans[i].up;
+                c.gate_name = br->chans[i].gate_name;
+                c.layer     = br->chans[i].layer;
+                br->chans.push_back(c);
+            }
+            br->n_chains = 2;
+        } else if (tbo > 0) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L22_TBO] two-chain decode off: %s\n", __func__,
+                    br->mode != GGML_MOE_BRIDGE_WAIT_SPIN ? "it needs spin waits" : "one sequence per graph (--parallel 1)");
+        }
+    }
+
     // [TAG_FN_L16_PLEGATE] one more channel that no layer posts to: a gated decode graph waits on it for its PLE rows,
     // which fill one channel's out area (n_embd floats per token). Spin waits only: in hostfunc mode a wait joins the
     // event of its channel's post, and this channel has none
@@ -1460,7 +1492,17 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     bp.device     = dev_index;
     bp.n_chan     = (int) br->chans.size() + (br->ple_chan >= 0 ? 1 : 0); // [TAG_FN_L16_PLEGATE]
     if (br->xd_mode > 0) {
-        bp.n_chan += (int) br->chans.size(); // [TAG_FN_L22_X_DEFER] the defer channels
+        bp.n_chan += br->n_chan0; // [TAG_FN_L22_X_DEFER] the defer channels (chain 0's layers)
+    }
+    {
+        // [TAG_FN_L22_TBO] the channel numbers above are fn_tbo::chan_layout's (checked in tests/test-fn-l22-tbo.cpp)
+        fn_tbo::chan_layout lay;
+        lay.n0    = br->n_chan0;
+        lay.n_ch  = br->n_chains;
+        lay.ple   = br->ple_chan >= 0;
+        lay.defer = br->xd_mode > 0;
+        GGML_ASSERT(lay.n_layer_chans() == (int) br->chans.size() && lay.ple_chan() == br->ple_chan &&
+                (br->xd_mode == 0 || lay.defer_base() == br->xd_base) && lay.n_chan() == bp.n_chan);
     }
     bp.n_embd     = br->n_embd;
     bp.n_used     = br->n_used;
@@ -1544,15 +1586,16 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             br->pf_mode = std::min(1, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_MODE", 0)));
             br->pool_set_solo = (pool_set_solo_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_set_solo");
             br->pf_solo = env_int("LLAMA_MOE_BRIDGE_PF_SOLO", 0) > 0 && br->pool_set_solo != nullptr;
+            // [TAG_FN_L22_TBO] chain 0's channels only: a two-chain graph's jobs never prefetch (GGML_MOE_BRIDGE_JOB_NOPF)
             std::unordered_map<int, int> chan_of;
-            for (size_t c = 0; c < br->chans.size(); ++c) {
+            for (size_t c = 0; c < (size_t) br->n_chan0; ++c) {
                 chan_of[br->chans[c].il] = (int) c;
             }
             br->pf_next.assign(br->chans.size(), -1);
             br->pf_router.resize(br->chans.size());
             size_t n_bytes = 0;
             int    n_pf    = 0;
-            for (size_t c = 0; c < br->chans.size(); ++c) {
+            for (size_t c = 0; c < (size_t) br->n_chan0; ++c) {
                 const auto it = chan_of.find(br->chans[c].il + 1);
                 if (it == chan_of.end()) {
                     continue;
@@ -1586,7 +1629,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             br->pf_on = n_pf > 0;
             LLAMA_LOG_INFO("%s: [TAG_FN_R2_BRIDGE_PF] next-layer prefetch: %d of %zu layers predict their successor's experts "
                     "(top-%d per token, the cold ones pulled into the CPU caches between two jobs by %s%s), router copies "
-                    "%.1f MiB\n", __func__, n_pf, br->chans.size(), br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
+                    "%.1f MiB\n", __func__, n_pf, (size_t) br->n_chan0, br->pf_k, br->pf_mode == 0 ? "real loads" : "software prefetches",
                     br->pf_solo ? "; solo: the workers compute, the executor dispatches" : "", n_bytes/1048576.0);
             if (br->pool_split > 0 || br->pf_rank || br->hint_k > 0 || br->pf_streams > 1) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L3_CPU] pool split %s, prefetch order %s, prediction %s, %d pull streams%s\n", __func__,
@@ -1660,7 +1703,7 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     }
 
     LLAMA_LOG_INFO("%s: MoE bridge %d on %s: %zu host expert layers (%d skipped), T <= %d, %s wait, timeout %d ms (%d ms once "
-            "taken), spin %d us, up to %d pool threads, prio %d\n", __func__, br->bid, ggml_backend_dev_name(dev), br->chans.size(),
+            "taken), spin %d us, up to %d pool threads, prio %d\n", __func__, br->bid, ggml_backend_dev_name(dev), (size_t) br->n_chan0,
             n_skipped, br->max_t, br->mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", br->timeout_ms, br->job_max_ms,
             br->spin_us, br->pool_params.n_threads, br->pool_params.prio);
     if (br->seq_t > 0) {
@@ -1677,9 +1720,15 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_DEFER] decode windows defer their light cold experts (weight < %.3f or "
                 "rank >= %d) %s, defer channels %d..%d. CHANGES ANSWERS\n", __func__, br->bid, br->xd_w, br->xd_r,
                 br->xd_mode == 2 ? "and add them back in the same layer (check)" : "to the next layer, after its token mixer",
-                br->xd_base, br->xd_base + (int) br->chans.size() - 1);
+                br->xd_base, br->xd_base + br->n_chan0 - 1);
         llama_fn_l22_log("switch", "[TAG_FN_L22_X_DEFER] mode=%s w=%.3f r=%d chans=%d base=%d", br->xd_mode == 2 ? "check" : "defer",
-                br->xd_w, br->xd_r, (int) br->chans.size(), br->xd_base);
+                br->xd_w, br->xd_r, br->n_chan0, br->xd_base);
+    }
+    if (br->n_chains >= 2) {
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L22_TBO] two-chain decode: channels %d..%d are chain 1's (one per bridged layer)\n",
+                __func__, br->bid, br->n_chan0, br->n_chan0*br->n_chains - 1);
+        llama_fn_l22_log("switch", "[TAG_FN_L22_TBO] chains=%d layer_chans=%d ple=%d defer_base=%d n_chan=%d", br->n_chains,
+                br->n_chan0, br->ple_chan, br->xd_base, bp.n_chan);
     }
     if (br->pool_stats) {
         br->st_faults = br_page_faults();
@@ -1935,13 +1984,17 @@ bool llama_moe_bridge_layer(const llama_moe_bridge * br, const ggml_tensor * up_
     return true;
 }
 
-// [TAG_FN_L22_TBO] R-D5-3, P0 stubs: one chain
+// [TAG_FN_L22_TBO]
 int llama_moe_bridge_n_chains(const llama_moe_bridge * br) {
-    return br != nullptr ? 1 : 0;
+    return br != nullptr ? br->n_chains : 0;
 }
 
 bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor * up_exps, int chain, int32_t * id, int32_t * chan) {
-    return chain == 0 && llama_moe_bridge_layer(br, up_exps, id, chan);
+    if (br == nullptr || chain < 0 || chain >= br->n_chains || !llama_moe_bridge_layer(br, up_exps, id, chan)) {
+        return false;
+    }
+    *chan += chain*br->n_chan0;
+    return true;
 }
 
 // [TAG_FN_L22_X_DEFER]
@@ -1950,7 +2003,7 @@ int llama_moe_bridge_defer_mode(const llama_moe_bridge * br) {
 }
 
 int32_t llama_moe_bridge_defer_chan(const llama_moe_bridge * br, int32_t chan) {
-    if (br == nullptr || br->xd_mode == 0 || br->xd_base < 0 || chan < 0 || chan >= (int32_t) br->chans.size()) {
+    if (br == nullptr || br->xd_mode == 0 || br->xd_base < 0 || chan < 0 || chan >= (int32_t) br->n_chan0) {
         return -1;
     }
     return br->xd_base + chan;
@@ -2229,7 +2282,7 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
 
     // [TAG_FN_L22_X_DEFER] the device's waits for the light parts (0: there at the first look) and the host's time for them
     if (br->xd_mode > 0 && br->fn_chan_times && err == GGML_MOE_BRIDGE_ERR_NONE && (br->stats || llama_fn_l22_passlog_level() >= 2)) {
-        for (int ch = 0; ch < (int) br->chans.size(); ++ch) {
+        for (int ch = 0; ch < br->n_chan0; ++ch) {
             auto & c = br->chans[ch];
             ggml_moe_bridge_chan_times t;
             br->fn_chan_times(br->gb, br->xd_base + ch, &t);
@@ -2403,7 +2456,7 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L16_PLEGATE] the error is the PLE gate's (its rows came late or their read "
                 "failed)\n", __func__, br->bid);
     }
-    if (br->xd_base >= 0 && s.error_chan >= br->xd_base && s.error_chan < br->xd_base + (int) br->chans.size()) {
+    if (br->xd_base >= 0 && s.error_chan >= br->xd_base && s.error_chan < br->xd_base + br->n_chan0) {
         LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_DEFER] the error is the light part of layer %d (the layer below reads -1)\n",
                 __func__, br->bid, br->chans[s.error_chan - br->xd_base].il);
     }

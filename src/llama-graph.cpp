@@ -8,6 +8,7 @@
 #include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-l22.h"  // [TAG_FN_L22] round 22 hooks
+#include "llama-fn-tbo.h"  // [TAG_FN_L22_TBO] two-chain decode keys
 #include "ggml-fn-l3.h"     // [TAG_FN_L3_GPU]
 
 #include "llama-impl.h"
@@ -2676,8 +2677,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         !gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
         loras->empty() && !(hparams.swiglu_clamp_exp[il] > 1e-6f) &&
-        llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan)) {
-        if (moe_bridge && br_ring && llama_moe_bridge_dma(moe_bridge) && !pfs) {
+        llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan) &&
+        // [TAG_FN_L22_TBO] a chain's posts go to its own channel set (the sync op of a paused bridge needs none)
+        (moe_bridge_chain == 0 || moe_bridge == nullptr ||
+         llama_moe_bridge_layer_chain(moe_bridge, up_exps, moe_bridge_chain, &br_id, &br_chan))) {
+        // [TAG_FN_L22_TBO] no DMA fetch in a two-chain graph: its step is GPU-bound, and the banks serve one job per layer
+        if (moe_bridge && br_ring && llama_moe_bridge_dma(moe_bridge) && !pfs && !moe_tbo) {
             br_dma = llama_moe_dma_bridge_lookup(up_exps, n_tokens);
             if (br_dma == nullptr) {
                 br_dma = llama_fn_dmashare_view(moe_bridge, up_exps, n_tokens); // [TAG_FN_L22_DMASHARE] P14 (stub: nullptr)
@@ -2693,7 +2698,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const bool hint  = hint_k > 0 && hint_router->ne[0] == cur->ne[0] && hint_router->ne[1] >= hint_k;
             const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
                                      (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0) |
-                                     ((fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0); // [TAG_FN_L22_X_TAILSKIP]
+                                     ((fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0) | // [TAG_FN_L22_X_TAILSKIP]
+                                     (moe_tbo ? GGML_MOE_BRIDGE_JOB_NOPF : 0); // [TAG_FN_L22_TBO] no prefetch between chains
             br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan,
                     br_flags | (xd_chan >= 0 ? GGML_MOE_BRIDGE_JOB_DEFER : 0)); // [TAG_FN_L22_X_DEFER]
             if (moe_post_mark != 0) {
@@ -2705,7 +2711,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             res->n_moe_bridge++;
             if (hint && hint_late) {
-                moe_bridge_hints[il] = { hint_router, br_ticket, hint_k, br_id, br_chan }; // [TAG_FN_L6_PFDEV3] built later
+                moe_bridge_hints[fn_tbo::post_key(il, moe_bridge_chain)] = { hint_router, br_ticket, hint_k, br_id, br_chan }; // [TAG_FN_L6_PFDEV3] built later
             } else if (hint) {
                 const bool own_in = hint_input && hint_input->ne[0] == cur->ne[0] && hint_input->ne[1] == cur->ne[1] &&
                                     ggml_nrows(hint_input) == cur->ne[1];
@@ -2936,7 +2942,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             hot = hot ? ggml_add(ctx0, hot, dsum) : dsum;
             ggml_build_forward_expand(gf, hot);
         }
-        moe_bridge_posts[il] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan, br_sync };
+        moe_bridge_posts[fn_tbo::post_key(il, moe_bridge_chain)] = { br_ticket, hot, n_embd, n_tokens, br_id, br_chan, br_sync }; // [TAG_FN_L22_TBO] key
         if (moe_bridge_defer) {
             return br_ticket; // placeholder: the caller passes it to build_moe_bridge_finish
         }
@@ -3191,7 +3197,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 // [TAG_MOE_BRIDGE]
 ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int il, ggml_tensor * dep) const {
-    const auto it = moe_bridge_posts.find(il);
+    const auto it = moe_bridge_posts.find(fn_tbo::post_key(il, moe_bridge_chain)); // [TAG_FN_L22_TBO] the chain's post
     if (it == moe_bridge_posts.end()) {
         return cur;
     }
@@ -3217,7 +3223,7 @@ ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int 
 // [TAG_FN_L22_X_DEFER]
 int llm_graph_context::fn_x_defer_mode() const {
     const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
-    if (!(fn_x & LLAMA_FN_L22_XB_DEFER) || ubatch.n_seqs_unq != 1 || br_any == nullptr) {
+    if (!(fn_x & LLAMA_FN_L22_XB_DEFER) || ubatch.n_seqs_unq != 1 || br_any == nullptr || moe_tbo) { // [TAG_FN_L22_TBO] never in a chain
         return 0;
     }
     return llama_moe_bridge_defer_mode(br_any);
@@ -3241,7 +3247,7 @@ ggml_tensor * llm_graph_context::build_moe_defer_take(int il, ggml_tensor * dep)
 
 // [TAG_FN_L6_PFDEV3]
 bool llm_graph_context::build_moe_bridge_hint(int il, ggml_tensor * input) const {
-    const auto it = moe_bridge_hints.find(il);
+    const auto it = moe_bridge_hints.find(fn_tbo::post_key(il, moe_bridge_chain)); // [TAG_FN_L22_TBO] the chain's hint
     if (it == moe_bridge_hints.end()) {
         return false;
     }
