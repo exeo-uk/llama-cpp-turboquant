@@ -7648,6 +7648,18 @@ uint32_t llama_context::fn_prompt_ubatch_width() const {
 
 // [TAG_FN_L22_P10] ---------------------------------------------------------------------------------------------------
 
+// free device memory for the checks of a switch: min(CUDA free, DXGI LOCAL budget - usage when known), without the log line
+// of fn_l21_dev_memory (it runs at every FULL switch)
+static size_t llama_l22_free_vram(ggml_backend_dev_t dev) {
+    size_t mem_free = 0, mem_total = 0;
+    ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+    uint64_t budget = 0, usage = 0;
+    if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget > 0) {
+        mem_free = (size_t) std::min<uint64_t>(mem_free, budget > usage ? budget - usage : 0);
+    }
+    return mem_free;
+}
+
 // the round-22 switches of package P10 (qwen4exp target context; llama_fn_env: the environment, then the profile)
 void llama_context::l22p_init() {
     llama_fn_l22_cost_init(l22p_cost, false);
@@ -7787,8 +7799,7 @@ void llama_context::l22p_xover_apply() {
             ++it;
         }
     }
-    gf_res_prev_active = nullptr;
-    l22p_xover_t = t;
+    l22p_xover_t = t; // (the graphs of the SMALL state are no wider than 31 rows: the crossover does not touch them)
     l22p_n_xover++;
     const int b = l22p_bucket;
     if (l22.passlog >= 1) {
@@ -7825,9 +7836,8 @@ uint32_t llama_context::l22p_plan_width(uint32_t n_tokens, int64_t after, bool v
         // the big reserve beyond the base one and the borrow (+ the draft's wide reserve) must find free VRAM, + 512 MiB (a
         // projector encode or another process may hold what the fit left free)
         ggml_backend_dev_t dev = llama_moe_hot_device(model);
-        size_t mem_free = 0, mem_total = 0;
         if (dev) {
-            fn_l21_dev_memory(&model, dev, &mem_free, &mem_total);
+            const size_t mem_free = llama_l22_free_vram(dev);
             const size_t big  = cbuf_full_b + l20_dft_extra;
             const size_t have = l20_full_base_b + l21_extra;
             const size_t need = (big > have ? big - have : 0) + ((size_t) 512 << 20);
@@ -7876,10 +7886,7 @@ bool llama_context::l22_sk_park(ggml_backend_dev_t dev, size_t expect_full) {
         l22_sk_why = "noreserve";
         return false;
     }
-    size_t mem_free = 0, mem_total = 0;
-    if (dev) {
-        fn_l21_dev_memory(&model, dev, &mem_free, &mem_total);
-    }
+    const size_t mem_free = dev ? llama_l22_free_vram(dev) : 0;
     if (!dev || !llama_fn_l22_smallkeep_fits(mem_free, expect_full, cbuf_pool_mib << 20, (size_t) 512 << 20)) {
         l22_sk_why = "headroom";
         if (++l22_sk_n_nofit <= 3 || l22_sk_n_nofit % 64 == 0) {
