@@ -3503,6 +3503,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // last value for the positions after it), e.g. 0.5,0.5,0.85 lets a third draft through only when it is confident
     std::vector<float>              pmin_pos;
 
+    // [TAG_FN_L22_DRAFT2] LLAMA_FN_L22_DRAFT2=<p> on qwen4exp with 2+ sequences: in a step where 2+ sequences draft, the
+    // second and later draft positions need at least p (0 = off)
+    float                           draft2 = 0.0f;
+    uint64_t                        d2_cut = 0; // tokens the p_min rule alone would have kept
+
     // [TAG_FN_L13_SPEC_EQUAL] SPEC_MTP_EQUAL_SEQS=1, a recurrent or hybrid target, 2+ sequences: the sequences that draft
     // together keep drafting while one of them passes the p_min rule. Their verify rows match, so split_equal keeps them in
     // one ubatch (a 3 + 2 row step ran as two graphs: the recurrent ring needs each sequence's rows in one ubatch)
@@ -3755,6 +3760,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (equal_seqs && eq_steps > 0) {
             LOG_INF("%s: [TAG_FN_L13_SPEC_EQUAL] %llu draft decodes of 2+ sequences, %llu tokens kept below p_min\n", __func__,
                     (unsigned long long) eq_steps, (unsigned long long) eq_ext);
+        }
+        if (draft2 > 0.0f) {
+            LOG_INF("%s: [TAG_FN_L22_DRAFT2] p_min %.2f from draft position 2 with 2+ drafting sequences: %llu tokens cut\n", __func__,
+                    draft2, (unsigned long long) d2_cut);
         }
     }
 
@@ -4018,6 +4027,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 LOG_INF("%s: [TAG_FN_L3_MTP_CHAIN] the p_min rule per draft position: {%s} (the last for the rest), n_max %d\n",
                         __func__, t.c_str(), this->params.n_max);
+            }
+        }
+
+        // [TAG_FN_L22_DRAFT2] the joint draft rule's p_min (qwen4exp profile: 0 until its A/B)
+        if (is_qwen4exp && n_seq > 1) {
+            const char * e = llama_model_fn_env(llama_get_model(this->params.ctx_tgt), "LLAMA_FN_L22_DRAFT2");
+            draft2 = e && e[0] ? std::min(1.0f, std::max(0.0f, (float) atof(e))) : 0.0f;
+            if (draft2 > 0.0f) {
+                LOG_INF("%s: [TAG_FN_L22_DRAFT2] steps where 2+ sequences draft: p_min %.2f from draft position 2 on\n", __func__, draft2);
             }
         }
 
@@ -4782,6 +4800,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_FN_L22_DRAFT2] the sequences that draft in this step (the joint rule keeps their lengths equal)
+        const int n_drafting0 = n_drafting;
+
         // [TAG_FN_MTP_COST] keep a token of sequence s (confidence conf) after d draft decodes of n rows: it raises the
         // expected tokens per unit of step time. On keep, the step's E, R and the sequence's P move.
         auto cost_keep = [&](llama_seq_id s, float conf, int d, int n) -> bool {
@@ -4814,7 +4835,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (use_policy) {
                 return cost_keep(s, conf, d, n);
             }
-            const float pm = pmin_at(pos);
+            const float pm0 = pmin_at(pos);
+            const float pm  = common_speculative_pmin_draft2(pm0, pos, n_drafting0, draft2); // [TAG_FN_L22_DRAFT2]
+            if (pm > pm0 && conf < pm && conf >= pm0) {
+                d2_cut++;
+            }
             // [TAG_FN_L19_DRAFT_ADAPT] the cost cut on top of p_min: the token must pay for its verify row.
             // [TAG_FN_L20_DRAFTFIX] the drafts that pass p_min are counted apart from those proposed (pass_i learns p_min
             // only), a probe round runs without the cut (ad.keep), and [TAG_FN_L20_DRAFTFIX_FLOOR] with the floor a draft
@@ -4907,21 +4932,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // [TAG_FN_L13_SPEC_EQUAL] sample every drafting sequence first, then one keep decision for all of them
             const bool eq_step = equal_seqs && !cost_on && !cost2_on && n_drafting > 1;
             bool       eq_keep = false;
+            // [TAG_FN_L22_DRAFT2] the joint decision with the raised p_min of later positions (draft2 0: pmin_at)
+            auto pmin_eq = [&](llama_seq_id s) {
+                const int p = (int) dparams[s].result->size();
+                return common_speculative_pmin_draft2(pmin_at(p), p, n_drafting0, draft2);
+            };
             if (eq_step) {
                 eq_steps++;
+                bool eq_keep0 = false;
                 for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                     if (drafting[s]) {
                         eq_id[s] = common_sampler_sample(smpls[s].get(), ctx_dft, i_last[s], true);
                         const auto * cp = common_sampler_get_candidates(smpls[s].get(), true);
-                        eq_keep = eq_keep || (cp->size > 0 && !(cp->data[0].p < pmin_at((int) dparams[s].result->size())));
+                        eq_keep  = eq_keep  || (cp->size > 0 && !(cp->data[0].p < pmin_eq(s)));
+                        eq_keep0 = eq_keep0 || (cp->size > 0 && !(cp->data[0].p < pmin_at((int) dparams[s].result->size())));
                     }
+                }
+                if (eq_keep0 && !eq_keep) {
+                    d2_cut += (uint64_t) n_drafting;
                 }
             }
             auto keep_tok = [&](llama_seq_id s, float conf) -> bool {
                 if (!eq_step) {
                     return keep_token(s, conf, i + 1, cost_nit);
                 }
-                eq_ext += eq_keep && conf < pmin_at((int) dparams[s].result->size()) ? 1 : 0;
+                eq_ext += eq_keep && conf < pmin_eq(s) ? 1 : 0;
                 return eq_keep;
             };
 
