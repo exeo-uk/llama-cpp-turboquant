@@ -659,6 +659,10 @@ void pfs_run(pfs_state * s) {
         };
         // the byte ranges of tensor k in `ranges` from the host
         auto stream_ranges = [&](int k) {
+            if (L.src_pinned) {
+                stream_direct(k, ranges); // pinned at load (a host buffer or the round-14 arena)
+                return;
+            }
             if (pin_live) {
                 // [TAG_FN_L22_PIN] split at segment edges: pinned segments straight from their pages (a copy never runs past
                 // a registered range), the rest through the ring
@@ -687,10 +691,6 @@ void pfs_run(pfs_state * s) {
                         stream_direct(k, rr_stage); // no ring (every layer was pinned at load): pageable copies
                     }
                 }
-                return;
-            }
-            if (L.src_pinned) {
-                stream_direct(k, ranges);
                 return;
             }
             stream_ring(k, ranges);
