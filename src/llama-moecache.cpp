@@ -5,6 +5,7 @@
 #include "llama-fn-tier.h"  // [TAG_FN_L18_FIRSTANS_STATE] llama_fn_prefetch_ranges
 #include "llama-moe-decay.h" // [TAG_FN_R4_ADAPT_DECAY]
 #include "llama-moe-bridge.h" // [TAG_FN_L3_HOST_QUIET]
+#include "llama-fn-l22.h"     // [TAG_FN_L22_P4] pins, PASSLOG
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -37,6 +38,8 @@
 
 // [TAG_FN_L21_VRAM_DXGI] defined at the end of this file (the Windows headers stay out of the code above)
 void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
+// [TAG_FN_L22_REFILL] M2.4: the calling thread's memory priority to low (Windows; elsewhere a no-op), also at the end
+static void fn_l22_mem_prio_low();
 
 namespace {
 
@@ -108,6 +111,10 @@ struct layer_state {
     // slot_in_flight are pool sized and hold only this layer's entries (resident / upload into it in flight)
     int                               pool   = -1;
     int                               pool_k = -1; // the layer's index inside its pool
+
+    // [TAG_FN_L22_LENDCLASS] slot_expert names an expert whose bytes never reached the slot (an upload dropped while the
+    // layer was out keeps its expert for the next refill): a restore that skips intact slots must refill these
+    std::vector<uint8_t>              slot_dirty;
 };
 
 // [TAG_FN_L3_POLICY_POOL] one dynamic slot pool per expert shape class (LLAMA_MOE_HOT_POOL=1): any layer of the class can
@@ -135,6 +142,7 @@ struct upload_job {
     bool    failed = false; // [TAG_FN_L3_POLICY_UPLOAD] not uploaded (a slice out of range): the slot comes back empty
     bool    cb   = false; // [TAG_FN_L3_VRAM_CBUF] a refill job of the tail's restore
     bool    st   = false; // [TAG_FN_L18_FIRSTANS_STATE] a saved resident of the background state load
+    bool    ul   = false; // [TAG_FN_L22_ENDOVERLAP] a refill job of an asynchronous unlend (the stream's range)
 };
 
 struct moe_cache {
@@ -401,6 +409,25 @@ struct moe_cache {
     std::atomic<int>      l18_ab_mode   { 0 };
     // [TAG_FN_L18_CHURN_MIB] LLAMA_FN_L18_CHURN_MIB=<MiB>: the pass budget after the burst window (0 = LLAMA_MOE_HOT_DECAY_MIB)
     size_t                l18_mib       = 0;
+
+    // [TAG_FN_L22_P4] round 22, prompt stream state machine
+    bool                  l22_hide      = false; // [TAG_FN_L22_KEEPLEND] lent layers hidden from the hot chains (lookup)
+    bool                  l22_refill    = false; // [TAG_FN_L22_REFILL] pinned refill sources, memory priority low, prefetch
+    size_t                l22_ul_left   = 0;     // [TAG_FN_L22_ENDOVERLAP] async unlend jobs not published yet
+    int64_t               l22_ul_t0     = 0;
+    uint64_t              l22_ul_n      = 0;
+    size_t                l22_ul_bytes  = 0;
+    double                l22_ul_ms     = 0.0;   // host time of the unlends (sync or async) since the last take
+    size_t                l22_ul_b      = 0;     // bytes refilled (sync) or queued (async) since the last take
+    double                l22_res_ms    = 0.0;   // the same for the tail's restores
+    size_t                l22_res_b     = 0;
+    std::atomic<uint64_t> l22_pin_b{0};          // [TAG_FN_L22_REFILL] refill / upload bytes straight from pinned pages
+    size_t                l22_rel_b     = 0;     // [TAG_FN_L22_LENDCLASS] tail bytes unmapped since the last take
+    std::thread           l22_pf_th;             // [TAG_FN_L22_REFILL] (b) the refill set's prefetch
+    std::atomic<bool>     l22_pf_busy{false};
+    // [TAG_FN_L22_LENDCLASS] the tail is out with fewer bytes unmapped than layers hidden (a narrow FULL class): the
+    // restore refills only the slots that reach into the unmapped part, and the dirty ones
+    bool                  l22_part      = false;
 };
 
 moe_cache * g_cache = nullptr;
@@ -686,6 +713,9 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
     const layer_state & ls = g_cache->layers[it->second];
     if (ls.cb_lent || ls.kv_lent) {
         return nullptr; // [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L8_KVLEND] its slots have no VRAM now: the host computes all of its experts
+    }
+    if (ls.lent && g_cache->l22_hide) {
+        return nullptr; // [TAG_FN_L22_KEEPLEND] its slots hold bank bytes (also its zero slot): the host computes all of them
     }
     return &ls.pub;
 }
@@ -1284,6 +1314,9 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
     const int64_t t0 = ggml_time_us();
     size_t batch_bytes = 0;
     size_t n_done = 0;
+    // [TAG_FN_L22_REFILL] a slice on pinned pages goes straight from there (no staging); tickets after the synchronize
+    const bool pin_live = mc->l22_refill && llama_fn_pin_active();
+    std::vector<int32_t> pin_tk;
     for (; n_done < batch.size(); ++n_done) {
         if (mc->up_quit.load(std::memory_order_relaxed)) {
             break; // [TAG_FN_L4_EXIT] stop: what is staged lands below, the rest is dropped
@@ -1310,6 +1343,21 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
                     break;
                 }
             }
+            if (pin_live) {
+                const uint8_t *  p   = (const uint8_t *) srcs[k]->data + (size_t) j.expert*sz;
+                llama_fn_pin_seg seg = {};
+                const bool       ok  = llama_fn_pin_query(p, sz, &seg);
+                if (ok && seg.ticket >= 0) {
+                    pin_tk.push_back(seg.ticket);
+                }
+                if (ok && seg.pinned && seg.len == sz) {
+                    hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
+                    ggml_backend_tensor_set_async(mc->up_backend, dsts[k], p, (size_t) j.slot*dsts[k]->nb[2], sz);
+                    mc->up_bytes.fetch_add(sz, std::memory_order_relaxed);
+                    mc->l22_pin_b.fetch_add(sz, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             if (sz > mc->up_half) {
                 flush();
                 hot_pace(mc, sz); // [TAG_FN_L18_CHURN_PACE]
@@ -1332,6 +1380,9 @@ size_t hot_upload_pipe(moe_cache * mc, std::vector<upload_job> & batch) {
     }
     flush();
     ggml_backend_synchronize(mc->up_backend); // every copy of the batch has landed
+    for (int32_t t : pin_tk) {
+        llama_fn_pin_release(t); // [TAG_FN_L22_REFILL]
+    }
     if (mc->up_batches++ < 2) {
         const double ms = (ggml_time_us() - t0)/1000.0;
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_POLICY_UPLOAD] batch %llu: %zu experts, %.1f MiB through the pinned halves in %.1f ms "
@@ -1400,6 +1451,9 @@ size_t hot_upload_staged(moe_cache * mc, const std::vector<upload_job> & batch) 
 // uploads the queued slices: mmap -> pinned staging -> the upload backend's own stream, then marks them done
 void hot_adapt_worker(moe_cache * mc) {
     llama_fn_thread_name("hot-upload"); // [TAG_FN_L18_FIRSTANS_STALL]
+    if (mc->l22_refill) {
+        fn_l22_mem_prio_low(); // [TAG_FN_L22_REFILL] M2.4: the pages it faults in sit low on the standby list
+    }
     std::vector<upload_job> batch;
     for (;;) {
         {
@@ -1802,6 +1856,11 @@ void hot_adapt_publish(moe_cache * mc) {
                     (ggml_time_us() - mc->fa18_st_t0)/1000.0);
             llama_fn_stall_mark("saved state: all residents published");
         }
+        // [TAG_FN_L22_ENDOVERLAP] the asynchronous unlend's refill: counted down as its jobs come back
+        if (j.ul && mc->l22_ul_left > 0 && --mc->l22_ul_left == 0) {
+            llama_fn_l22_log("switch", "what=unlend_async_landed ms=%.1f bytes_mib=%.0f", (ggml_time_us() - mc->l22_ul_t0)/1000.0,
+                    mc->l22_ul_bytes/1048576.0);
+        }
         // [TAG_FN_L10_SLOTLEND] an upload into a slot that went out meanwhile: as failed (the slot stays empty)
         if (j.failed || (!ls.slot_out.empty() && ls.slot_out[j.slot])) { // [TAG_FN_L3_POLICY_UPLOAD] nothing was copied: the slot is free again, the expert stays cold
             ls.slot_in_flight[j.slot]     = false;
@@ -1815,6 +1874,9 @@ void hot_adapt_publish(moe_cache * mc) {
         ls.expert_slot[j.expert]      = j.slot;
         ls.slot_in_flight[j.slot]     = false;
         ls.expert_in_flight[j.expert] = false;
+        if ((size_t) j.slot < ls.slot_dirty.size()) {
+            ls.slot_dirty[j.slot] = 0; // [TAG_FN_L22_LENDCLASS] its bytes landed
+        }
         hot_adapt_set_entry(mc, ls, j.expert, ls.out() ? ls.pub.n_slots : j.slot);
         mc->ad_admitted++;
         // [TAG_FN_L3_VRAM_CBUF] the asynchronous refill of the tail landed
@@ -2044,6 +2106,9 @@ void hot_adapt_init(moe_cache * mc, const llama_model & model, const void * owne
                     "LLAMA_MOE_HOT_STATS)\n", mc->l18_ab == 1 ? "staged / pinned halves" : mc->l18_ab == 2 ? "the pass budget" :
                     mc->l18_ab == 3 ? "the gate" : "nothing");
         }
+        // [TAG_FN_L22_REFILL] pinned refill sources, the upload / refill threads at low memory priority, the refill set's
+        // prefetch at a prompt's end (before the worker starts, so it sees the flag)
+        mc->l22_refill = llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_REFILL"));
     }
 
     mc->up_backend = ggml_backend_dev_init(dev, nullptr);
@@ -3639,9 +3704,17 @@ void hot_drain_out(moe_cache * mc) {
                 }
                 // [TAG_FN_L3_VRAM_CBUF] a tail slot keeps the expert it was getting: the next restore uploads it with the
                 // others, so prompts in quick succession do not empty the tail (a lent layer's slot comes back empty)
-                if ((ls.cb_lent || ls.kv_lent) && !sl_o) {
+                // [TAG_FN_L22_ENDOVERLAP] so does a slot of the stream's range whose asynchronous refill had not run yet
+                if (it->ul && mc->l22_ul_left > 0) {
+                    mc->l22_ul_left--;
+                }
+                if ((ls.cb_lent || ls.kv_lent || (it->ul && ls.lent)) && !sl_o) {
                     ls.slot_expert[it->slot]   = it->expert;
                     ls.expert_slot[it->expert] = it->slot;
+                    if (ls.slot_dirty.size() < ls.slot_expert.size()) {
+                        ls.slot_dirty.resize(ls.slot_expert.size(), 0);
+                    }
+                    ls.slot_dirty[it->slot] = 1; // [TAG_FN_L22_LENDCLASS] named, not uploaded
                 } else if (ls.pool >= 0) {
                     mc->pools[ls.pool].slot_layer[it->slot] = -1; // [TAG_FN_L3_POLICY_POOL]
                 }
@@ -4032,7 +4105,49 @@ constexpr size_t REFILL_HALF    = 128u << 20;
 // the resident experts of the lent layers whose bytes the stream may have overwritten: through the pinned halves when
 // the hot set has an upload stream, else one synchronous copy per slice. Returns the bytes uploaded.
 // [TAG_FN_L3_VRAM_CBUF] n_threads: the copy threads (the stream's unlend keeps REFILL_THREADS)
+size_t hot_refill_staged(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads);
+
 size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads = REFILL_THREADS) {
+    // [TAG_FN_L22_REFILL] (a) the slices on pinned host pages go to the device straight from there (one async copy per
+    // pinned segment on the upload stream), the rest through the staging halves as before; the tickets are released after
+    // the stream has synchronized (every copy landed)
+    if (!mc->l22_refill || !mc->up_backend || !llama_fn_pin_active() || jobs.empty()) {
+        return hot_refill_staged(mc, jobs, n_threads);
+    }
+    std::vector<refill_job> rest;
+    std::vector<int32_t>    tickets;
+    size_t pinned = 0;
+    for (const auto & j : jobs) {
+        size_t o = 0;
+        while (o < j.size) {
+            const uint8_t *  p   = (const uint8_t *) j.src + o;
+            llama_fn_pin_seg seg = {};
+            if (!llama_fn_pin_query(p, j.size - o, &seg) || seg.len == 0 || seg.len > j.size - o) {
+                rest.push_back({ j.dst, j.off + o, p, j.size - o });
+                break;
+            }
+            if (seg.pinned) {
+                ggml_backend_tensor_set_async(mc->up_backend, j.dst, p, j.off + o, seg.len);
+                pinned += seg.len;
+            } else {
+                rest.push_back({ j.dst, j.off + o, p, seg.len });
+            }
+            if (seg.ticket >= 0) {
+                tickets.push_back(seg.ticket);
+            }
+            o += seg.len;
+        }
+    }
+    const size_t staged = hot_refill_staged(mc, rest, n_threads); // ends with a synchronize of the upload stream
+    ggml_backend_synchronize(mc->up_backend);
+    for (int32_t t : tickets) {
+        llama_fn_pin_release(t);
+    }
+    mc->l22_pin_b.fetch_add(pinned, std::memory_order_relaxed);
+    return pinned + staged;
+}
+
+size_t hot_refill_staged(moe_cache * mc, const std::vector<refill_job> & jobs, int n_threads) {
     llama_fn_stall_scope st_scope("hot refill begins (jobs, threads)", "hot refill ends", (int64_t) jobs.size(), n_threads); // [TAG_FN_L18_FIRSTANS_STALL]
     n_threads = std::max(1, std::min(64, n_threads));
     size_t bytes = 0;
@@ -4089,6 +4204,9 @@ size_t hot_refill(moe_cache * mc, const std::vector<refill_job> & jobs, int n_th
         for (int t = 0; t < n_threads; ++t) {
             th.emplace_back([&, t]() {
                 llama_fn_thread_name("hot-refill", t); // [TAG_FN_L18_FIRSTANS_STALL]
+                if (mc->l22_refill) {
+                    fn_l22_mem_prio_low(); // [TAG_FN_L22_REFILL] M2.4
+                }
                 for (size_t k = (size_t) t; k < n; k += (size_t) n_threads) {
                     hot_copy(mc, base + stage_off[k], jobs[i + k].src, jobs[i + k].size); // [TAG_FN_L17_START_NT]
                 }
@@ -4278,10 +4396,206 @@ void llama_moe_hot_unlend(const void * owner) {
     const double ms = (ggml_time_us() - t0)/1000.0;
     mc->unlend_ms += ms;
     mc->unlend_b  += bytes;
+    mc->l22_ul_ms += ms;    // [TAG_FN_L22_PASSLOG]
+    mc->l22_ul_b  += bytes;
     if (mc->n_lend <= 2 || mc->n_lend % 16 == 0) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_R1_PFS_LEND] lend %" PRIu64 ": %.2f GiB of resident experts refilled in %.1f ms "
                 "(%.1f GiB/s)\n", mc->n_lend, bytes/1073741824.0, ms, ms > 0 ? bytes/1073741824.0/(ms/1000.0) : 0.0);
     }
+}
+
+// [TAG_FN_L22_ENDOVERLAP] llama_moe_hot_unlend with the refill on the upload worker: the range is cleared as there, the
+// residents whose slices reach into it leave the tables and go in flight (evict, upload, publish at an owner step once
+// landed: the device tables never name a slot before its copy completed), the others stay; the bridge / CPU computes the
+// experts in flight meanwhile. Without the adaptive set (no worker) the synchronous unlend runs.
+void llama_moe_hot_unlend_async(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->lent_any) {
+        return;
+    }
+    if (!mc->adapt || !mc->worker.joinable()) {
+        llama_moe_hot_unlend(owner);
+        return;
+    }
+    if (owner != mc->owner) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
+    if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
+        mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
+    }
+    if (!mc->lent_any) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_lend.buf);
+    // [TAG_FN_L19_UNLEND_CLEAR] the whole range reads 0 first (the stream left its bank bytes there)
+    ggml_backend_tensor_memset(g_lend.raw, 0, 0, ggml_nbytes(g_lend.raw));
+    size_t bytes  = 0;
+    size_t n_jobs = 0;
+    std::vector<const ggml_tensor *> zeroed; // [TAG_FN_L3_POLICY_POOL] the layers of a pool share their tensors
+    {
+        std::lock_guard<std::mutex> lk(mc->wmtx);
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            layer_state & ls = mc->layers[li];
+            if (!ls.lent) {
+                continue;
+            }
+            ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+                const int32_t e = ls.slot_expert[s];
+                if (e < 0 || ls.slot_in_flight[s]) {
+                    continue;
+                }
+                bool reach = false; // a slice that reaches into the lent range was overwritten
+                for (int k = 0; k < 3; ++k) {
+                    const size_t sz  = srcs[k]->nb[2];
+                    const size_t off = (size_t) s*dsts[k]->nb[2];
+                    reach = reach || (uint8_t *) dsts[k]->data + off + sz > g_lend.lo;
+                }
+                if (!reach) {
+                    continue; // below the lent range: never overwritten, stays resident
+                }
+                ls.slot_expert[s]      = -1;
+                ls.expert_slot[e]      = -1;
+                ls.slot_in_flight[s]   = true;
+                ls.expert_in_flight[e] = true;
+                upload_job j;
+                j.layer_idx = li;
+                j.expert    = e;
+                j.slot      = s;
+                j.ul        = true;
+                mc->todo.push_back(j);
+                bytes += srcs[0]->nb[2] + srcs[1]->nb[2] + srcs[2]->nb[2];
+                n_jobs++;
+            }
+        }
+        mc->l22_ul_left += n_jobs;
+    }
+    for (auto & ls : mc->layers) {
+        if (!ls.lent) {
+            continue;
+        }
+        // the zero slot every miss reads, and the alloc-size tail after it (kernels may read padded rows there)
+        ggml_tensor * ts[3] = { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c };
+        for (ggml_tensor * t : ts) {
+            if (std::find(zeroed.begin(), zeroed.end(), t) != zeroed.end()) {
+                continue;
+            }
+            zeroed.push_back(t);
+            ggml_backend_tensor_memset(t, 0, (size_t) ls.pub.n_slots*t->nb[2], t->nb[2]);
+            uint8_t * tail_lo = std::max((uint8_t *) t->data + ggml_nbytes(t), g_lend.lo);
+            uint8_t * tail_hi = (uint8_t *) t->data + ggml_backend_buft_get_alloc_size(buft, t);
+            if (tail_hi > tail_lo) {
+                ggml_backend_tensor_memset(g_lend.raw, 0, (size_t) (tail_lo - g_lend.lo), (size_t) (tail_hi - tail_lo));
+            }
+        }
+        ls.lent = false;
+        hot_write_tables(mc, ls); // the residents that stayed; the slots in flight read "not hot"
+    }
+    mc->lent_any = false;
+    if (n_jobs > 0) {
+        mc->l22_ul_t0    = t0;
+        mc->l22_ul_bytes = bytes;
+        mc->wcv.notify_one();
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    mc->l22_ul_n++;
+    mc->unlend_ms += ms;
+    mc->l22_ul_ms += ms;
+    mc->l22_ul_b  += bytes;
+    if (mc->l22_ul_n <= 2 || mc->l22_ul_n % 16 == 0) {
+        LLAMA_LOG_INFO("moe-hot: [TAG_FN_L22_ENDOVERLAP] lend %" PRIu64 ": %.2f GiB of resident experts queued for the upload worker "
+                "in %.1f ms (%zu experts; the CPU computes them until each has landed)\n", mc->n_lend, bytes/1073741824.0, ms,
+                n_jobs);
+    }
+}
+
+// [TAG_FN_L22_REFILL] (b) see llama-moecache.h
+size_t llama_moe_hot_prefetch_refill(const void * owner) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->l22_refill || (mc->adapt && owner != mc->owner)) {
+        return 0;
+    }
+    if (mc->l22_pf_busy.load()) {
+        return 0; // the last one still runs
+    }
+    std::vector<std::pair<const void *, size_t>> rr;
+    size_t bytes = 0;
+    {
+        std::unique_lock<std::mutex> slk(mc->step_mtx, std::try_to_lock);
+        if (!slk.owns_lock()) {
+            return 0;
+        }
+        const uint8_t * cb_base = mc->cb_buf ? (const uint8_t *) ggml_backend_buffer_get_base(mc->cb_buf) : nullptr;
+        for (const auto & ls : mc->layers) {
+            if (!ls.lent && !ls.cb_lent) {
+                continue;
+            }
+            ggml_tensor *       dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            for (int32_t s = 0; s < ls.pub.n_slots && s < (int32_t) ls.slot_expert.size(); ++s) {
+                const int32_t e = ls.slot_expert[s];
+                if (e < 0) {
+                    continue;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const size_t sz  = srcs[k]->nb[2];
+                    const size_t off = (size_t) s*dsts[k]->nb[2];
+                    const uint8_t * end = (const uint8_t *) dsts[k]->data + off + sz;
+                    bool reach = false;
+                    if (ls.lent && g_lend.lo) {
+                        reach = end > g_lend.lo; // the stream's range: what the unlend refills
+                    }
+                    if (!reach && ls.cb_lent && cb_base) {
+                        reach = end > cb_base + mc->cb_rel; // the tail's part that is unmapped: what the restore refills
+                    }
+                    if (reach && (size_t) (e + 1)*sz <= ggml_nbytes(srcs[k])) {
+                        rr.push_back({ (const uint8_t *) srcs[k]->data + (size_t) e*sz, sz });
+                        bytes += sz;
+                    }
+                }
+            }
+        }
+    }
+    if (rr.empty()) {
+        return 0;
+    }
+    if (mc->l22_pf_th.joinable()) {
+        mc->l22_pf_th.join(); // finished (not busy)
+    }
+    mc->l22_pf_busy.store(true);
+    mc->l22_pf_th = std::thread([mc, rr = std::move(rr)]() {
+        llama_fn_thread_name("hot-refill-prefetch");
+        fn_l22_mem_prio_low();
+        llama_fn_prefetch_ranges(rr);
+        mc->l22_pf_busy.store(false);
+    });
+    return bytes;
+}
+
+// [TAG_FN_L22_PASSLOG] see llama-moecache.h
+llama_moe_hot_l22_stats llama_moe_hot_l22_take() {
+    llama_moe_hot_l22_stats r;
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return r;
+    }
+    r.unlend_ms  = mc->l22_ul_ms;
+    r.unlend_b   = mc->l22_ul_b;
+    r.restore_ms = mc->l22_res_ms;
+    r.restore_b  = mc->l22_res_b;
+    r.pinned_b   = mc->l22_pin_b.exchange(0);
+    r.released_b = mc->l22_rel_b;
+    r.ul_left    = mc->l22_ul_left;
+    mc->l22_ul_ms  = 0.0;
+    mc->l22_ul_b   = 0;
+    mc->l22_res_ms = 0.0;
+    mc->l22_res_b  = 0;
+    mc->l22_rel_b  = 0;
+    return r;
 }
 
 // [TAG_FN_L3_POLICY_STATE] ---------------------------------------------------------------------------------------------
@@ -4915,6 +5229,7 @@ size_t llama_moe_hot_cbuf_release(const void * owner, size_t need) {
     if (prev <= a) {
         return 0;
     }
+    mc->l22_part = false; // [TAG_FN_L22_LENDCLASS] every hidden layer is refilled at the restore, as before
     std::lock_guard<std::mutex> slk(mc->step_mtx); // [TAG_FN_L3_POLICY_STATE] the tail's bookkeeping, as the lend
     hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
     const int64_t t0 = ggml_time_us();
@@ -4963,6 +5278,75 @@ size_t llama_moe_hot_cbuf_release(const void * owner, size_t need) {
     mc->cb_rel = a;
     mc->cb_n_rel++;
     mc->cb_rel_ms += (ggml_time_us() - t0)/1000.0;
+    mc->l22_rel_b += bytes;
+    return bytes;
+}
+
+// [TAG_FN_L22_LENDCLASS] see llama-moecache.h: the layers a release of need_hide would lend leave the tables (the graphs
+// are those of that release, so the outputs are too), but only the top need_unmap bytes go back to the driver; the layers
+// below keep their bytes, and the restore refills only what reaches into the unmapped part (and dirty slots)
+size_t llama_moe_hot_cbuf_release2(const void * owner, size_t need_hide, size_t need_unmap) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->cb_buf || (mc->adapt && owner != mc->owner)) {
+        return 0;
+    }
+    if (need_unmap == 0 || (need_hide > 0 && need_unmap >= need_hide)) {
+        return llama_moe_hot_cbuf_release(owner, need_hide); // nothing narrower: the plain release
+    }
+    const size_t a_h  = llama_fn_cbuf_part_lo(mc->cb_lo, mc->cb_hi, mc->cb_seg, need_hide);
+    const size_t a_u  = std::max(a_h, llama_fn_cbuf_part_lo(mc->cb_lo, mc->cb_hi, mc->cb_seg, need_unmap));
+    const size_t prev = mc->cb_out ? mc->cb_rel : mc->cb_hi;
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    hot_turn_join(mc);
+    const int64_t t0 = ggml_time_us();
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(mc->cb_buf);
+    const size_t    lim  = a_h > mc->cb_lo + mc->cb_gran ? a_h - mc->cb_gran : mc->cb_lo;
+    std::vector<layer_state *> newly;
+    for (auto & ls : mc->layers) {
+        if (!ls.cb_tail || ls.cb_lent) {
+            continue;
+        }
+        size_t end = 0;
+        for (const ggml_tensor * t : { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c }) {
+            end = std::max(end, (size_t) ((const uint8_t *) t->data - base) + ggml_nbytes(t));
+        }
+        if (a_h == mc->cb_lo || end > lim) {
+            ls.cb_lent = true;
+            newly.push_back(&ls);
+        }
+    }
+    if (newly.empty() && prev <= a_u) {
+        return 0;
+    }
+    const bool first = !mc->cb_out;
+    hot_drain_out(mc);
+    mc->cb_async_left = 0;
+    for (layer_state * ls : newly) {
+        hot_write_tables(mc, *ls);
+    }
+    // the drain published the worker's last batch into the host tables: the device tables follow now, so a narrow graph
+    // of this FULL period (the tail, a window) never sees a host table that skips what the device table misses
+    if (mc->tbl_dirty && mc->tbl_all) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    size_t bytes = 0;
+    if (prev > a_u) {
+        if (!mc->cb_unmap(mc->cb_buf, a_u, prev - a_u)) {
+            LLAMA_LOG_WARN("moe-hot: [TAG_FN_L22_LENDCLASS] the tail could not give its VRAM back - its layers sit out this prompt\n");
+            mc->cb_out = true;
+            mc->cb_rel = std::min(prev, a_u);
+            mc->l22_part = false; // refill everything hidden at the restore
+            return 0;
+        }
+        bytes = prev - a_u;
+        mc->cb_rel = a_u;
+    }
+    mc->cb_out   = true;
+    mc->l22_part = first ? true : mc->l22_part; // a later plain release clears it
+    mc->cb_n_rel++;
+    mc->cb_rel_ms += (ggml_time_us() - t0)/1000.0;
+    mc->l22_rel_b += bytes;
     return bytes;
 }
 
@@ -4970,6 +5354,23 @@ size_t llama_moe_hot_cbuf_release(const void * owner, size_t need) {
 
 namespace {
 std::atomic<uint64_t> g_hot_gen{0};
+}
+
+// [TAG_FN_L22_KEEPLEND] see llama-moecache.h
+void llama_moe_hot_lend_hide(const void * owner, bool hide) {
+    moe_cache * mc = g_cache;
+    if (!mc || (mc->adapt && owner != mc->owner) || mc->l22_hide == hide) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    mc->l22_hide = hide;
+    // narrow graphs come next: the host and device tables agree (a drain at the lend may have published into the host
+    // tables only; the owner's graphs are synchronized)
+    if (mc->tbl_dirty && mc->tbl_all) {
+        ggml_backend_tensor_set(mc->tbl_all, mc->tbl_mirror.data(), 0, mc->tbl_mirror.size()*sizeof(int32_t));
+        mc->tbl_dirty = false;
+    }
+    g_hot_gen.fetch_add(1, std::memory_order_acq_rel); // no graph built under the other state is reused
 }
 
 void llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk) {
@@ -5236,6 +5637,9 @@ void llama_moe_hot_stop(const void * owner) {
         mc->fa18_pf_abort.store(true);
         mc->fa18_pf_th.join(); // [TAG_FN_L18_FIRSTANS_STATE] its jobs are queued (or dropped) before the worker stops
     }
+    if (mc->l22_pf_th.joinable()) {
+        mc->l22_pf_th.join(); // [TAG_FN_L22_REFILL] the refill set's prefetch (one call, bounded)
+    }
     {
         std::lock_guard<std::mutex> lk(mc->wmtx);
         mc->stop = true;
@@ -5258,6 +5662,11 @@ void llama_moe_hot_stop(const void * owner) {
 }
 
 bool llama_moe_hot_cbuf_restore(const void * owner) {
+    moe_cache * mc = g_cache;
+    return llama_moe_hot_cbuf_restore_ex(owner, mc && mc->adapt && mc->cb_async);
+}
+
+bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
     moe_cache * mc = g_cache;
     if (!mc || !mc->cb_buf || !mc->cb_out) {
         return true;
@@ -5288,7 +5697,24 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
     // fresh memory: zero slots, padding and empty slots read 0, then the resident experts come back
     ggml_backend_tensor_memset(mc->cb_raw, 0, r0 - mc->cb_lo, n); // [TAG_FN_L20_BIGPROMPT_TAIL] the part mapped again
     size_t bytes = 0;
-    const bool async = mc->adapt && mc->cb_async;
+    const bool async = mc->adapt && async_req && mc->worker.joinable(); // [TAG_FN_L22_ENDOVERLAP] async_req: also per call
+    // [TAG_FN_L22_LENDCLASS] after a narrow class's release: a hidden layer's slot below the unmapped part kept its bytes
+    // (nothing writes an out layer's slots; an upload dropped meanwhile marked its slot dirty), so it needs no refill
+    const bool      part    = mc->l22_part;
+    const uint8_t * cb_base = (const uint8_t *) ggml_backend_buffer_get_base(mc->cb_buf);
+    auto intact = [&](const layer_state & ls, int32_t s) -> bool {
+        if (!part || ((size_t) s < ls.slot_dirty.size() && ls.slot_dirty[s])) {
+            return false;
+        }
+        const ggml_tensor * ts[3] = { ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c };
+        const ggml_tensor * ss[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+        for (int k = 0; k < 3; ++k) {
+            if ((const uint8_t *) ts[k]->data + (size_t) s*ts[k]->nb[2] + ss[k]->nb[2] > cb_base + r0) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (async) {
         // through the upload worker, published at the owner's step boundaries as they land, the CPU computing them until
         // then: every resident slot leaves the tables and goes in flight, as for an admission (evict, upload, publish)
@@ -5301,7 +5727,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
             const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
             for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
                 const int32_t e = ls.slot_expert[s];
-                if (e < 0 || ls.slot_in_flight[s]) {
+                if (e < 0 || ls.slot_in_flight[s] || intact(ls, s)) {
                     continue;
                 }
                 ls.slot_expert[s]     = -1;
@@ -5329,7 +5755,7 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
             const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
             for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
                 const int32_t e = ls.slot_expert[s];
-                if (e < 0) {
+                if (e < 0 || intact(ls, s)) {
                     continue;
                 }
                 for (int k = 0; k < 3; ++k) {
@@ -5339,6 +5765,9 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
                         continue; // upload_slice's bound check
                     }
                     jobs.push_back({ dsts[k], off, (const char *) srcs[k]->data + (size_t) e*sz, sz });
+                }
+                if ((size_t) s < ls.slot_dirty.size()) {
+                    ls.slot_dirty[s] = 0; // [TAG_FN_L22_LENDCLASS] refilled below
                 }
             }
         }
@@ -5354,8 +5783,9 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
             hot_write_tables(mc, ls);
         }
     }
-    mc->cb_out = false;
-    mc->cb_rel = mc->cb_hi;
+    mc->cb_out   = false;
+    mc->cb_rel   = mc->cb_hi;
+    mc->l22_part = false; // [TAG_FN_L22_LENDCLASS]
     if (async) {
         mc->wcv.notify_one();
     }
@@ -5363,6 +5793,8 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
     const double ms = (ggml_time_us() - t0)/1000.0;
     mc->cb_res_ms += ms;
     mc->cb_res_b  += bytes;
+    mc->l22_res_ms += ms; // [TAG_FN_L22_PASSLOG]
+    mc->l22_res_b  += bytes;
     if (mc->cb_n_res <= 2 || mc->cb_n_res % 16 == 0) {
         LLAMA_LOG_INFO("moe-hot: [TAG_FN_L3_VRAM_CBUF] restore %" PRIu64 ": %.0f MiB tail mapped in %.1f ms, %.2f GiB of resident "
                 "experts %s (releases %.1f ms, restores %.1f ms on average)\n", mc->cb_n_res, n/1048576.0, ms,
@@ -5452,5 +5884,22 @@ void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t
 void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total) {
     (void) model;
     ggml_backend_dev_memory(dev, mem_free, mem_total);
+}
+#endif
+
+// [TAG_FN_L22_REFILL] M2.4: the calling thread at MEMORY_PRIORITY_LOW, so the pages it faults in (host copies of experts
+// that sit in VRAM) are the first the memory manager takes back (SetThreadInformation, Windows 8+)
+#if defined(_WIN32)
+static void fn_l22_mem_prio_low() {
+    using set_info_t = BOOL (WINAPI *)(HANDLE, int, LPVOID, DWORD);
+    static const set_info_t set_info = (set_info_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+    if (!set_info) {
+        return;
+    }
+    struct { ULONG MemoryPriority; } mpi = { 2 };       // MEMORY_PRIORITY_INFORMATION { MEMORY_PRIORITY_LOW }
+    (void) set_info(GetCurrentThread(), 0 /* ThreadMemoryPriority */, &mpi, (DWORD) sizeof(mpi));
+}
+#else
+static void fn_l22_mem_prio_low() {
 }
 #endif

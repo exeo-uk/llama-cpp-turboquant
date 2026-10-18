@@ -239,6 +239,43 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, struct ggml_backend_bu
 // the lent layers are uploaded again, their zero slots cleared, and both tables restored. No-op when nothing is lent.
 void llama_moe_hot_unlend(const void * owner);
 
+// [TAG_FN_L22_ENDOVERLAP] as llama_moe_hot_unlend, but the residents whose slices reach into the range go through the upload
+// worker (they leave the tables now and come back at an owner step once their copy landed; the CPU computes them until
+// then). Without the adaptive set it is llama_moe_hot_unlend.
+void llama_moe_hot_unlend_async(const void * owner);
+
+// [TAG_FN_L22_KEEPLEND] while the stream keeps its banks over a narrow ubatch: the lent layers are hidden from the hot
+// chains (llama_moe_cache_lookup returns nullptr for them: their zero slot may hold bank bytes). A change bumps the hot
+// generation (llama_moe_hot_generation), so graphs built under the other state are not reused. The owner's graphs are
+// synchronized.
+void llama_moe_hot_lend_hide(const void * owner, bool hide);
+
+// [TAG_FN_L22_REFILL] (b) at a prompt's last batch: a background PrefetchVirtualMemory of the host pages the unlend and the
+// tail restore will read (the resident experts of the lent and tail-out layers). Returns the bytes asked for (0: nothing,
+// off, or the last prefetch still runs). Needs LLAMA_FN_L22_REFILL.
+size_t llama_moe_hot_prefetch_refill(const void * owner);
+
+// [TAG_FN_L22_LENDCLASS] the tail release of a narrow FULL class: the layers a release of need_hide would lend leave the
+// tables and the hot chains (so the graphs and outputs are those of that release), but only the top need_unmap bytes go
+// back; the restore then refills only the slots that reach into what was unmapped (and dirty ones). need_unmap 0 or >=
+// need_hide: llama_moe_hot_cbuf_release(owner, need_hide). Returns the bytes given back.
+size_t llama_moe_hot_cbuf_release2(const void * owner, size_t need_hide, size_t need_unmap);
+
+// [TAG_FN_L22_ENDOVERLAP] llama_moe_hot_cbuf_restore with the refill on the upload worker when async (adaptive set only)
+bool   llama_moe_hot_cbuf_restore_ex(const void * owner, bool async);
+
+// [TAG_FN_L22_PASSLOG] the switch parts since the last call (taken and reset)
+struct llama_moe_hot_l22_stats {
+    double   unlend_ms  = 0.0; // the stream's returns (host time)
+    size_t   unlend_b   = 0;   // refilled (sync) or queued (async)
+    double   restore_ms = 0.0; // the tail's restores
+    size_t   restore_b  = 0;
+    uint64_t pinned_b   = 0;   // refill / upload bytes straight from pinned pages
+    size_t   released_b = 0;   // tail bytes unmapped
+    size_t   ul_left    = 0;   // async unlend jobs not landed yet
+};
+llama_moe_hot_l22_stats llama_moe_hot_l22_take();
+
 // [TAG_FN_L3_POLICY_SEED] LLAMA_MOE_HOT_SEED_NODE=1 (qwen4exp, decayed adaptive set, LLAMA_MOE_HOT_SEED > 0): a prompt
 // ubatch (more than LLAMA_MOE_HOT_MAX_T tokens) reports its routing through a CPU graph node after the layer's experts,
 // wherever they ran. Without it the prompt seed sees only prompts the CPU computes: the CPU MUL_MAT_ID observer never runs

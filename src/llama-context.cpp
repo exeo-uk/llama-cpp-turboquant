@@ -7,6 +7,7 @@
 #include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
+#include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1745,6 +1746,8 @@ llama_context::llama_context(
         llama_moe_bridge_attach_dma(moe_bridge, this);
         vram_account("gen5"); // [TAG_FN_L3_VRAM_ACCOUNT] DMA banks (VRAM), rings and stream staging (pinned host)
 
+        l22_init(); // [TAG_FN_L22_P4] the round-22 switches, the stream's configuration, the graph key mode
+
         // [TAG_FN_L3_HOST_STEP] the owner's step goes to a helper thread (the MTP draft context never owns the hot set)
         step_async_want = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && llama_fn_l3_flag(model, "LLAMA_FN_HOST_STEP");
         if (step_async_want) {
@@ -2050,6 +2053,14 @@ void llama_context::sched_reserve() {
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
+    // [TAG_FN_L22_OOMHOOK] a device allocation after ready with pins active: DXGI LOCAL headroom first (plan 3.6); the bytes
+    // this width's compute buffers took the last time (else the FULL reserve's), a failed allocation below retries once
+    size_t l22_need = 0;
+    if (llama_fn_pin_active()) {
+        l22_need = n_tokens <= cbuf_small_t && cbuf_small_b > 0 ? cbuf_small_b : std::max(cbuf_full_b, (size_t) 512 << 20);
+        l22_oom_pre(l22_need);
+    }
+
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     for (auto & res : gf_res_prev) {
@@ -2100,6 +2111,9 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        if (!gf && !model.hparams.no_alloc && l22_oom_retry(l22_need)) {
+            gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get()); // [TAG_FN_L22_OOMHOOK] pins released: once more
+        }
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -2175,8 +2189,26 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
+        if (!gf && !model.hparams.no_alloc && model.arch != LLM_ARCH_KIMI_LINEAR && model.arch != LLM_ARCH_MINIMAX_01 &&
+            l22_oom_retry(l22_need)) {
+            gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get()); // [TAG_FN_L22_OOMHOOK]
+        }
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    // [TAG_FN_L22_SCHEDBUF] qwen4exp: the next scheduler of this width gets a node budget from these graphs (x 3/2 + 8192)
+    if (l22.schedbuf && model.arch == LLM_ARCH_QWEN4EXP && !model.hparams.no_alloc) {
+        const uint32_t measured = (uint32_t) std::max(std::max(n_nodes_pp, n_nodes_tg), 0);
+        const uint32_t budget   = llama_fn_l22_sched_nodes(graph_max_nodes_base(n_tokens), measured);
+        const auto     it       = l22_nodes.find(n_tokens);
+        if (it == l22_nodes.end() || it->second != budget) {
+            l22_nodes[n_tokens] = budget;
+            if (l22.passlog >= 1 && l22_nodes.size() <= 8) {
+                llama_fn_l22_log("switch", "what=schedbuf width=%u nodes_pp=%d nodes_tg=%d budget=%u formula=%u", n_tokens,
+                        n_nodes_pp, n_nodes_tg, budget, graph_max_nodes_base(n_tokens));
+            }
         }
     }
 
@@ -3201,6 +3233,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (llama_moe_gen5_before_ubatch(this, sched.get(), ubatch.n_tokens)) {
         gf_res_prev_active = nullptr;
     }
+    // [TAG_FN_L22_REFILL] (b) the prompt's last wide ubatch: the pages the unlend and the tail restore will read are asked
+    // for now, in the background, while this ubatch computes
+    if (l22.refill && l22_last_ub && ubatch.n_tokens > cbuf_small_t && cbuf_state == CBUF_FULL) {
+        const size_t pf = llama_moe_hot_prefetch_refill(this);
+        if (pf > 0 && l22.passlog >= 2) {
+            llama_fn_l22_log("switch", "what=refill_prefetch mib=%.0f", pf/1048576.0);
+        }
+    }
 
     hp(LLAMA_HP_DEC_GRAPH); // [TAG_FN_L4_HOST]
 
@@ -3303,6 +3343,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        // [TAG_FN_L22_SCHEDBUF] a real graph near its measured budget: the next reserve takes the formula again (the budget
+        // keeps a margin of half the reserve graph + 8192 nodes; this only guards an unforeseen shape)
+        if (l22.schedbuf && !l22_nodes.empty() && (uint64_t) ggml_graph_n_nodes(gf)*4 > (uint64_t) res->get_max_nodes()*3) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_SCHEDBUF] a %u-token graph has %d nodes of a budget of %zu: the formula's budget from "
+                    "the next reserve on\n", __func__, ubatch.n_tokens, ggml_graph_n_nodes(gf), (size_t) res->get_max_nodes());
+            l22_nodes.clear();
+            l22.schedbuf = false;
         }
 
         if (graph_per_width && !cparams.pipeline_parallel) {
@@ -3896,6 +3945,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L3_VRAM_CBUF] a batch wider than the SMALL reserve runs with the FULL one (the hot set's tail gives its VRAM
     // back first); the next narrow batch returns to SMALL and refills the tail. The whole batch keeps one state: its
     // ubatches are at most n_ubatch wide either way, and a narrow ubatch under FULL just runs without the tail layers
+    l22_after = l20_prompt_after; // [TAG_FN_L22_KEEPLEND] the prompt rows (any slot) after this batch (-1: not known)
+    l22_tail  = false;
     cbuf_short = false;
     if (cbuf_state != CBUF_OFF) {
         cbuf_n_batch++;
@@ -3929,7 +3980,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
         }
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
-        const bool tail_full = !wide && llama_fn_cbuf_tail_full(l19_tailfull, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
+        // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch
+        const uint32_t tailfull_n = l22.endoverlap ? UINT32_MAX : l19_tailfull;
+        const bool tail_full = !wide && llama_fn_cbuf_tail_full(tailfull_n, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
                 n_outputs_all, cbuf_prev_n, cbuf_prev_out, cbuf_small_t);
         if (tail_full) {
             if (cbuf_n_tailfull++ < 3) {
@@ -3937,14 +3990,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         "FULL: the answer's first step returns to SMALL\n", __func__, (int) n_tokens_all, cbuf_prev_n);
             }
         }
+        l22_tail = tail_full && l22.endoverlap; // [TAG_FN_L22_ENDOVERLAP] its narrow ubatch keeps the stream's banks too
         cbuf_prev_n   = n_tokens_all;
         cbuf_prev_out = n_outputs_all > 0;
         // [TAG_FN_L20_BIGPROMPT_UB] the FULL width by this batch and the rest of its prompt; a narrow part of a prompt that
         // goes on stays FULL (its tokens run with the tail out, as any narrow ubatch under FULL)
         uint32_t full_w    = 0;
         bool     keep_full = false;
+        uint32_t cls       = 0; // [TAG_FN_L22_LENDCLASS]
+        const int64_t after = l20_prompt_after;
         if (l20_base_ub > 0) {
-            const int64_t after = l20_prompt_after;
             full_w    = !l21_bigub ? llama_fn_l20_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after) :
                         l21_big_off ? l20_base_ub : // [TAG_FN_L21_BIGUB]
                         llama_fn_l21_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after);
@@ -3953,10 +4008,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
                         __func__, (int) n_tokens_all, (int) after);
             }
+            // [TAG_FN_L22_LENDCLASS] a prompt whose whole width fits a class below the command's width reserves that class:
+            // the same ubatches (the class holds every one of them), a smaller tail release
+            if (l22.lendclass && full_w == l20_base_ub) {
+                cls = llama_fn_l22_lend_class(l20_base_ub, (uint32_t) n_tokens_all, after);
+            }
         }
         l20_prompt_after = -1;
-        if (!cbuf_set(wide || cbuf_pinned || tail_full || keep_full, full_w)) {
+        const bool want_full = wide || cbuf_pinned || tail_full || keep_full;
+        if (want_full && wide) {
+            l22_end_pending = false; // [TAG_FN_L22_ENDOVERLAP] the prompt goes on (or another one starts)
+        }
+        // [TAG_FN_L22_LENDCLASS] FULL at a class that this batch and the rest do not fit (another slot's prompt, a hint that
+        // grew): the width the old rule had chosen at the switch, so the ubatches stay the old ones
+        if (want_full && cbuf_state == CBUF_FULL && l22_class > 0 &&
+            (int64_t) n_tokens_all + std::max<int64_t>(0, after) > (int64_t) l22_class) {
+            if (!l22_class_upgrade()) {
+                return -2;
+            }
+        }
+        if (!cbuf_set(want_full, full_w, cls)) {
             return -2;
+        }
+        // [TAG_FN_L22_PASSLOG] the prompt's record: rows and batches of the FULL period
+        if (l22_rec_on && cbuf_state == CBUF_FULL && n_tokens_all > cbuf_small_t) {
+            l22_rec_cur.rows += n_tokens_all;
+            l22_rec_cur.batches++;
         }
     }
     l20_prompt_after = -1;
@@ -4267,6 +4344,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             early_extract_ud = &extract_outputs;
             early_extract_fn = [](void * ud, const llm_graph_result * r) { (*static_cast<decltype(extract_outputs) *>(ud))(r); };
         }
+        // [TAG_FN_L22_KEEPLEND] [TAG_FN_L22_ENDOVERLAP] [TAG_FN_L22_REFILL] the rows of the prompt after this ubatch: the rest of
+        // this batch plus the hint; the prompt's last wide ubatch
+        {
+            const int64_t left = (int64_t) n_tokens_all - n_tokens_prev - (int64_t) ubatch.n_tokens;
+            l22_last_ub = left <= 0 && l22_after >= 0 && l22_after <= (int64_t) cbuf_small_t;
+            if (l22.keeplend || l22.endoverlap) {
+                llama_prefill_stream_l22_set_after(this, std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left), l22_tail);
+            }
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         early_extract_fn = nullptr;
         early_extract_ud = nullptr;
@@ -4497,8 +4583,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // token); a batch before it - the server splits a prompt at a context checkpoint, e.g. at the last user message - keeps
     // FULL and runs no pass, so a split prompt pays one FULL/SMALL round trip and one pass instead of one per part
     const bool prompt_end = !fa18_once || n_outputs_all > 0;
-    if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch && prompt_end) {
+    // [TAG_FN_L22_ENDOVERLAP] a prompt's last batch (it asks for an output) keeps FULL and the banks: the caller samples and
+    // sends the first token now, and the answer's first step makes the switch, with the refills on the upload worker
+    if (l22.endoverlap && cbuf_state == CBUF_FULL && n_outputs_all > 0 && !cbuf_pinned && prompt_end && cparams.n_seq_max == 1) {
+        l22_end_pending = true;
+        // the MTP draft's graphs run before the answer's first step: the lent layers stay hidden from their hot chains
+        llama_prefill_stream_l22_hold(this, sched.get());
+    } else if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch && prompt_end) {
         cbuf_set(false);
+    }
+    // [TAG_FN_L22_PASSLOG] the first 8 decode calls after a prompt's switch, wall time (round 18's lesson)
+    if (l22_first_n > 0 && n_tokens_all <= cbuf_small_t && --l22_first_n == 0) {
+        llama_fn_l22_log("switch", "what=first8 ms=%.1f", (ggml_time_us() - l22_first_t0)/1000.0);
+    }
+    // [TAG_FN_L22_PASSLOG] a short-path prompt batch (SMALL, no switch): its own record
+    if (cbuf_short && l22.passlog >= 1) {
+        llama_fn_l22_log("pass", "path=short rows=%u ms=%.1f", n_tokens_all, (ggml_time_us() - t_short0)/1000.0);
     }
 
     // [TAG_FN_L17_START_PRE] a prompt batch ends: the experts its routing names land before the answer's first decode step
@@ -4890,7 +4990,20 @@ void llama_context::output_reorder() {
 // graph
 //
 
+// [TAG_FN_L22_SCHEDBUF] qwen4exp with LLAMA_FN_L22_SCHEDBUF: the budget measured at this width's last reserve (the real
+// graphs x 3/2 + 8192) instead of the n_tokens x 40 formula, never above it; every other model the formula
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    const uint32_t res = graph_max_nodes_base(n_tokens);
+    if (l22.schedbuf && !l22_nodes.empty()) {
+        const auto it = l22_nodes.find(n_tokens);
+        if (it != l22_nodes.end() && it->second > 0 && it->second < res) {
+            return it->second;
+        }
+    }
+    return res;
+}
+
+uint32_t llama_context::graph_max_nodes_base(uint32_t n_tokens) const {
     uint32_t res;
     if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
@@ -4952,10 +5065,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             std::min(n_tokens, cparams.n_outputs_max),
             (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
 
-    res += n_sampling_nodes;
+    uint32_t n_samp = n_sampling_nodes;
     if (n_sampling_outputs_max > 1) {
-        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
+        n_samp += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    // [TAG_FN_L22_SAMPSTATIC] every sampler builds n_outputs_max_per_seq chains (P1's static sampling graph)
+    if (l22.sampstatic && cparams.n_outputs_max_per_seq > 1) {
+        n_samp = llama_fn_l22_sampling_nodes(n_samp, n_sampling_nodes, cparams.n_outputs_max_per_seq) + n_sampling_nodes_max;
+    }
+    res += n_samp;
 
     if (cparams.training) {
         res *= 4;
@@ -5274,8 +5392,42 @@ public:
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        // [TAG_FN_L22_E6] (#30694) consecutive small ranges of one device tensor in one read, then copied apart on the host
+        // (the same bytes; LLAMA_FN_L22_STATEMERGE=0: one read per range, as before)
+        static const bool merge = [] {
+            const char * e = getenv("LLAMA_FN_L22_STATEMERGE");
+            return !(e && e[0] == '0');
+        }();
+        if (!merge || winfos.size() < 2) {
+            for (const auto & winfo : winfos) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+            return;
+        }
+        std::vector<llama_fn_l22_io_range> rr;
+        rr.reserve(winfos.size());
+        for (const auto & w : winfos) {
+            const bool host = w.tensor->buffer == nullptr || ggml_backend_buffer_is_host(w.tensor->buffer);
+            rr.push_back({ host ? (const void *) &w : (const void *) w.tensor, w.offset, w.size }); // host tensors never merge
+        }
+        std::vector<std::pair<size_t, size_t>> groups;
+        llama_fn_l22_io_merge(rr, groups);
+        std::vector<uint8_t> tmp;
+        for (const auto & g : groups) {
+            if (g.second - g.first == 1) {
+                const auto & w = winfos[g.first];
+                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+                continue;
+            }
+            const auto & w0 = winfos[g.first];
+            const auto & w1 = winfos[g.second - 1];
+            const size_t lo = w0.offset;
+            const size_t hi = w1.offset + w1.size;
+            tmp.resize(hi - lo);
+            ggml_backend_tensor_get(w0.tensor, tmp.data(), lo, hi - lo);
+            for (size_t k = g.first; k < g.second; ++k) {
+                memcpy(winfos[k].ptr, tmp.data() + (winfos[k].offset - lo), winfos[k].size);
+            }
         }
     }
 
@@ -6271,6 +6423,18 @@ size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
     for (const auto & c : llama_fn_ctx_list(*model)) {
         c.first->synchronize(); // no graph of the model reads a slot while its VRAM goes
     }
+    // [TAG_FN_L22_OOMHOOK] with pins: the projector's buffers come next; DXGI LOCAL headroom first (plan 3.6)
+    if (llama_fn_pin_active()) {
+        uint64_t budget = 0, usage = 0;
+        if (llama_fn_dxgi_query(0, 0, &budget, &usage)) {
+            const uint64_t head = budget > usage ? budget - usage : 0;
+            if (head < (uint64_t) bytes + ((uint64_t) 512 << 20)) {
+                const bool freed = llama_fn_pin_on_oom(bytes);
+                llama_fn_l22_log("pin", "what=oom_pre site=vision_take need_mib=%.0f headroom_mib=%.0f freed=%d", bytes/1048576.0,
+                        head/1048576.0, freed ? 1 : 0);
+            }
+        }
+    }
     return llama_moe_hot_vis_take(bytes);
 }
 
@@ -6685,6 +6849,11 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
     }
     cbuf_full_b  = full;
     cbuf_small_b = small;
+    // [TAG_FN_L22_OOMHOOK] P6's LOCAL reserve: the most a FULL reserve adds above SMALL, and the 16K borrow
+    llama_fn_pin_note_need(&model, LLAMA_FN_PIN_NEED_FULL_EXTRA, full > small ? full - small + cbuf_slack_b : 0);
+    if (l21_extra > 0) {
+        llama_fn_pin_note_need(&model, LLAMA_FN_PIN_NEED_BORROW, l21_extra);
+    }
     if (l20_base_ub > 0) {
         // [TAG_FN_L20_BIGPROMPT_UB] the tail's top part a FULL reserve at the command's width needs, with its own slack
         const size_t slack_b = std::max<size_t>((size_t) 128 << 20, l20_full_base_b/16);
@@ -6703,7 +6872,7 @@ size_t llama_context::cbuf_prepare(ggml_backend_dev_t dev) {
 // before a batch: wider than SMALL -> FULL (the tail gives its VRAM back first), narrow -> SMALL (FULL goes first, then the
 // tail comes back and is refilled). The device use never passes the larger of the two states'. false: a reserve failed
 // (another process took the VRAM): the batch fails, the next one tries again
-bool llama_context::cbuf_set(bool full, uint32_t width) {
+bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
     const int want = full ? CBUF_FULL : CBUF_SMALL;
     // [TAG_FN_L20_BIGPROMPT_UB] the FULL width: n_ubatch unless a narrower class was asked for. It is chosen at the switch
     // and kept until SMALL: a wider batch under the narrower FULL runs in ubatches of that width (correct, no re-reserve)
@@ -6745,11 +6914,40 @@ bool llama_context::cbuf_set(bool full, uint32_t width) {
     bool   restored = true;
     // [TAG_FN_L19_TTFT_HUSH] bit 1: the FULL reserve's allocation without the warm pass's page faults beside it
     llama_fn_hush_scope hush_full((l19_hush & 1) != 0 && full);
+    // [TAG_FN_L22_PASSLOG] the switch's parts (the hot set's own counters since the last switch are dropped first)
+    const llama_fn_l22_counters l22_c0 = l22.passlog >= 1 ? llama_fn_l22_counters_now() : llama_fn_l22_counters{};
+    if (l22.passlog >= 1) {
+        (void) llama_moe_hot_l22_take();
+    }
+    const bool l22_rec_ended = !full && l22_rec_on;
+    if (l22_rec_ended) {
+        l22_rec_end(); // the prompt's record ends where its SMALL switch begins
+    }
     if (full) {
+        // [TAG_FN_L22_GRAPHKEEP] the pools' high-water of the SMALL period is the decode graphs' footprint: the trim at the
+        // return to SMALL keeps it mapped (P7's proc; nothing without GGML_CUDA_FN_L22_GRAPHKEEP)
+        if (l22.graphkeep) {
+            l22_graph_procs(true, 0);
+        }
         // [TAG_FN_L20_BIGPROMPT_UB] the command's width: only the tail's top part goes out
         const bool base_w  = l20_base_ub > 0 && w_want == l20_base_ub && l20_base_need > 0;
-        released           = llama_moe_hot_cbuf_release(this, base_w ? l20_base_need : 0);
-        cbuf_full_t        = l20_base_ub > 0 ? (base_w ? l20_base_ub : cparams.n_ubatch) : 0;
+        // [TAG_FN_L22_LENDCLASS] a class below the command's width: the same layers leave the tables (the command width's
+        // release), but only the class's need goes back to the driver once it was measured (the first use measures it)
+        uint32_t cls_now     = 0;
+        size_t   need_unmap  = base_w ? l20_base_need : 0;
+        if (l22.lendclass && cls > 0 && base_w && cls < l20_base_ub) {
+            cls_now = cls;
+            const auto it = l22_class_need.find(cls);
+            if (it != l22_class_need.end() && it->second > 0 && it->second < l20_base_need) {
+                need_unmap = it->second;
+            }
+        }
+        released           = cls_now > 0 && need_unmap < l20_base_need ? llama_moe_hot_cbuf_release2(this, l20_base_need, need_unmap) :
+                             llama_moe_hot_cbuf_release(this, base_w ? l20_base_need : 0);
+        cbuf_full_t        = l20_base_ub > 0 ? (cls_now > 0 ? cls_now : base_w ? l20_base_ub : cparams.n_ubatch) : 0;
+        l22_class          = cls_now;
+        l22_w_old          = base_w ? l20_base_ub : cparams.n_ubatch;
+        l22_n_class       += cls_now > 0 ? 1 : 0;
         if (l21_extra > 0 && l20_base_ub > 0 && !base_w) {
             // [TAG_FN_L21_BIGUB] the 16K reserve's extra: the borrow goes out (short: back, and the command's width)
             const size_t got = llama_moe_hot_cb_borrow(this);
@@ -6768,15 +6966,46 @@ bool llama_context::cbuf_set(bool full, uint32_t width) {
         (base_w ? l20_n_base : l20_n_big) += l20_base_ub > 0 ? 1 : 0;
         cbuf_state         = CBUF_FULL;
         sched_need_reserve = true;
+        // [TAG_FN_L22_OOMHOOK] with pins: DXGI LOCAL headroom for this reserve first (plan 3.6)
+        if (llama_fn_pin_active()) {
+            l22_oom_pre(cbuf_full_t > 0 && cbuf_full_t <= l20_base_ub && l20_full_base_b > 0 ? l20_full_base_b : cbuf_full_b);
+        }
+        bool l22_ok = false;
         try {
             sched_reserve();
+            l22_ok = true;
         } catch (const std::exception & err) {
-            // another process holds the VRAM the prompt needs: back to SMALL, so the context stays consistent and the
-            // narrow batches keep running; this batch fails and the next wide one tries again
-            LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve failed (%s): back to SMALL, this batch fails\n",
-                    __func__, err.what());
-            cbuf_to_small(dev, trimmed, restored);
-            return false;
+            if (l22_class > 0 && need_unmap < l20_base_need) {
+                // [TAG_FN_L22_LENDCLASS] the class's reserve did not fit its release: the command width's release, once more
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_LENDCLASS] the %u-token class reserve failed (%s): the %u-token width's tail release, "
+                        "again\n", __func__, l22_class, err.what(), l20_base_ub);
+                released += llama_moe_hot_cbuf_release(this, l20_base_need);
+                l22_class_need.erase(l22_class);
+                sched_need_reserve = true;
+                try {
+                    sched_reserve();
+                    l22_ok = true;
+                } catch (const std::exception & err2) {
+                    LLAMA_LOG_ERROR("%s: [TAG_FN_L22_LENDCLASS] the retry failed too (%s)\n", __func__, err2.what());
+                }
+            }
+            if (!l22_ok) {
+                // another process holds the VRAM the prompt needs: back to SMALL, so the context stays consistent and the
+                // narrow batches keep running; this batch fails and the next wide one tries again
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L3_VRAM_CBUF] the FULL reserve failed (%s): back to SMALL, this batch fails\n",
+                        __func__, err.what());
+                l22_class = 0;
+                cbuf_to_small(dev, trimmed, restored);
+                return false;
+            }
+        }
+        // [TAG_FN_L22_LENDCLASS] the first use of a class measures its reserve: later uses give back only its need
+        if (l22_class > 0 && l22_class_need.find(l22_class) == l22_class_need.end()) {
+            const size_t need = llama_fn_l22_class_need(cbuf_compute_bytes(dev), cbuf_small_b, cbuf_pool_mib << 20, l20_base_need);
+            l22_class_need[l22_class] = need;
+            LLAMA_LOG_INFO("%s: [TAG_FN_L22_LENDCLASS] class %u: compute reserve %.0f MiB, its tail need %.0f MiB (the %u-token width "
+                    "gives back %.0f MiB)\n", __func__, l22_class, cbuf_compute_bytes(dev)/MiB, need/MiB, l20_base_ub,
+                    l20_base_need/MiB);
         }
         cbuf_n_full++;
         // [TAG_FN_L20_BIGPROMPT_DFTUB] a big prompt: the draft context's wide reserve in the tail's room (it stays narrow if not)
@@ -6793,15 +7022,56 @@ bool llama_context::cbuf_set(bool full, uint32_t width) {
                     (full_now - cbuf_full_b - cbuf_slack_b)/MiB);
         }
     } else {
+        // [TAG_FN_L22_ENDOVERLAP] the answer's first step after a prompt that kept FULL: the stream's refill and the tail's go
+        // to the upload worker (each slot reaches the device tables once its copy landed; the CPU computes it until then)
+        const bool async = l22.endoverlap && l22_end_pending;
+        l22_end_pending  = false;
+        l22_class        = 0; // [TAG_FN_L22_LENDCLASS]
+        if (async) {
+            llama_prefill_stream_l22_async_return(this, true);
+        }
         // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
         llama_moe_gen5_before_ubatch(this, sched.get(), 0);
-        if (!cbuf_to_small(dev, trimmed, restored)) {
+        llama_prefill_stream_l22_async_return(this, false);
+        if (!cbuf_to_small(dev, trimmed, restored, async)) {
             return false;
         }
         cbuf_n_small++;
+        // [TAG_FN_L22_PASSLOG] the next 16 graph calls (P7's window) and 8 decode calls are counted
+        if (l22.passlog >= 1) {
+            l22_first_n  = 8;
+            l22_first_t0 = ggml_time_us();
+            l22_graph_procs(false, 16);
+        }
     }
     const double ms = (ggml_time_us() - t0)/1000.0;
     (full ? cbuf_ms_full : cbuf_ms_small) += ms;
+    // [TAG_FN_L22_PASSLOG] kind=switch: the parts; the prompt's record after its SMALL switch
+    if (l22.passlog >= 1) {
+        const llama_moe_hot_l22_stats hs = llama_moe_hot_l22_take();
+        const llama_fn_l22_counters   c1 = llama_fn_l22_counters_now();
+        llama_fn_l22_log("switch", "to=%s ms=%.1f width=%u class=%u released_mib=%.0f unlend_ms=%.1f unlend_mib=%.0f restore_ms=%.1f "
+                "restore_mib=%.0f pinned_mib=%.0f async_left=%zu trimmed_mib=%.0f faults=%llu page_reads=%llu avail_mib=%.0f",
+                full ? "full" : "small", ms, cbuf_full_t, l22_class, hs.released_b/MiB, hs.unlend_ms, hs.unlend_b/MiB,
+                hs.restore_ms, hs.restore_b/MiB, hs.pinned_b/MiB, hs.ul_left, trimmed/MiB,
+                (unsigned long long) (c1.faults - l22_c0.faults), (unsigned long long) (c1.sys_page_reads - l22_c0.sys_page_reads),
+                c1.avail_ram/MiB);
+        if (full) {
+            l22_rec_begin();
+            l22_rec_cur.full_ms = ms;
+        } else if (l22_rec_ended) {
+            l22_rec.small_ms = ms;
+            const auto & r = l22_rec;
+            llama_fn_l22_log("pass", "path=%s rows=%llu batches=%llu ubatches=%llu width=%u class=%u ms=%.1f full_ms=%.1f small_ms=%.1f "
+                    "gate_wait_ms=%.1f pinned_mib=%.0f staged_mib=%.0f ssd_mib=%.0f d2d_mib=%.0f readahead_mib=%.0f miss_share=%.3f "
+                    "miss_layers=%u keeps=%llu faults=%llu page_reads=%llu n_kv=%u", r.path == 1 ? "stream" : "cpu",
+                    (unsigned long long) r.rows, (unsigned long long) r.batches, (unsigned long long) r.ubatches, r.width, r.cls,
+                    r.wall_ms, r.full_ms, r.small_ms, r.gate_wait_ms, r.b_pinned/MiB, r.b_staged/MiB, r.b_ssd/MiB, r.b_d2d/MiB,
+                    r.b_ra/MiB, r.miss_share, r.miss_layers, (unsigned long long) r.keeps, (unsigned long long) r.faults,
+                    (unsigned long long) r.page_reads, r.n_kv);
+            l22_rec_seq++;
+        }
+    }
     if (dev) {
         ggml_backend_dev_memory(dev, &mem_free, &mem_total);
     }
@@ -6825,7 +7095,7 @@ bool llama_context::cbuf_set(bool full, uint32_t width) {
 // the SMALL state from FULL (or from a failed FULL reserve): the compute buffers go, the pools give back what the prompt
 // grew, the tail is mapped and refilled, then SMALL is reserved. A SMALL reserve that fails gives the tail back (its layers
 // sit out) and tries once more. false: no reserve now (the next batch tries again).
-bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored) {
+bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored, bool async_refill) {
     if (l20_dft_extra > 0) {
         if (llama_context * dft = l20_draft()) {
             dft->dft_set_wide(false); // [TAG_FN_L20_BIGPROMPT_DFTUB]
@@ -6848,7 +7118,8 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
             }
         }
     }
-    restored = llama_moe_hot_cbuf_restore(this);
+    // [TAG_FN_L22_ENDOVERLAP] async_refill: the tail's residents through the upload worker (LLAMA_FN_CBUF_ASYNC's path)
+    restored = async_refill ? llama_moe_hot_cbuf_restore_ex(this, true) : llama_moe_hot_cbuf_restore(this);
     if (l21_extra > 0) {
         llama_moe_hot_cb_unborrow(this); // [TAG_FN_L21_BIGUB] after the tail: mapped, cleared, its residents queued
     }
@@ -6933,6 +7204,13 @@ void llama_context::draft_trim(uint32_t n_tokens_all) {
         }
     }
     if (n_tokens_all > 64) {
+        // [TAG_FN_L22_GRAPHKEEP] the first wide batch: the pools' high-water so far is the draft's decode footprint, which the
+        // trim at the next narrow batch keeps mapped (P7's proc; nothing without GGML_CUDA_FN_L22_GRAPHKEEP)
+        if (!dtrim_wide && l22.graphkeep) {
+            llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+            synchronize();
+            l22_graph_procs(true, 0);
+        }
         dtrim_wide = true;
         return;
     }
@@ -6964,6 +7242,231 @@ void llama_context::draft_trim(uint32_t n_tokens_all) {
                 "given back in %.1f ms (%.1f MiB per trim on average)\n", __func__, dtrim_n, held/MiB, freed/MiB,
                 (ggml_time_us() - t0)/1000.0, dtrim_b/MiB/dtrim_n);
     }
+}
+
+// [TAG_FN_L22_P4] ----------------------------------------------------------------------------------------------------
+
+// the round-22 switches of package P4 (llama_fn_env: the environment, then the qwen4exp profile; every arch reads the
+// environment), the prefill stream's configuration and the G4 key mode of the CUDA backends
+void llama_context::l22_init() {
+    auto on = [&](const char * name) {
+        return llama_fn_l22_switch_on(llama_fn_env(model, name));
+    };
+    auto num = [&](const char * name, int def) {
+        const char * v = llama_fn_env(model, name);
+        return v && v[0] ? atoi(v) : def;
+    };
+    const bool fn = model.arch == LLM_ARCH_QWEN4EXP && !model.hparams.no_alloc;
+    l22.passlog    = llama_fn_l22_passlog_level();
+    l22.sampstatic = on("LLAMA_FN_L22_SAMPSTATIC");
+    if (const char * e = getenv("LLAMA_FN_L22_STATEMERGE"); e && e[0] == '0') {
+        l22.e6 = false;
+    }
+    if (const char * e = getenv("GGML_CUDA_FN_L22_GRAPHKEEP"); e && atoi(e) >= 1) {
+        l22.graphkeep = true;
+    }
+    if (fn) {
+        l22.schedbuf = on("LLAMA_FN_L22_SCHEDBUF");
+        l22.graphkey = on("LLAMA_FN_L22_GRAPHKEY");
+    }
+    if (fn && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        l22.lendclass  = on("LLAMA_FN_L22_LENDCLASS");
+        l22.keeplend   = on("LLAMA_FN_L22_KEEPLEND");
+        l22.endoverlap = on("LLAMA_FN_L22_ENDOVERLAP");
+        l22.refill     = on("LLAMA_FN_L22_REFILL");
+        l22.readahead  = on("LLAMA_FN_L22_READAHEAD");
+        l22.ssdtier    = std::max(0, std::min(2, num("LLAMA_FN_L22_SSDTIER", 0)));
+        l22.pin        = on("LLAMA_FN_L22_PIN");
+        llama_pfs_l22_cfg cfg;
+        cfg.keeplend   = l22.keeplend;
+        cfg.endoverlap = l22.endoverlap;
+        cfg.prestage   = l22.refill;
+        cfg.readahead  = l22.readahead;
+        cfg.ra_call    = (size_t) std::max(64, num("LLAMA_FN_L22_READAHEAD_MIB", 2048)) << 20;
+        cfg.ssdtier    = l22.ssdtier;
+        cfg.pin        = l22.pin;
+        cfg.passlog    = l22.passlog;
+        llama_prefill_stream_l22_config(this, &model, cfg);
+    }
+    // [TAG_FN_L22_GRAPHKEY] G4: decode graphs of a new KV size land on the old CUDA graph object (RECAP update instead of a
+    // warm-up); trunk and MTP draft contexts alike (P7's proc; nothing without it)
+    if (l22.graphkey) {
+        int n = 0;
+        for (auto & backend : backends) {
+            ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+            auto * fn_key = reg ? (void (*)(ggml_backend_t, uint32_t)) ggml_backend_reg_get_proc_address(reg,
+                    "ggml_backend_cuda_set_graph_key_mode") : nullptr;
+            if (fn_key) {
+                fn_key(backend.get(), 4096);
+                n++;
+            }
+        }
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_GRAPHKEY] CUDA graph keys hash dimensions >= 4096 as one value on %d backend(s)\n",
+                __func__, n);
+    }
+    if (l22.lendclass || l22.keeplend || l22.endoverlap || l22.refill || l22.schedbuf || l22.sampstatic) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_P4] round 22:%s%s%s%s%s%s%s\n", __func__, l22.lendclass ? " LENDCLASS" : "",
+                l22.keeplend ? " KEEPLEND" : "", l22.endoverlap ? " ENDOVERLAP" : "", l22.refill ? " REFILL" : "",
+                l22.schedbuf ? " SCHEDBUF" : "", l22.sampstatic ? " SAMPSTATIC" : "", l22.graphkeep ? " GRAPHKEEP-marks" : "");
+    }
+}
+
+// [TAG_FN_L22_OOMHOOK] before a device allocation of need bytes with pins active: DXGI LOCAL headroom below need + 512 MiB
+// -> P6 unpins first (synchronized: every caller has synchronized this context)
+void llama_context::l22_oom_pre(size_t need) {
+    if (!llama_fn_pin_active()) {
+        return;
+    }
+    uint64_t budget = 0, usage = 0;
+    if (!llama_fn_dxgi_query(0, 0, &budget, &usage)) {
+        return;
+    }
+    const uint64_t head = budget > usage ? budget - usage : 0;
+    if (head >= (uint64_t) need + ((uint64_t) 512 << 20)) {
+        return;
+    }
+    const bool freed = llama_fn_pin_on_oom(need);
+    llama_fn_l22_log("pin", "what=oom_pre need_mib=%.0f headroom_mib=%.0f freed=%d", need/1048576.0, head/1048576.0, freed ? 1 : 0);
+}
+
+// [TAG_FN_L22_OOMHOOK] an allocation failed: P6 unpins once more; true = retry it once
+bool llama_context::l22_oom_retry(size_t need) {
+    if (!llama_fn_pin_active()) {
+        return false;
+    }
+    const bool freed = llama_fn_pin_on_oom(need > 0 ? need : (size_t) 1 << 30);
+    llama_fn_l22_log("pin", "what=oom_retry need_mib=%.0f freed=%d", need/1048576.0, freed ? 1 : 0);
+    return freed;
+}
+
+// [TAG_FN_L22_LENDCLASS] FULL at a class that the prompt no longer fits: the rest of the command width's release, the
+// compute buffers again at the width the old rule chose at the switch (so the ubatches are the old ones). false: the
+// reserve failed (back to SMALL, the batch fails, as a failed switch does)
+bool llama_context::l22_class_upgrade() {
+    constexpr double MiB = 1024.0*1024.0;
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    synchronize();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    ggml_backend_dev_t dev = llama_moe_hot_device(model);
+    const uint32_t from = l22_class;
+    const size_t   rel  = llama_moe_hot_cbuf_release(this, l20_base_need);
+    l22_class   = 0;
+    cbuf_full_t = l22_w_old;
+    cbuf_free_compute();
+    if (llama_fn_pin_active()) {
+        l22_oom_pre(l20_full_base_b > 0 ? l20_full_base_b : cbuf_full_b);
+    }
+    try {
+        sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L22_LENDCLASS] the %u-token reserve after the %u-token class failed (%s): back to SMALL, this "
+                "batch fails\n", __func__, cbuf_full_t, from, err.what());
+        size_t trimmed  = 0;
+        bool   restored = true;
+        cbuf_to_small(dev, trimmed, restored);
+        return false;
+    }
+    l22_n_upgrade++;
+    if (l22_n_upgrade <= 3 || l22_n_upgrade % 32 == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_LENDCLASS] upgrade %" PRIu64 ": class %u -> %u tokens (%.0f MiB more of the tail given back)\n",
+                __func__, l22_n_upgrade, from, cbuf_full_t, rel/MiB);
+    }
+    return true;
+}
+
+// [TAG_FN_L22_GRAPHKEEP] the CUDA backends' procs of P7: mark = ggml_backend_pool_mark (the keep mark of the next trim),
+// window > 0 = ggml_backend_cuda_graph_window (its kind=graph line counts the next `window` graph calls); null procs: nothing
+void llama_context::l22_graph_procs(bool mark, int window) {
+    for (auto & backend : backends) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+        if (!reg) {
+            continue;
+        }
+        if (mark) {
+            if (auto * fn_mark = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_mark")) {
+                fn_mark(backend.get());
+            }
+        }
+        if (window > 0) {
+            if (auto * fn_win = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_window")) {
+                fn_win(backend.get(), window);
+            }
+        }
+    }
+    if (window > 0) {
+        if (llama_context * dft = l20_draft()) {
+            for (auto & backend : dft->backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+                ggml_backend_reg_t reg = d ? ggml_backend_dev_backend_reg(d) : nullptr;
+                auto * fn_win = reg ? (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg,
+                        "ggml_backend_cuda_graph_window") : nullptr;
+                if (fn_win) {
+                    fn_win(backend.get(), window);
+                }
+            }
+        }
+    }
+}
+
+// [TAG_FN_L22_PASSLOG] a prompt's record: from the end of its FULL switch ...
+void llama_context::l22_rec_begin() {
+    l22_rec_cur       = {};
+    l22_rec_cur.width = cbuf_full_t;
+    l22_rec_cur.cls   = l22_class;
+    l22_rec_on        = true;
+    l22_rec_t0        = ggml_time_us();
+    l22_rec_c0        = llama_fn_l22_counters_now();
+    (void) llama_prefill_stream_l22_take(this);
+}
+
+// ... to the start of its SMALL switch
+void llama_context::l22_rec_end() {
+    l22_rec_on = false;
+    const llama_pfs_l22_sums    s  = llama_prefill_stream_l22_take(this);
+    const llama_fn_l22_counters c1 = llama_fn_l22_counters_now();
+    l22_pass_rec & r = l22_rec_cur;
+    r.wall_ms      = (ggml_time_us() - l22_rec_t0)/1000.0;
+    r.ubatches     = s.ubatches;
+    r.path         = s.ubatches > 0 ? 1 : 0;
+    r.gate_wait_ms = s.wait_ms;
+    r.b_pinned     = s.bytes_pinned;
+    r.b_staged     = s.bytes_staged;
+    r.b_ssd        = s.bytes_ssd;
+    r.b_d2d        = s.bytes_d2d;
+    r.b_ra         = s.ra_bytes;
+    r.miss_share   = s.miss_share;
+    r.miss_layers  = s.miss_layers;
+    r.keeps        = s.keeps;
+    r.faults       = c1.faults - l22_rec_c0.faults;
+    r.page_reads   = c1.sys_page_reads - l22_rec_c0.sys_page_reads;
+    if (memory) {
+        llama_pos pmax = -1;
+        for (int s2 = 0; s2 < (int) cparams.n_seq_max; ++s2) {
+            pmax = std::max(pmax, memory->seq_pos_max(s2));
+        }
+        r.n_kv = (uint32_t) std::max<llama_pos>(0, pmax + 1);
+    }
+    l22_rec = r;
+}
+
+// [TAG_FN_L22_GENSHARE2] the width of the next prompt ubatch given the current hint: FULL -> the width it holds (a class the
+// rest of the prompt does not fit is upgraded at the next decode: the old width), SMALL -> the next switch's choice
+uint32_t llama_context::fn_prompt_ubatch_width() const {
+    const uint32_t nub = cparams.n_ubatch;
+    if (cbuf_state == CBUF_OFF || l20_base_ub == 0) {
+        return nub;
+    }
+    if (cbuf_state == CBUF_FULL && cbuf_full_t > 0) {
+        if (l22_class > 0 && l20_prompt_after > (int64_t) l22_class) {
+            return std::min(nub, l22_w_old);
+        }
+        return std::min(nub, cbuf_full_t);
+    }
+    return llama_fn_l22_next_width(l20_base_ub, nub, l21_bigub, l21_big_off, l22.lendclass, l20_prompt_after);
 }
 
 // [TAG_FN_L3_VRAM_ACCOUNT] ------------------------------------------------------------------------------------------
@@ -7779,9 +8282,9 @@ int32_t llama_get_decode_phase_ext(const llama_context * ctx) {
     return ctx ? ctx->fn_get_phase() : LLAMA_FN_PHASE_PROMPT;
 }
 
-// [TAG_FN_L22_GENSHARE2] round 22 P4. P0 stub: the context's n_ubatch
+// [TAG_FN_L22_GENSHARE2] round 22 P4: the width the context will use for its next prompt ubatch given the current hint
 int32_t llama_fn_prompt_ubatch_width_ext(llama_context * ctx) {
-    return ctx ? (int32_t) llama_n_ubatch(ctx) : 0;
+    return ctx ? (int32_t) ctx->fn_prompt_ubatch_width() : 0;
 }
 
 void llama_context::fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first) {

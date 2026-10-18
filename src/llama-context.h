@@ -74,6 +74,8 @@ struct llama_context {
     // when that decode returns
     void    fn_set_phase(int32_t phase) { fn_phase = phase == LLAMA_FN_PHASE_GEN ? LLAMA_FN_PHASE_GEN : LLAMA_FN_PHASE_PROMPT; }
     int32_t fn_get_phase() const { return fn_phase; }
+    // [TAG_FN_L22_GENSHARE2] the width of the next prompt ubatch given the current hint (llama_fn_prompt_ubatch_width_ext)
+    uint32_t fn_prompt_ubatch_width() const;
     // [TAG_FN_L20_BIGPROMPT_PLEPRE] the next prompt batch's tokens (with up to 16 before them for the n-gram context): their
     // PLE rows are read ahead once this decode's first ubatch has its inputs
     void fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first);
@@ -539,7 +541,7 @@ private:
     void     cbuf_note_full();
     size_t   cbuf_prepare(ggml_backend_dev_t dev);
     void     cbuf_off();
-    bool     cbuf_set(bool full, uint32_t width = 0);
+    bool     cbuf_set(bool full, uint32_t width = 0, uint32_t cls = 0); // [TAG_FN_L22_LENDCLASS] cls: the FULL class (0: none)
     // [TAG_FN_L20_BIGPROMPT_UB] LLAMA_FN_L20_BIGPROMPT_UB=<n> (qwen4exp profile lookup, 0 = off): with the compute-buffer lend,
     // a target context whose -b and -ub are equal (>= 4096) takes n for both. A prompt whose batch or rest (the server's
     // hint) is wider than the command's ubatch runs FULL at n tokens per ubatch (the hot set's whole tail lent); any other
@@ -577,9 +579,69 @@ private:
     bool     l21_big_off   = false;
     size_t   l21_extra     = 0;
     uint64_t l21_n_borrow  = 0, l21_n_fallback = 0;
+
+    // [TAG_FN_L22_P4] round 22, package P4 (prompt stream state machine); every switch off unless set (plan 3.4)
+    struct l22_p4_cfg {
+        bool lendclass  = false; // LLAMA_FN_L22_LENDCLASS: FULL reserve classes 1K / 2K / 4K below the command's width
+        bool keeplend   = false; // LLAMA_FN_L22_KEEPLEND: narrow ubatches with prompt rows after them keep the stream's banks
+        bool endoverlap = false; // LLAMA_FN_L22_ENDOVERLAP: the prompt's end stays FULL, the answer's first step goes SMALL async
+        bool refill     = false; // LLAMA_FN_L22_REFILL: pinned refill sources, the refill set's prefetch, bank 0 pre-staged
+        bool readahead  = false; // LLAMA_FN_L22_READAHEAD
+        int  ssdtier    = 0;     // LLAMA_FN_L22_SSDTIER (0/1/2)
+        bool pin        = false; // LLAMA_FN_L22_PIN (the stream's pinned segments; the OOM callers act whenever pins exist)
+        bool graphkey   = false; // LLAMA_FN_L22_GRAPHKEY (G4 key mode on the CUDA backends)
+        bool schedbuf   = false; // LLAMA_FN_L22_SCHEDBUF (graph node budget from the measured reserve, qwen4exp)
+        bool sampstatic = false; // LLAMA_FN_L22_SAMPSTATIC (sampling nodes counted for static chains)
+        bool graphkeep  = false; // GGML_CUDA_FN_L22_GRAPHKEEP >= 1: the pool marks before FULL / at the draft's wide batch
+        bool e6         = true;  // [TAG_FN_L22_E6] merged small state reads (exact; LLAMA_FN_L22_STATEMERGE=0 turns it off)
+        int  passlog    = 0;
+    };
+    l22_p4_cfg l22;
+    int64_t  l22_after      = -1;    // the hint of the running batch (read once at its start)
+    bool     l22_tail       = false; // [TAG_FN_L22_ENDOVERLAP] the running batch is a prompt's narrow last part kept FULL
+    bool     l22_last_ub    = false; // [TAG_FN_L22_REFILL] the running ubatch is the prompt's last wide one
+    // [TAG_FN_L22_LENDCLASS]
+    uint32_t l22_class      = 0;     // the class of the FULL state now (0: none)
+    uint32_t l22_w_old      = 0;     // the width the old rule chose at the switch (an upgrade goes there)
+    std::map<uint32_t, size_t> l22_class_need; // measured tail need per class width
+    uint64_t l22_n_class    = 0, l22_n_upgrade = 0;
+    // [TAG_FN_L22_SCHEDBUF] node budget per reserve width (measured)
+    mutable std::map<uint32_t, uint32_t> l22_nodes;
+    // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
+    bool     l22_end_pending = false;
+    int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
+    int64_t  l22_first_t0    = 0;
+    // [TAG_FN_L22_PASSLOG] one record per prompt (FULL period, or a short-path batch); P10 reads l22_rec / l22_rec_seq
+    struct l22_pass_rec {
+        uint64_t rows = 0, batches = 0, ubatches = 0;
+        int      path = 0;           // 0 cpu path (FULL, no stream), 1 stream, 2 short (SMALL)
+        uint32_t width = 0, cls = 0; // the FULL width and class
+        double   wall_ms = 0.0;      // from the FULL switch's end to the end of the last batch (switches excluded)
+        double   full_ms = 0.0, small_ms = 0.0; // the two switches
+        double   gate_wait_ms = 0.0;
+        uint64_t b_pinned = 0, b_staged = 0, b_ssd = 0, b_d2d = 0, b_ra = 0;
+        double   miss_share = 0.0;
+        uint32_t miss_layers = 0;
+        uint64_t keeps = 0;
+        uint64_t faults = 0, page_reads = 0;
+        uint32_t n_kv = 0;           // the KV cells used at the end (depth)
+    };
+    l22_pass_rec l22_rec_cur, l22_rec;
+    uint64_t     l22_rec_seq   = 0;
+    bool         l22_rec_on    = false;
+    int64_t      l22_rec_t0    = 0;
+    llama_fn_l22_counters l22_rec_c0 = {};
+    void     l22_init();
+    void     l22_oom_pre(size_t need);
+    bool     l22_oom_retry(size_t need);
+    bool     l22_class_upgrade();
+    void     l22_graph_procs(bool mark, int window);
+    void     l22_rec_begin();
+    void     l22_rec_end();
+    uint32_t graph_max_nodes_base(uint32_t n_tokens) const;
     bool     dft_set_wide(bool wide);
     llama_context * l20_draft() const;
-    bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored);
+    bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored, bool async_refill = false); // [TAG_FN_L22_ENDOVERLAP]
     void     cbuf_retry_restore();
     void     cbuf_free_compute();
     size_t   cbuf_compute_bytes(ggml_backend_dev_t dev) const;
