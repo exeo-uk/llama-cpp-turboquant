@@ -134,6 +134,7 @@ struct kvl_state {
     const void * owner = nullptr;
     bool     whole = false;   // everything mapped (the lend is off)
     uint64_t n_grow = 0, n_shrink = 0;
+    size_t   l22_step_noted = 0; // [TAG_FN_L22_KVGROW] the grow step size last told to the pin watcher
 };
 // [TAG_FN_L10_KVLEND2] one lend per cache: the attention cache and (qwen4exp) the indexer's key cache; the functions below
 // work on kvl_cur, which each entry point points at its cache's state; the hot set sees the sum of both
@@ -434,6 +435,24 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
     kvl_cur = ks;
     const uint32_t ch   = std::max<uint32_t>(1, g_kvl.chunk);
     const uint32_t want = std::min<uint32_t>(g_kvl.kv_size, std::max<uint32_t>(g_kvl.init_cells, (uint32_t) kvl_round_up((size_t) need + ch/2, ch)));
+    if (fn_kvgrow) {
+        // [TAG_FN_L22_KVGROW] P6 R2: one grow step of every lend (the attention cache and the indexer's), in device bytes,
+        // for the pin watcher's LOCAL reserve; told when it changes
+        size_t step = 0;
+        for (const auto & s : g_kvls) {
+            if (s.kv == nullptr || s.whole) {
+                continue;
+            }
+            for (const auto & r : s.regs) {
+                step += kvl_round_up((size_t) std::max<uint32_t>(1, s.chunk) * r.row, std::max<size_t>(1, s.gran));
+            }
+        }
+        if (step != g_kvls[0].l22_step_noted) {
+            g_kvls[0].l22_step_noted = step;
+            llama_fn_pin_note_need(&model, LLAMA_FN_PIN_NEED_KV_GROW, step);
+            kvl_cur = ks;
+        }
+    }
     if (need > g_kvl.cells) {
         const int64_t t0 = ggml_time_us();
         size_t after = 0;
