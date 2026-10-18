@@ -336,6 +336,15 @@ struct fn_group_state {
     int  n_on   = 0;     // its ranges registered now
 };
 
+// one layer at plan time: the residency classes and the hot set's view (tv: 1 read, 0 busy, -1 no hot set / layer)
+struct fn_layer_view {
+    std::vector<uint8_t> cls;
+    std::vector<int32_t> slot;
+    std::vector<float>   cnt;
+    std::vector<uint8_t> vol;
+    int                  tv = -1;
+};
+
 struct fn_pin_state {
     const llama_model * model = nullptr;
     int  mode = 1;     // 1 untouched, 2 touched
@@ -1101,7 +1110,9 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     const size_t page = fn_page_size();
     const int n_layer = (int) model->layers.size();
     std::vector<fn_pin::layer_in> layers;
+    std::vector<fn_layer_view>    views;
     int n_busy = 0;
+    int n_vram = 0;
     size_t host_bytes = 0;
     const int64_t t_view_end = fn_now_us() + 3000000; // the hot set's view: retries while busy, 3 s in all
     for (int il = 0; il < n_layer; ++il) {
@@ -1129,33 +1140,50 @@ void llama_fn_pin_on_ready(const llama_model * model) {
         if (!ok || n_exp <= 0) {
             continue;
         }
-        std::vector<int32_t> slot(n_exp, -1);
-        std::vector<float>   cnt(n_exp, 0.0f);
-        std::vector<uint8_t> vol(n_exp, 0);
-        int tv = 0;
-        for (int k = 0; k < 50 && (tv = llama_moe_hot_tier_view(ts[0], slot.data(), cnt.data(), vol.data(), n_exp)) == 0 &&
+        fn_layer_view v;
+        v.slot.assign(n_exp, -1);
+        v.cnt.assign(n_exp, 0.0f);
+        v.vol.assign(n_exp, 0);
+        for (int k = 0; k < 50 && (v.tv = llama_moe_hot_tier_view(ts[0], v.slot.data(), v.cnt.data(), v.vol.data(), n_exp)) == 0 &&
                 fn_now_us() < t_view_end; ++k) {
             fn_sleep_ms(10);
         }
-        n_busy += tv == 0 ? 1 : 0;
+        n_busy += v.tv == 0 ? 1 : 0;
+        v.cls.resize(n_exp);
+        for (int e = 0; e < n_exp; ++e) {
+            v.cls[e] = llama_fn_res_class(model, il, e);
+            n_vram  += v.cls[e] == LLAMA_FN_RES_VRAM ? 1 : 0;
+        }
+        for (int k = 0; k < 3; ++k) {
+            host_bytes += (size_t) n_exp*in.t[k].stride;
+        }
+        views.push_back(std::move(v));
+        layers.push_back(std::move(in));
+    }
+    // the classes: P5's residency table when it is built (it says VRAM somewhere; it also knows the stream's lend layers
+    // before their first lend), else the hot set's view (a resident in a slot that keeps its VRAM is not streamed)
+    const bool trust_res = n_vram > 0;
+    for (size_t li = 0; li < layers.size(); ++li) {
+        fn_pin::layer_in & in = layers[li];
+        const fn_layer_view & v = views[li];
+        const int n_exp = (int) v.cls.size();
         in.ok.assign(n_exp, 0);
-        bool all_vol = true;
+        bool streamed = true;
         double cpu = 0.0;
         for (int e = 0; e < n_exp; ++e) {
-            const uint8_t cls = llama_fn_res_class(model, il, e);
-            bool can = cls == LLAMA_FN_RES_RAM || cls == LLAMA_FN_RES_PIN;
-            if (tv == 1) {
-                if (slot[e] >= 0 && !vol[e]) {
-                    can = false; // held in a slot that keeps its VRAM: its host copy is not streamed
-                    all_vol = false;
-                }
-                if (slot[e] < 0) {
-                    cpu += cnt[e];
-                }
+            bool can = v.cls[e] == LLAMA_FN_RES_RAM || v.cls[e] == LLAMA_FN_RES_PIN;
+            if (trust_res) {
+                streamed = streamed && v.cls[e] != LLAMA_FN_RES_VRAM;
+            } else if (v.tv == 1 && v.slot[e] >= 0 && !v.vol[e]) {
+                can      = false;
+                streamed = false;
+            }
+            if (v.tv == 1 && v.slot[e] < 0) {
+                cpu += v.cnt[e];
             }
             in.ok[e] = can ? 1 : 0;
         }
-        in.fully_streamed = tv == -1 || (tv == 1 && all_vol);
+        in.fully_streamed = trust_res ? streamed : (v.tv == -1 || (v.tv == 1 && streamed));
         in.cpu_use        = cpu;
         if (st->unit == 1 && in.fully_streamed) {
             const uint8_t * lo = nullptr;
@@ -1168,10 +1196,6 @@ void llama_fn_pin_on_ready(const llama_model * model) {
             }
             in.span_ok = fn_one_view(lo, hi);
         }
-        for (int k = 0; k < 3; ++k) {
-            host_bytes += (size_t) n_exp*in.t[k].stride;
-        }
-        layers.push_back(std::move(in));
     }
     if (layers.empty()) {
         LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] no layer with host-mapped routed experts: no pins\n", __func__);
@@ -1253,9 +1277,10 @@ void llama_fn_pin_on_ready(const llama_model * model) {
             st->unit == 2 ? "arena" : st->unit == 1 ? "spans" : "ranges", st->mode == 2 ? "touched" : "before touch",
             fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(st->cfg.l_keep),
             fn_gib(st->reserve_need), fn_gib(st->watch_local), fn_gib(b.avail), fn_gib(st->cfg.floor), n_busy, (fn_now_us() - t0)/1e3);
-    fn_log("event=plan layers=%zu host_gib=%.2f ranges=%zu groups=%zu take=%d whole=%zu planned_gib=%.2f unit=%d mode=%d nl_gib=%.2f/%.2f "
-            "l_gib=%.2f/%.2f l_keep_gib=%.2f reserve_need_gib=%.2f avail_gib=%.2f", layers.size(), fn_gib(host_bytes),
-            st->plan.ranges.size(), st->plan.groups.size(), st->n_take, n_whole, fn_gib(planned), st->unit, st->mode,
+    fn_log("event=plan classes=%s layers=%zu host_gib=%.2f ranges=%zu groups=%zu take=%d whole=%zu planned_gib=%.2f unit=%d mode=%d "
+            "nl_gib=%.2f/%.2f l_gib=%.2f/%.2f l_keep_gib=%.2f reserve_need_gib=%.2f avail_gib=%.2f", trust_res ? "table" : "hotset",
+            layers.size(), fn_gib(host_bytes), st->plan.ranges.size(), st->plan.groups.size(), st->n_take, n_whole, fn_gib(planned),
+            st->unit, st->mode,
             fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(st->cfg.l_keep),
             fn_gib(st->reserve_need), fn_gib(b.avail));
     if (st->n_take == 0) {
