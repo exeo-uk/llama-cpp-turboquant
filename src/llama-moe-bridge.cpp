@@ -288,6 +288,12 @@ struct llama_moe_bridge {
         std::vector<float>   xs_maxw;
         std::vector<float>   xs_sumw;
         std::vector<int32_t> xs_list;
+        // [TAG_FN_L22_X_DEFER] the light part of the channel's last deferred job (executor thread): the pool job (A's
+        // layer view, x, ids, w), A's seq (0: none), the light experts A counted (-1: unknown)
+        ggml_cpu_moe_job     xd_job = {};
+        uint32_t             xd_seq = 0;
+        int32_t              xd_n_light = -1;
+        uint32_t             xd_seen = 0;       // owner: the last seq whose defer wait was counted
     };
     std::vector<chan> chans;
     std::unordered_map<const ggml_tensor *, int> by_up;
@@ -365,6 +371,19 @@ struct llama_moe_bridge {
     } xs;
     // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] the pool's totals every 4096 bridged graphs
     bool  l22_pool_line = false;
+    // [TAG_FN_L22_X_DEFER] (qwen4exp, opt-in, changes answers) a job flagged GGML_MOE_BRIDGE_JOB_DEFER computes its heavy
+    // cold experts first (answered on its channel), then its light ones (largest weight < xd_w or best rank >= xd_r) as a
+    // second answer on the layer's defer channel xd_base + chan, under the same ticket. Spin waits only
+    int      xd_mode = 0;    // 0 off, 1 defer, 2 check (the graph adds the light rows in the same layer)
+    float    xd_w    = 0.0f;
+    int      xd_r    = 0;
+    int32_t  xd_base = -1;
+    std::atomic<uint64_t> xd_jobs{0};   // executor: light parts answered, of them empty (no light expert), lost (no take)
+    std::atomic<uint64_t> xd_empty{0};
+    std::atomic<uint64_t> xd_lost{0};
+    std::atomic<uint64_t> xd_ns{0};     // executor: host time of the light parts
+    std::atomic<uint64_t> xd_ns_max{0};
+    uint64_t xd_waits = 0, xd_wait_ns = 0, xd_ready = 0; // owner: device defer waits counted
 };
 
 // [TAG_FN_L3_MTP_COST2] add one job's cold prefix counts to the running graph's: for t = 0..T-1 the distinct experts of
@@ -490,6 +509,12 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         return false;
     }
     auto & c = br->chans[j->chan];
+    // [TAG_FN_L22_X_DEFER] no light part is owed until this job's split is stashed below
+    const bool xd = (j->flags & GGML_MOE_BRIDGE_JOB_DEFER) != 0;
+    c.xd_seq = 0;
+    if (xd && br->xd_mode == 0) {
+        return false; // a deferred post this bridge cannot split
+    }
     const ggml_cpu_moe_layer * layer = &c.layer;
     if (j->flags & GGML_MOE_BRIDGE_JOB_TABLE) {
         // the graph built a device chain over the moe-cache slots of this layer: skip the experts it serves
@@ -622,6 +647,20 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         job.tail_w    = br->tail_w;
         job.l22_flags = GGML_MOE_BRIDGE_JOB_TAIL;
     }
+    if (xd) {
+        // [TAG_FN_L22_X_DEFER] the heavy part now; the light part (same layer view, x, ids, w and tail rule) is stashed for
+        // br_run_light, which the executor runs right after this job is answered
+        job.l22_flags |= GGML_MOE_BRIDGE_JOB_DEFER;
+        job.defer_w    = br->xd_w;
+        job.defer_rank = (int8_t) br->xd_r;
+        c.xd_n_light   = -1;
+        job.n_light    = &c.xd_n_light;
+        c.xd_job           = job;
+        c.xd_job.l22_flags = (job.l22_flags & ~(uint32_t) GGML_MOE_BRIDGE_JOB_DEFER) | GGML_MOE_BRIDGE_JOB_LIGHT;
+        c.xd_job.out       = nullptr;
+        c.xd_job.n_light   = nullptr;
+        c.xd_seq           = j->seq;
+    }
     const bool hold = br->fill_gap && br->dma_on; // [TAG_FN_L3_CPU_FILL] the ring fills wait while the pool reads DRAM
     if (hold) {
         llama_moe_dma_bridge_hold(true);
@@ -679,6 +718,42 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     if (br->xs_on && ok) { // [TAG_FN_L22_X_STATS] over the hot table (the DMA share's fetched experts count as cold)
         const bool tbl = (j->flags & GGML_MOE_BRIDGE_JOB_TABLE) && c.tbl_ok;
         br_xstats_job(br, c, tbl ? c.layer_tbl.table : nullptr, tbl ? c.layer_tbl.table_miss : 0, j);
+    }
+    return ok;
+}
+
+// [TAG_FN_L22_X_DEFER] the light part of deferred job a into the defer channel's out area (jb, from host_take), on the
+// executor right after a was answered. No observer call and no DMA plan (a made them). false: jb gets zeros and the error
+static bool br_run_light(llama_moe_bridge * br, const ggml_moe_bridge_job & a, const ggml_moe_bridge_job & jb) {
+    if (a.chan < 0 || a.chan >= (int) br->chans.size() || jb.out == nullptr || jb.n_tokens != a.n_tokens) {
+        return false;
+    }
+    auto & c = br->chans[a.chan];
+    if (c.xd_seq == 0 || c.xd_seq != a.seq) {
+        return false; // a failed before its split
+    }
+    c.xd_seq = 0;
+    {
+        std::lock_guard<std::mutex> lk(br->graph_mtx);
+        if (!br->in_graph) {
+            return false; // stale: the device wait already gave up
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    if (c.xd_n_light == 0) {
+        memset(jb.out, 0, (size_t) br->n_embd*a.n_tokens*sizeof(float)); // the pool's answer without an expert (+0.0)
+        br->xd_empty.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ggml_cpu_moe_job jl = c.xd_job;
+        jl.out = jb.out;
+        ok = br->pool_run(br->pool, &jl) == GGML_STATUS_SUCCESS;
+    }
+    const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    br->xd_jobs.fetch_add(1, std::memory_order_relaxed);
+    br->xd_ns.fetch_add(ns, std::memory_order_relaxed);
+    uint64_t m = br->xd_ns_max.load(std::memory_order_relaxed);
+    while (ns > m && !br->xd_ns_max.compare_exchange_weak(m, ns, std::memory_order_relaxed)) {
     }
     return ok;
 }
@@ -802,7 +877,22 @@ static void br_exec_main(llama_moe_bridge * br) {
                 g_gate_busy.fetch_add(1, std::memory_order_acq_rel);
             }
             const bool ok = br_run(&job, br);
-            br->fn_complete(br->gb, &job, ok);
+            if ((job.flags & GGML_MOE_BRIDGE_JOB_DEFER) && br->xd_base >= 0 && job.chan >= 0 && job.chan < (int) br->chans.size()) {
+                // [TAG_FN_L22_X_DEFER] the light part is owed before the heavy part is answered, so reset() never sees the
+                // bridge idle while the light part still reads this channel's x / ids / w; once taken it is always answered
+                ggml_moe_bridge_job jb;
+                const bool took = br->fn_host_take(br->gb, br->xd_base + job.chan, job.seq, job.n_tokens, &jb);
+                br->fn_complete(br->gb, &job, ok);
+                if (took) {
+                    const bool ok_b = ok && br_run_light(br, job, jb);
+                    br->fn_complete(br->gb, &jb, ok_b);
+                } else if (br->xd_lost.fetch_add(1, std::memory_order_relaxed) < 4) {
+                    LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_DEFER] the light part of layer %d (seq %u) could not be taken: "
+                            "its device wait times out\n", __func__, br->bid, br->chans[job.chan].il, job.seq);
+                }
+            } else {
+                br->fn_complete(br->gb, &job, ok);
+            }
             if (gate) {
                 g_gate_end_ns.store(br_now_ns(), std::memory_order_relaxed);
                 g_gate_busy.fetch_sub(1, std::memory_order_acq_rel);
@@ -1260,9 +1350,40 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
 
+    // [TAG_FN_L22_X_DEFER] (qwen4exp, opt-in, changes answers) one defer channel per bridged layer after the PLE channel,
+    // answered through host_take like the PLE gate's. Spin waits only: in hostfunc mode a wait joins the event of its
+    // channel's post, and these channels have none (and one host function answers both parts anyway: no gain)
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        const char * xd = llama_fn_env(model, "LLAMA_FN_L22_X_DEFER");
+        const int mode = xd && (strcmp(xd, "check") == 0 || strcmp(xd, "CHECK") == 0) ? 2 : llama_fn_l22_switch_on(xd) ? 1 : 0;
+        if (mode > 0) {
+            const char * xr = llama_fn_env(model, "LLAMA_FN_L22_X_DEFER_R");
+            const char * xw = llama_fn_env(model, "LLAMA_FN_L22_X_DEFER_W");
+            br->xd_r = xr && xr[0] ? std::min(127, std::max(0, atoi(xr))) : 0;
+            br->xd_w = xw && xw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(xw))) : 0.0f;
+            if (br->xd_r == 0 && br->xd_w <= 0.0f) {
+                br->xd_w = 0.1f; // no rule given: the plan's default bound
+            }
+            if (br->fn_host_take == nullptr) {
+                br->fn_host_take = (ggml_backend_moe_bridge_host_take_t) proc("ggml_backend_moe_bridge_host_take");
+            }
+            if (br->mode != GGML_MOE_BRIDGE_WAIT_SPIN || br->fn_host_take == nullptr) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_X_DEFER] LLAMA_FN_L22_X_DEFER needs spin waits and the device's host_take: off\n", __func__);
+            } else {
+                br->xd_mode = mode;
+                br->xd_base = (int32_t) br->chans.size() + (br->ple_chan >= 0 ? 1 : 0);
+                br->pool_params.defer_rank = br->xd_r; // the sync op's light rule (a retried ubatch splits the same way)
+                br->pool_params.defer_w    = br->xd_w;
+            }
+        }
+    }
+
     ggml_moe_bridge_params bp = {};
     bp.device     = dev_index;
     bp.n_chan     = (int) br->chans.size() + (br->ple_chan >= 0 ? 1 : 0); // [TAG_FN_L16_PLEGATE]
+    if (br->xd_mode > 0) {
+        bp.n_chan += (int) br->chans.size(); // [TAG_FN_L22_X_DEFER] the defer channels
+    }
     bp.n_embd     = br->n_embd;
     bp.n_used     = br->n_used;
     bp.max_tokens = br->max_t;
@@ -1461,6 +1582,14 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                 "them on the device before the PLE layer%s\n", __func__, br->ple_chan,
                 br->ple_skip > 0 ? format(" (LLAMA_FN_L16_PLE_GATE_SKIP=%d: every %dth fill is never answered)", br->ple_skip,
                 br->ple_skip).c_str() : "");
+    }
+    if (br->xd_mode > 0) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_DEFER] decode windows defer their light cold experts (weight < %.3f or "
+                "rank >= %d) %s, defer channels %d..%d. CHANGES ANSWERS\n", __func__, br->bid, br->xd_w, br->xd_r,
+                br->xd_mode == 2 ? "and add them back in the same layer (check)" : "to the next layer, after its token mixer",
+                br->xd_base, br->xd_base + (int) br->chans.size() - 1);
+        llama_fn_l22_log("switch", "[TAG_FN_L22_X_DEFER] mode=%s w=%.3f r=%d chans=%d base=%d", br->xd_mode == 2 ? "check" : "defer",
+                br->xd_w, br->xd_r, (int) br->chans.size(), br->xd_base);
     }
     if (br->pool_stats) {
         br->st_faults = br_page_faults();
@@ -1725,6 +1854,27 @@ bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor
     return chain == 0 && llama_moe_bridge_layer(br, up_exps, id, chan);
 }
 
+// [TAG_FN_L22_X_DEFER]
+int llama_moe_bridge_defer_mode(const llama_moe_bridge * br) {
+    return br != nullptr ? br->xd_mode : 0;
+}
+
+int32_t llama_moe_bridge_defer_chan(const llama_moe_bridge * br, int32_t chan) {
+    if (br == nullptr || br->xd_mode == 0 || br->xd_base < 0 || chan < 0 || chan >= (int32_t) br->chans.size()) {
+        return -1;
+    }
+    return br->xd_base + chan;
+}
+
+void llama_moe_bridge_defer_params(const llama_moe_bridge * br, float * w, int * r) {
+    if (w) {
+        *w = br ? br->xd_w : 0.0f;
+    }
+    if (r) {
+        *r = br ? br->xd_r : 0;
+    }
+}
+
 void llama_moe_bridge_step(llama_moe_bridge * br) {
     if (br == nullptr || br->active) {
         return;
@@ -1961,6 +2111,40 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
         }
     }
 
+    // [TAG_FN_L22_X_DEFER] the device's waits for the light parts (0: there at the first look) and the host's time for them
+    if (br->xd_mode > 0 && br->fn_chan_times && err == GGML_MOE_BRIDGE_ERR_NONE && (br->stats || llama_fn_l22_passlog_level() >= 2)) {
+        for (int ch = 0; ch < (int) br->chans.size(); ++ch) {
+            auto & c = br->chans[ch];
+            ggml_moe_bridge_chan_times t;
+            br->fn_chan_times(br->gb, br->xd_base + ch, &t);
+            if (t.seq == 0 || t.seq == c.xd_seen) {
+                continue;
+            }
+            c.xd_seen = t.seq;
+            br->xd_waits++;
+            br->xd_wait_ns += t.wait_ns;
+            br->xd_ready   += t.wait_ns == 0 ? 1 : 0;
+        }
+        if (br->xd_jobs.load(std::memory_order_relaxed) >= 4096) {
+            const uint64_t nj = br->xd_jobs.exchange(0);
+            const uint64_t ne = br->xd_empty.exchange(0);
+            const uint64_t ns = br->xd_ns.exchange(0);
+            const uint64_t nm = br->xd_ns_max.exchange(0);
+            char line[320];
+            snprintf(line, sizeof(line), "[TAG_FN_L22_X_DEFER] %" PRIu64 " light parts: host %.1f us avg / %.1f max, %.1f%% empty; "
+                    "device waits %" PRIu64 ", %.1f us avg, %.1f%% ready at the first look; %" PRIu64 " not taken",
+                    nj, nj ? ns/1e3/nj : 0.0, nm/1e3, nj ? 100.0*ne/nj : 0.0, br->xd_waits,
+                    br->xd_waits ? br->xd_wait_ns/1e3/br->xd_waits : 0.0, br->xd_waits ? 100.0*br->xd_ready/br->xd_waits : 0.0,
+                    br->xd_lost.load());
+            if (llama_fn_l22_passlog_level() >= 1) {
+                llama_fn_l22_log("graph", "%s", line);
+            } else {
+                LLAMA_LOG_INFO("%s: MoE bridge %d: %s\n", __func__, br->bid, line);
+            }
+            br->xd_waits = br->xd_wait_ns = br->xd_ready = 0;
+        }
+    }
+
     if (br->stats && (br->n_graphs % 256 == 0 || err != GGML_MOE_BRIDGE_ERR_NONE)) {
         ggml_moe_bridge_stats s;
         br->fn_get_stats(br->gb, &s);
@@ -2102,6 +2286,10 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     if (br->ple_chan >= 0 && s.error_chan == br->ple_chan) { // [TAG_FN_L16_PLEGATE] the layer below reads -1
         LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L16_PLEGATE] the error is the PLE gate's (its rows came late or their read "
                 "failed)\n", __func__, br->bid);
+    }
+    if (br->xd_base >= 0 && s.error_chan >= br->xd_base && s.error_chan < br->xd_base + (int) br->chans.size()) {
+        LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_DEFER] the error is the light part of layer %d (the layer below reads -1)\n",
+                __func__, br->bid, br->chans[s.error_chan - br->xd_base].il);
     }
     // [TAG_FN_R1_BRIDGE_RB] errors far apart are transient stalls whose ubatch was computed again: only 3 within 1024
     // bridged graphs turn the bridge off for the rest of the context (a host side that keeps failing)
