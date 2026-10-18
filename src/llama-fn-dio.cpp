@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -65,9 +66,12 @@ void llama_fn_p5_on_build(const llama_model & model, llama_model_loader & ml) {
     d->model = &model;
     size_t n_reg = 0;
     size_t bytes = 0;
+    std::vector<const ggml_tensor *> regs;
     for (const auto & L : model.layers) {
         for (const ggml_tensor * t : { L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps }) {
-            if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || t->data == nullptr) {
+            // a repacked tensor (extra set) holds other bytes than its file range
+            if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || t->data == nullptr ||
+                t->extra != nullptr) {
                 continue;
             }
             const auto it = ml.weights_map.find(ggml_get_name(t));
@@ -75,6 +79,7 @@ void llama_fn_p5_on_build(const llama_model & model, llama_model_loader & ml) {
                 continue;
             }
             d->eng.add_region(t->data, ggml_nbytes(t), (int) it->second.idx, (uint64_t) it->second.offs);
+            regs.push_back(t);
             n_reg++;
             bytes += ggml_nbytes(t);
         }
@@ -88,6 +93,36 @@ void llama_fn_p5_on_build(const llama_model & model, llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: [TAG_FN_L22_SSDTIER] direct I/O is off: %s (SSD-class experts are read through the mapping)\n",
                 __func__, err.c_str());
         return;
+    }
+    // the readers must give the mapped bytes: the first and last 4 KiB of every tensor are read and compared (a few
+    // pages each; the load does not prefetch the routed experts)
+    {
+        std::vector<uint8_t> buf((size_t) 8192*regs.size());
+        std::vector<fn_res::dio_req> rq;
+        for (size_t i = 0; i < regs.size(); ++i) {
+            const size_t n = ggml_nbytes(regs[i]);
+            const size_t k = std::min<size_t>(n, 4096);
+            rq.push_back({ regs[i]->data, k, buf.data() + 8192*i });
+            rq.push_back({ (const char *) regs[i]->data + n - k, k, buf.data() + 8192*i + 4096 });
+        }
+        const int tk = d->eng.submit(rq.data(), (int) rq.size());
+        bool same = tk >= 0 && d->eng.wait(tk, 60000);
+        for (size_t i = 0; same && i < regs.size(); ++i) {
+            const size_t n = ggml_nbytes(regs[i]);
+            const size_t k = std::min<size_t>(n, 4096);
+            same = memcmp(buf.data() + 8192*i, regs[i]->data, k) == 0 &&
+                   memcmp(buf.data() + 8192*i + 4096, (const char *) regs[i]->data + n - k, k) == 0;
+            if (!same) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_SSDTIER] %s differs from its file range: direct I/O is off\n", __func__,
+                        ggml_get_name(regs[i]));
+            }
+        }
+        if (!same) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_SSDTIER] the readers' check failed: SSD-class experts are read through the mapping\n",
+                    __func__);
+            d->eng.close();
+            return;
+        }
     }
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDTIER] direct I/O ready: %zu expert tensors (%.2f GiB) in %zu files, %d reader threads\n",
             __func__, n_reg, bytes/1073741824.0, ml.files_paths.size(), n_thr);
