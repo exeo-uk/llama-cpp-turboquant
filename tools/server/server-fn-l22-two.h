@@ -1,0 +1,120 @@
+#pragma once
+
+// [TAG_FN_L22] round 22, P9: pure policy functions of the server's two-connection rules (no llama / server types), so
+// that tests/test-fn-l22-two.cpp checks them without a model.
+//
+//   l22_oneprompt_order        the visit order of the prompt slots                      [TAG_FN_L22_ONEPROMPT]
+//   l22_yield_note             a yield counts once per claiming task                    [TAG_FN_L22_ONEPROMPT]
+//   l22_genshare2_prompt_cap   the batch limit while a slot answers                     [TAG_FN_L22_GENSHARE2]
+//   l22_window_cap_us          the decode window cap of a stream pass                   [TAG_FN_L22_GENSHARE2]
+//   l22_pause_eligible         a short request may pause an answer                      [TAG_FN_L22_PAUSE]
+//   l22_pause_should_resume    when a paused answer goes on                             [TAG_FN_L22_PAUSE]
+//   l22_sharekv_usable         a follower may take the leader's prefix by seq_cp        [TAG_FN_L22_SHAREKV]
+//   l22_park_cells             the cells a parked slot needs again                      [TAG_FN_L22_SHAREKV]
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
+// [TAG_FN_L22_ONEPROMPT] one slot with prompt tokens left: its id, the tokens left, the claimers it gave way to
+struct l22_prompt_cand {
+    int     id      = -1;
+    int32_t left    = 0;
+    int32_t n_yield = 0;
+};
+
+// a slot that gave way n_force times goes first; then the fewest tokens left; then the slot id
+static inline std::vector<int> l22_oneprompt_order(std::vector<l22_prompt_cand> c, int32_t n_force = 2) {
+    std::stable_sort(c.begin(), c.end(), [n_force](const l22_prompt_cand & a, const l22_prompt_cand & b) {
+        const bool fa = a.n_yield >= n_force;
+        const bool fb = b.n_yield >= n_force;
+        if (fa != fb) {
+            return fa;
+        }
+        if (a.left != b.left) {
+            return a.left < b.left;
+        }
+        return a.id < b.id;
+    });
+    std::vector<int> out;
+    out.reserve(c.size());
+    for (const auto & x : c) {
+        out.push_back(x.id);
+    }
+    return out;
+}
+
+// the slot gave way to claimer_task in this batch: counts once per claiming task (a long prompt gives way to a shorter
+// one at most n_force times)
+static inline void l22_yield_note(int32_t & n_yield, int & last_task, int claimer_task) {
+    if (claimer_task < 0 || claimer_task == last_task) {
+        return;
+    }
+    last_task = claimer_task;
+    n_yield++;
+}
+
+// [TAG_FN_L22_GENSHARE2] the batch size the prompt rows may fill: the generating rows plus one context prompt ubatch
+// (w; mode 2: at most 8192). mode 0 or no generating rows (unless all): n_batch, as before
+static inline int32_t l22_genshare2_prompt_cap(int32_t n_batch, int32_t n_gen_rows, int32_t w, int mode, bool all = false) {
+    if (mode <= 0 || n_batch <= 0 || (n_gen_rows <= 0 && !all)) {
+        return n_batch;
+    }
+    if (w <= 0) {
+        w = n_batch;
+    }
+    if (mode == 2) {
+        w = std::min<int32_t>(w, 8192);
+    }
+    w = std::clamp<int32_t>(w, std::min<int32_t>(512, n_batch), n_batch);
+    const int64_t cap = (int64_t) std::max<int32_t>(0, n_gen_rows) + w;
+    return (int32_t) std::min<int64_t>(n_batch, cap);
+}
+
+// the decode window cap after a batch that held prompt_rows prompt rows: cap_us per 8K rows (at least one)
+static inline int64_t l22_window_cap_us(int64_t cap_us, int64_t prompt_rows, int mode) {
+    if (mode <= 0) {
+        return cap_us;
+    }
+    return cap_us * std::max<int64_t>(1, prompt_rows / 8192);
+}
+
+// [TAG_FN_L22_PAUSE] a request with work prompt tokens to process may pause an answer that paused fewer than
+// max_pauses times
+static inline bool l22_pause_eligible(int32_t work, int32_t max_tok, int32_t n_pauses, int32_t max_pauses = 2) {
+    return work >= 0 && work <= max_tok && n_pauses < max_pauses;
+}
+
+// a paused answer (until != 0) goes on at its timeout or when the request that paused it is gone
+static inline bool l22_pause_should_resume(int64_t now, int64_t until, bool by_alive) {
+    return until != 0 && (now >= until || !by_alive);
+}
+
+// [TAG_FN_L22_SHAREKV] what get_available_slot knows when a follower arrives (the leader L, the published record, the
+// follower's slot ret)
+struct l22_share_view {
+    int     task_now  = -1;    // L's task id now
+    int     task_rec  = -1;    // the task id the record was published for (-1: no record)
+    bool    prompting = false; // L is in PROCESSING_PROMPT
+    bool    parked    = false; // L is parked
+    int32_t n_tokens  = 0;     // L's prompt tokens now
+    int32_t n_shared  = 0;     // the published boundary
+    int32_t lcp_task  = 0;     // common prefix of the follower's prompt and L's prompt
+    int32_t lcp_ret   = 0;     // common prefix of the follower's prompt and what ret holds now
+    int32_t n_task    = 0;     // the follower's prompt tokens
+    bool    same_slot = false; // ret is L
+    bool    ret_idle  = false; // ret processes nothing
+};
+
+// the leader still sits exactly on the boundary of the record, the follower shares the whole boundary and has tokens of
+// its own after it, and its slot holds less of that prefix
+static inline bool l22_sharekv_usable(const l22_share_view & v) {
+    return v.task_rec >= 0 && v.task_now == v.task_rec && v.prompting && !v.parked && v.n_shared > 0 &&
+           v.n_tokens == v.n_shared && v.lcp_task >= v.n_shared && v.n_task > v.n_shared && !v.same_slot && v.ret_idle &&
+           v.lcp_ret < v.n_shared;
+}
+
+// a park of a slot that shares cells with another sequence frees only its own cells, but the resume writes all of them
+static inline int32_t l22_park_cells(int32_t freed, int32_t n_tokens, bool shared) {
+    return shared ? std::max(freed, n_tokens) : freed;
+}
