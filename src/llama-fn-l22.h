@@ -288,3 +288,7 @@ LLAMA_API void llama_fn_l22_passlog_model(const llama_model * model, bool loaded
 //
 // requests (append-only, the steward; see E:/turbot-gates/flashnext/test/r22/impl/requests.md)
 //
+
+// R-P6-1 / R-P14-5 (P6, src/llama-fn-pin.cpp; no stub): llama_fn_pin_query plus the device address of seg->src for a
+// pinned segment (0 when unknown or unpinned; set only with LLAMA_FN_L22_DMASHARE). Valid while the ticket is held
+LLAMA_API bool llama_fn_pin_query_dev(const void * p, size_t n, llama_fn_pin_seg * seg, uint64_t * dev);
