@@ -485,6 +485,8 @@ struct ggml_cpu_moe_pool {
     std::unordered_map<const ggml_tensor *, l22_layer> l22_seen;
     std::vector<int32_t>    l22_cold;
     std::vector<uint8_t>    l22_stale;
+    std::vector<int32_t>    jpf_list;  // R-REV-10: a job's read-ahead experts in the workers' walk order (caller thread)
+    std::vector<moe_mem_range> jpf_rs; // the caller's ranges of its first read-ahead call
     std::atomic<uint64_t>   jpf_queued{0};
     std::atomic<uint64_t>   jpf_calls{0};
     std::atomic<uint64_t>   jpf_ranges{0};
@@ -1312,14 +1314,15 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
         p->pt_thread = std::thread(moe_pool_pt_main, p);
         GGML_LOG_INFO("%s: [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] a helper thread (CPU %d)%s%s\n", __func__, c1,
                 p->pretouch ? " reads one byte per page of the cold experts the next jobs compute that no job of their layer read "
-                "within the last 64 jobs" : "", p->jobpf > 0 ? "; it sends the read-ahead requests of the jobs" : "");
+                "within the last 64 jobs" : "", p->jobpf > 0 ? "; it sends the read-ahead requests after a job's first 8" : "");
     }
     if (p->stagger > 0 && p->split >= GGML_CPU_MOE_SPLIT_STABLE) {
         GGML_LOG_INFO("%s: [TAG_FN_L22_POOL_STAGGER] split %d jobs: thread i walks its experts from position (i %% %d)*n/%d on\n",
                 __func__, p->split, p->stagger, p->stagger);
     }
     if (p->jobpf > 0) {
-        GGML_LOG_INFO("%s: [TAG_FN_L22_JOBPF] a read-ahead request at each job's post for %s\n", __func__,
+        GGML_LOG_INFO("%s: [TAG_FN_L22_JOBPF] a read-ahead request before each job starts (its first 8 experts in walk order on "
+                "the calling thread, the rest on the helper) for %s\n", __func__,
                 p->jobpf >= 2 ? "all its cold experts" : "its cold experts no job of the layer read within the last 64 jobs");
     }
     return p;
@@ -1605,34 +1608,48 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         moe_pool_l22_mark(p, l, job->ids, n_used*T);
     }
 
-    const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
-    if (p->where) { // [TAG_FN_L22_POOLDIAG]
-        p->where_t_post = ggml_fn_moe_tick();
-        p->where_f_post = moe_proc_faults();
-    }
-    const uint64_t t_pub = p->stats ? ggml_fn_moe_tick() : 0;
-    p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
-    p->n_done.store(0, std::memory_order_relaxed);
-    p->parked.store(false, std::memory_order_relaxed); // [TAG_MOE_BRIDGE]
-    p->seq.fetch_add(1, std::memory_order_seq_cst);
-    if (p->n_sleeping.load(std::memory_order_seq_cst) > 0) {
-        {
-            std::lock_guard<std::mutex> lk(p->mtx);
-        }
-        p->cv.notify_all();
-    }
-
     if (p->l22_track && !p->l22_cold.empty()) {
-        // [TAG_FN_L22_JOBPF] the read-ahead requests of the job's stale (jobpf 1) or all (2) cold experts, sent by the helper
-        // (no system call on the job's path). [TAG_FN_L22_PRETOUCH] then its stale cold experts to touch, the highest id
-        // first: a job walks the predicted experts, then the rest by id, and the workers start at the front
+        // [TAG_FN_L22_JOBPF] R-REV-10: the read-ahead of the job's stale (jobpf 1) or all (2) cold experts goes out before its
+        // pieces start: the first experts the workers reach (the predicted ones first, then by id) in one call on this
+        // thread, the rest through the helper. [TAG_FN_L22_PRETOUCH] then its stale cold experts to touch, the highest id
+        // first (the workers start at the front)
         int nq = 0;
         if (p->jobpf > 0) {
+            p->jpf_list.clear();
             for (size_t i = 0; i < p->l22_cold.size(); ++i) {
                 if (p->jobpf >= 2 || p->l22_stale[i]) {
-                    moe_pool_pt_push(p, l, p->l22_cold[i], 1);
-                    nq++;
+                    p->jpf_list.push_back(p->l22_cold[i]);
                 }
+            }
+            const bool      use_pf = a.split >= GGML_CPU_MOE_SPLIT_STABLE && pf_mine && p->pf_n > 0; // as a.prio above
+            const int32_t * prio   = use_pf ? p->pf_list.data() : nullptr;
+            const int       n_prio = use_pf ? p->pf_n : 0;
+            auto rank = [&](int32_t e) -> int64_t {
+                for (int i = 0; i < n_prio; ++i) {
+                    if (prio[i] == e) {
+                        return i;
+                    }
+                }
+                return (int64_t) n_prio + e;
+            };
+            std::sort(p->jpf_list.begin(), p->jpf_list.end(), [&](int32_t x, int32_t y) { return rank(x) < rank(y); });
+            constexpr int n_sync_max = 8;
+            ggml_cpu_moe_pool::pt_entry first[n_sync_max];
+            const int n_sync = std::min<int>(n_sync_max, (int) p->jpf_list.size());
+            for (int i = 0; i < n_sync; ++i) {
+                first[i].t[0] = l->gate;
+                first[i].t[1] = l->up;
+                first[i].t[2] = l->down;
+                first[i].e    = p->jpf_list[i];
+                first[i].kind = 1;
+            }
+            if (n_sync > 0) {
+                p->jpf_queued.fetch_add((uint64_t) n_sync, std::memory_order_relaxed);
+                moe_pool_jobpf_issue(p, first, n_sync, p->jpf_rs);
+            }
+            for (size_t i = (size_t) n_sync; i < p->jpf_list.size(); ++i) {
+                moe_pool_pt_push(p, l, p->jpf_list[i], 1);
+                nq++;
             }
         }
         if (p->pretouch) {
@@ -1652,6 +1669,23 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
         if (nq > 0) {
             moe_pool_pt_kick(p);
         }
+    }
+
+    const uint64_t f_pub = p->stats ? moe_proc_faults() : 0; // [TAG_FN_L7_FAULTS]
+    if (p->where) { // [TAG_FN_L22_POOLDIAG]
+        p->where_t_post = ggml_fn_moe_tick();
+        p->where_f_post = moe_proc_faults();
+    }
+    const uint64_t t_pub = p->stats ? ggml_fn_moe_tick() : 0;
+    p->kind.store(solo ? 2 : 0, std::memory_order_relaxed);
+    p->n_done.store(0, std::memory_order_relaxed);
+    p->parked.store(false, std::memory_order_relaxed); // [TAG_MOE_BRIDGE]
+    p->seq.fetch_add(1, std::memory_order_seq_cst);
+    if (p->n_sleeping.load(std::memory_order_seq_cst) > 0) {
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
+        }
+        p->cv.notify_all();
     }
 
     if (!solo) {
