@@ -1075,8 +1075,13 @@ void llama_fn_p5_after_warm(const llama_model & model, size_t warmed, double sec
     res_missing_blocks(t, miss, &share);
     t->share.store(share);
     t->warm_done.store(true);
-    LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] ready: %.2f GiB warmed in %.1f s, %.2f GiB of VRAM-held host copies go to standby, "
-            "streamed set %.1f %% in RAM\n", __func__, warmed/1073741824.0, secs, dropped/1073741824.0, 100.0*share);
+    if (t->resset) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] ready: %.2f GiB warmed in %.1f s, %.2f GiB of VRAM-held host copies go to standby, "
+                "streamed set %.1f %% in RAM\n", __func__, warmed/1073741824.0, secs, dropped/1073741824.0, 100.0*share);
+    } else {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] ready after the full warm pass (resset off): streamed set %.1f %% in RAM\n",
+                __func__, 100.0*share);
+    }
     res_log(t, "ready");
 }
 

@@ -296,6 +296,9 @@ public:
         int id;
         {
             std::lock_guard<std::mutex> lk(mtx);
+            if (stop.load() || workers.empty()) {
+                return -1; // closing: no reader would take the pieces
+            }
             id = ++next_id;
             if (id <= 0) {
                 id = next_id = 1;
