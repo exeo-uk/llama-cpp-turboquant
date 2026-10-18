@@ -445,6 +445,10 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// [TAG_FN_L22_OOMHOOK] defined after ggml_cuda_lock_counter: the libllama OOM hook (pins), outside a capture
+static void ggml_cuda_fn_l22_oom_precheck(size_t need);
+static bool ggml_cuda_fn_l22_oom_retry(size_t need);
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -593,6 +597,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t pool_hwm  = 0; // [TAG_FN_L3_VRAM_TRIM]
+    size_t cap_top   = 0; // [TAG_FN_L22_GRAPHKEEP] highest pool_used since cap_begin()
     size_t granularity;
     // [TAG_FN_L3_VRAM_TRIM] every mapping in address order (HIP unmaps them one by one, trim() unmaps from the top)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
@@ -623,6 +628,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t reserved() const override { return pool_size; }
     size_t used_hwm() const override { return pool_hwm; }
     void   reset_hwm() override { pool_hwm = pool_used; }
+    void   cap_begin() override { cap_top = pool_used; }
+    size_t cap_hwm() const override { return cap_top; }
     size_t trim(size_t keep) override {
         if (pool_used != 0) {
             return 0;
@@ -659,7 +666,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_fn_l22_oom_precheck(reserve_size); // [TAG_FN_L22_OOMHOOK]
+            CUresult cr = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size)) { // [TAG_FN_L22_OOMHOOK]
+                cr = cuMemCreate(&handle, reserve_size, &prop, 0);
+            }
+            CU_CHECK(cr);
+#else
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -733,6 +749,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         *actual_size = size;
         pool_used += size;
         pool_hwm   = std::max(pool_hwm, pool_used); // [TAG_FN_L3_VRAM_TRIM]
+        cap_top    = std::max(cap_top, pool_used);  // [TAG_FN_L22_GRAPHKEEP]
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -770,6 +787,62 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
+
+// [TAG_FN_L22_OOMHOOK] plan 3.6: a device allocation after ready asks the owner of pinned host memory (libllama, set
+// through the proc "ggml_backend_cuda_set_oom_hook") first to check the device headroom (after_failure 0: give memory
+// back only if the headroom is short) and, if it still fails, to give some back once (after_failure 1). Never inside a
+// capture: the hook unregisters host memory, which a capturing stream must not see.
+typedef bool (*ggml_cuda_fn_l22_oom_fn_t)(size_t need, int after_failure, void * ud);
+static std::atomic<ggml_cuda_fn_l22_oom_fn_t> ggml_cuda_fn_l22_oom_fn{nullptr};
+static std::atomic<void *>                    ggml_cuda_fn_l22_oom_ud{nullptr};
+
+static void ggml_cuda_fn_l22_oom_precheck(size_t need) {
+    const ggml_cuda_fn_l22_oom_fn_t fn = ggml_cuda_fn_l22_oom_fn.load();
+    if (fn != nullptr && ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0) {
+        fn(need, 0, ggml_cuda_fn_l22_oom_ud.load());
+    }
+}
+
+static bool ggml_cuda_fn_l22_oom_retry(size_t need) {
+    const ggml_cuda_fn_l22_oom_fn_t fn = ggml_cuda_fn_l22_oom_fn.load();
+    if (fn == nullptr || ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    const bool freed = fn(need, 1, ggml_cuda_fn_l22_oom_ud.load());
+    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] device allocation of %.1f MiB failed: the OOM hook %s, one retry\n",
+            need/1048576.0, freed ? "gave memory back" : "had nothing to give");
+    return freed;
+}
+
+static void ggml_backend_cuda_set_oom_hook(ggml_cuda_fn_l22_oom_fn_t fn, void * ud) {
+    ggml_cuda_fn_l22_oom_ud.store(ud);
+    ggml_cuda_fn_l22_oom_fn.store(fn);
+}
+
+// [TAG_FN_L22_GRAPHKEEP] [TAG_FN_L22_GRAPH2] switches read once, at the first graph (after a model profile set them)
+int ggml_cuda_fn_l22_graph_keep(void) {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_GRAPHKEEP");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_fn_l22_graph2() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_GRAPH2");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_fn_l22_graph_diag() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_GRAPHDIAG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
@@ -3432,9 +3505,34 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // ggml_cuda_graph_update_required still decides whether it can be replayed, so a shape whose
 // allocation moved simply re-warms as before. Distinct shapes get distinct objects, and the 10 s
 // eviction sweep bounds the map.
-static const void * ggml_cuda_graph_get_key_hash(ggml_cgraph * cgraph) {
+// [TAG_FN_L22_GRAPHKEY] big > 0: every dimension >= big is hashed as one value, so the decode graphs of a new KV bucket land
+// on the old object and take the RECAP path (capture + cudaGraphExecUpdate); the property compare is unchanged.
+// [TAG_FN_L22_GRAPHKEEP] rows: the token rows of the graph, from the weight matmuls (src1 rows; MUL_MAT_ID src1->ne[2]) and
+// the embedding GET_ROWS. Not the widest node: GDN decode graphs have conv / concat nodes with ne[1] = d_inner.
+static int64_t ggml_cuda_fn_l22_node_rows(const ggml_tensor * t) {
+    const ggml_tensor * a = t->src[0];
+    const ggml_tensor * b = t->src[1];
+    if (a == nullptr || b == nullptr) {
+        return 0;
+    }
+    if (t->op == GGML_OP_MUL_MAT && a->op == GGML_OP_NONE) {
+        return ggml_nrows(b) / std::max<int64_t>(1, a->ne[2]*a->ne[3]);
+    }
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        return b->ne[2];
+    }
+    if (t->op == GGML_OP_GET_ROWS && a->op == GGML_OP_NONE && b->type == GGML_TYPE_I32) {
+        return ggml_nelements(b);
+    }
+    return 0;
+}
+
+static const void * ggml_cuda_graph_get_key_hash(ggml_cgraph * cgraph, const uint32_t big = 0, int32_t * rows = nullptr) {
     uint64_t h = 1469598103934665603ull;   // FNV-1a
     auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    // [TAG_FN_L22_GRAPHKEY]
+    auto dim = [big](int64_t v) { return big > 0 && v >= (int64_t) big ? (uint64_t) 0x7fffffffffffull : (uint64_t) v; };
+    int64_t n_rows = 0;
     mix((uint64_t) cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * t = cgraph->nodes[i];
@@ -3444,12 +3542,19 @@ static const void * ggml_cuda_graph_get_key_hash(ggml_cgraph * cgraph) {
         // graph rebuild, so this does not reintroduce the churn a pointer-based key caused.
         for (const char * c = t->name; *c; ++c) { mix((uint64_t) (unsigned char) *c); }
         mix((uint64_t) t->op); mix((uint64_t) t->type);
-        mix((uint64_t) t->ne[0]); mix((uint64_t) t->ne[1]); mix((uint64_t) t->ne[2]); mix((uint64_t) t->ne[3]);
+        mix(dim(t->ne[0])); mix(dim(t->ne[1])); mix(dim(t->ne[2])); mix(dim(t->ne[3]));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            if (t->src[j]) { mix((uint64_t) t->src[j]->type); mix((uint64_t) t->src[j]->ne[0]); mix((uint64_t) t->src[j]->ne[1]); }
+            if (t->src[j]) { mix((uint64_t) t->src[j]->type); mix(dim(t->src[j]->ne[0])); mix(dim(t->src[j]->ne[1])); }
+        }
+        if (rows) {
+            n_rows = std::max(n_rows, ggml_cuda_fn_l22_node_rows(t));
         }
     }
     if (h == 0) { h = 1; }
+    if (h == (uint64_t) (uintptr_t) GGML_CUDA_FN_L22_EAGER_KEY) { h = 3; } // [TAG_FN_L22_GRAPHKEEP] reserved key
+    if (rows) {
+        *rows = (int32_t) std::min<int64_t>(n_rows, INT32_MAX);
+    }
     return reinterpret_cast<const void *>((uintptr_t) h);
 }
 
@@ -3487,16 +3592,24 @@ static ggml_cuda_graph_key_memo * ggml_cuda_graph_key_memo_find(ggml_backend_cud
     return nullptr;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int32_t * rows = nullptr) {
+    const uint32_t big = cuda_ctx != nullptr ? cuda_ctx->fn_l22_key_big : 0; // [TAG_FN_L22_GRAPHKEY]
     if (cuda_ctx == nullptr || cgraph->uid == 0 || !ggml_cuda_graph_key_memo_enabled()) {
-        return ggml_cuda_graph_get_key_hash(cgraph);
+        return ggml_cuda_graph_get_key_hash(cgraph, big, rows);
     }
 
     if (const ggml_cuda_graph_key_memo * m = ggml_cuda_graph_key_memo_find(cuda_ctx, cgraph)) {
+        if (rows) {
+            *rows = m->rows;
+        }
         return m->key;
     }
 
-    const void * key = ggml_cuda_graph_get_key_hash(cgraph);
+    int32_t n_rows = 0;
+    const void * key = ggml_cuda_graph_get_key_hash(cgraph, big, &n_rows);
+    if (rows) {
+        *rows = n_rows;
+    }
 
     // [TAG_FN_GRAPH_KEY_MEMO] replace an empty way, else the oldest (smallest uid) of the set
     constexpr int n_memo = ggml_backend_cuda_context::GRAPH_KEY_MEMO_N;
@@ -3518,6 +3631,7 @@ static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx
     m.n_nodes = cgraph->n_nodes;
     m.key     = key;
     m.compat  = -1;
+    m.rows    = n_rows;
 
     return key;
 }
@@ -3536,11 +3650,223 @@ static bool ggml_cuda_graph_check_compability_memo(ggml_backend_cuda_context * c
     return compat;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, bool * nodes_changed) {
+// [TAG_FN_L22_GRAPHKEEP] ------------------------------------------------------------------------------------------------
+// GGML_CUDA_FN_L22_GRAPHKEEP >= 1: no 10 s sweep; graphs wider than GGML_CUDA_FN_L22_GRAPH_MAXROWS (128) token rows run
+// eagerly without a map entry (prompt graphs are one-off shapes: the same kernels, only not captured); an LRU cap on
+// objects (GGML_CUDA_FN_L22_GRAPH_CAP "objects,instances", 512,64) never evicts a replayed graph (>= 2 replays) for a
+// new key, and the instance cap drops cold instances first. Unset: the sweep and every graph mapped, as before.
+
+static void ggml_cuda_fn_l22_graph_cap(size_t * cap_n, int * cap_i) {
+    static const std::pair<size_t, int> caps = [] {
+        size_t n = 512;
+        int    i = 64;
+        if (const char * e = getenv("GGML_CUDA_FN_L22_GRAPH_CAP")) {
+            long long a = 0, b = 0;
+            const int got = sscanf(e, "%lld,%lld", &a, &b);
+            if (got >= 1 && a > 0) {
+                n = (size_t) a;
+            }
+            if (got >= 2 && b > 0) {
+                i = (int) b;
+            }
+        }
+        return std::make_pair(std::max<size_t>(n, 8), std::max(i, 2));
+    }();
+    *cap_n = caps.first;
+    *cap_i = caps.second;
+}
+
+static int32_t ggml_cuda_fn_l22_graph_maxrows() {
+    static const int32_t v = [] {
+        const char * e = getenv("GGML_CUDA_FN_L22_GRAPH_MAXROWS");
+        const int r = e ? atoi(e) : 128;
+        return r > 0 ? (int32_t) r : 128;
+    }();
+    return v;
+}
+
+static bool ggml_cuda_fn_l22_hot(const ggml_cuda_graph & g) {
+    return g.instance != nullptr && g.n_replay >= 2;
+}
+
+void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void * key) {
+    size_t cap_n = 0;
+    int    cap_i = 0;
+    ggml_cuda_fn_l22_graph_cap(&cap_n, &cap_i);
+    while (ctx->cuda_graphs.size() >= cap_n) {
+        auto victim = ctx->cuda_graphs.end();
+        for (auto it = ctx->cuda_graphs.begin(); it != ctx->cuda_graphs.end(); ++it) {
+            if (it->first == key || ggml_cuda_fn_l22_hot(*it->second)) {
+                continue;
+            }
+            if (victim == ctx->cuda_graphs.end() || it->second->last_used_time < victim->second->last_used_time) {
+                victim = it;
+            }
+        }
+        if (victim == ctx->cuda_graphs.end()) {
+            break; // only replayed graphs: the instance cap bounds them
+        }
+        ctx->cuda_graphs.erase(victim);
+        ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_EVICT_LRU]++;
+    }
+}
+
+static int ggml_cuda_fn_l22_count_instances(const ggml_backend_cuda_context * ctx) {
+    int n = 0;
+    for (const auto & [k, g] : ctx->cuda_graphs) {
+        n += g->instance != nullptr ? 1 : 0;
+        for (const auto & v : g->fn_l22_alt) {
+            n += v.instance != nullptr ? 1 : 0;
+        }
+    }
+    return n;
+}
+
+// drop the LRU instance (cold ones first: objects with < 2 replays), never one of keep; false: nothing to drop
+static bool ggml_cuda_fn_l22_drop_one_instance(ggml_backend_cuda_context * ctx, const ggml_cuda_graph * keep, bool cold_only) {
+    ggml_cuda_graph * best_g = nullptr;
+    int               best_v = -1;
+    int64_t           best_t = 0;
+    bool              best_hot = true;
+    for (auto & [k, gp] : ctx->cuda_graphs) {
+        ggml_cuda_graph * g = gp.get();
+        if (g == keep) {
+            continue;
+        }
+        const auto consider = [&](int v, int64_t t, uint64_t n_replay) {
+            const bool hot = n_replay >= 2;
+            if (cold_only && hot) {
+                return;
+            }
+            if (best_g == nullptr || (best_hot && !hot) || (best_hot == hot && t < best_t)) {
+                best_g = g; best_v = v; best_t = t; best_hot = hot;
+            }
+        };
+        if (g->instance != nullptr) {
+            consider(-1, g->last_used_time, g->n_replay);
+        }
+        for (int v = 0; v < (int) g->fn_l22_alt.size(); ++v) {
+            if (g->fn_l22_alt[v].instance != nullptr) {
+                consider(v, g->fn_l22_alt[v].last_used, g->fn_l22_alt[v].n_replay);
+            }
+        }
+    }
+    if (best_g == nullptr) {
+        return false;
+    }
+    if (best_v < 0) {
+        best_g->fn_l22_drop_instance();
+    } else {
+        best_g->fn_l22_alt[best_v].destroy();
+        best_g->fn_l22_alt.erase(best_g->fn_l22_alt.begin() + best_v);
+    }
+    ctx->fn_l22_cnt[best_hot ? GGML_CUDA_FN_L22_CNT_EVICT_INST_HOT : GGML_CUDA_FN_L22_CNT_EVICT_INST_COLD]++;
+    return true;
+}
+
+// before an instantiate for graph: keep at most cap_i instances
+static void ggml_cuda_fn_l22_instance_cap(ggml_backend_cuda_context * ctx, const ggml_cuda_graph * graph) {
+    if (ggml_cuda_fn_l22_graph_keep() < 1) {
+        return;
+    }
+    size_t cap_n = 0;
+    int    cap_i = 0;
+    ggml_cuda_fn_l22_graph_cap(&cap_n, &cap_i);
+    int n = ggml_cuda_fn_l22_count_instances(ctx);
+    while (n >= cap_i && ggml_cuda_fn_l22_drop_one_instance(ctx, graph, false)) {
+        n--;
+    }
+}
+
+// cudaGraphInstantiate with the instance cap first and, on an out-of-memory error, the cold instances dropped and the
+// OOM hook asked once before one retry [TAG_FN_L22_OOMHOOK]
+static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
+    ggml_cuda_fn_l22_instance_cap(ctx, graph);
+    ggml_cuda_fn_l22_oom_precheck(64u*1024*1024); // [TAG_FN_L22_OOMHOOK] an instance of a large graph: tens of MiB
+    const auto inst = [&]() {
+        if (ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS]
+            return cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority);
+        }
+        return cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+    };
+    cudaError_t err = inst();
+    if (err == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        graph->instance = nullptr;
+        int n_dropped = 0;
+        while (ggml_cuda_fn_l22_drop_one_instance(ctx, graph, true)) {
+            n_dropped++;
+        }
+        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024);
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] graph instantiate out of memory (%d nodes): %d cold instances dropped, "
+                "hook %d, one retry\n", (int) graph->node_props.size(), n_dropped, hook ? 1 : 0);
+        err = inst();
+    }
+    CUDA_CHECK(err);
+}
+
+static void ggml_cuda_fn_l22_cap_begin(ggml_backend_cuda_context * ctx) {
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        if (ctx->pools[ctx->device][s]) {
+            ctx->pools[ctx->device][s]->cap_begin();
+        }
+    }
+}
+
+static void ggml_cuda_fn_l22_cap_end(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
+    bool known = true;
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        size_t top = 0;
+        if (ctx->pools[ctx->device][s]) {
+            top = ctx->pools[ctx->device][s]->cap_hwm();
+            known = known && top != (size_t) -1;
+        }
+        graph->pool_top[s] = top;
+    }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && known; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS && d != ctx->device; ++s) {
+            known = known && ctx->pools[d][s] == nullptr; // another device's pool: not tracked
+        }
+    }
+    graph->pool_top_known = known;
+    graph->n_replay_cap   = 0;
+}
+
+// one "[TAG_FN_L22_PASSLOG] kind=graph" line per window (PASSLOG format; ggml cannot call libllama's helper)
+static void ggml_cuda_fn_l22_window_start(ggml_backend_cuda_context * ctx, int n) {
+    ctx->fn_l22_win_left = n;
+    ctx->fn_l22_win_len  = n;
+    memcpy(ctx->fn_l22_win_base, ctx->fn_l22_cnt, sizeof(ctx->fn_l22_cnt));
+}
+
+static void ggml_cuda_fn_l22_window_tick(ggml_backend_cuda_context * ctx) {
+    if (ctx->fn_l22_win_left <= 0 || --ctx->fn_l22_win_left > 0) {
+        return;
+    }
+    const uint64_t * c = ctx->fn_l22_cnt;
+    const uint64_t * b = ctx->fn_l22_win_base;
+    GGML_LOG_WARN("[TAG_FN_L22_PASSLOG] kind=graph ctx=%s %p first %d calls: replay %" PRIu64 " recap %" PRIu64 " capture %" PRIu64
+            " warmup %" PRIu64 " eager %" PRIu64 " host %.1f ms; map %zu objects, %d instances; evict lru %" PRIu64 " inst cold %" PRIu64
+            " hot %" PRIu64 ", variant swaps %" PRIu64 "\n",
+            ctx->name.c_str(), (void *) ctx, ctx->fn_l22_win_len,
+            c[GGML_CUDA_FN_L22_CNT_REPLAY] - b[GGML_CUDA_FN_L22_CNT_REPLAY], c[GGML_CUDA_FN_L22_CNT_RECAP] - b[GGML_CUDA_FN_L22_CNT_RECAP],
+            c[GGML_CUDA_FN_L22_CNT_CAPTURE] - b[GGML_CUDA_FN_L22_CNT_CAPTURE], c[GGML_CUDA_FN_L22_CNT_WARMUP] - b[GGML_CUDA_FN_L22_CNT_WARMUP],
+            c[GGML_CUDA_FN_L22_CNT_EAGER_ROWS] - b[GGML_CUDA_FN_L22_CNT_EAGER_ROWS],
+            (c[GGML_CUDA_FN_L22_CNT_HOST_US] - b[GGML_CUDA_FN_L22_CNT_HOST_US])/1000.0,
+            ctx->cuda_graphs.size(), ggml_cuda_fn_l22_count_instances(ctx),
+            c[GGML_CUDA_FN_L22_CNT_EVICT_LRU], c[GGML_CUDA_FN_L22_CNT_EVICT_INST_COLD], c[GGML_CUDA_FN_L22_CNT_EVICT_INST_HOT],
+            c[GGML_CUDA_FN_L22_CNT_VARIANT_SWAP]);
+}
+
+static bool ggml_cuda_fn_l22_props_equal(const std::vector<ggml_cuda_graph::node_properties> & a,
+                                         const std::vector<ggml_cuda_graph::node_properties> & b) {
+    return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size()*sizeof(a[0])) == 0);
+}
+
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key, bool * nodes_changed) {
     bool res = false;
     *nodes_changed = false; // [TAG_FN_L21_RECAP]
 
-    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3551,6 +3877,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+
+    // [TAG_FN_L22_GRAPH2] an instance that replayed a few times and is about to change goes aside with its properties: a key
+    // that alternates between two buffer layouts then swaps instances instead of re-warming at every switch. A graph
+    // that replayed long (a KV bucket change) keeps the RECAP update in place.
+    const bool g2 = ggml_cuda_fn_l22_graph2() && graph->instance != nullptr && graph->n_replay_cap >= 1 &&
+        graph->n_replay_cap <= 32 && (int) graph->node_props.size() == cgraph->n_nodes;
+    std::vector<ggml_cuda_graph::node_properties> g2_old;
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -3572,10 +3905,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            // [TAG_FN_L7_GDIFF] TURBO_GRAPH_DIFF=1: the first node whose properties changed, and what changed (diagnostic)
+            if (g2 && !res) {
+                g2_old = graph->node_props; // [TAG_FN_L22_GRAPH2] the layout the instance was captured for
+            }
+            // [TAG_FN_L7_GDIFF] TURBO_GRAPH_DIFF=1 (or GGML_CUDA_FN_L22_GRAPHDIAG=1): the first node whose properties
+            // changed, and what changed (diagnostic)
             static const bool gdiff = [] {
                 const char * e = getenv("TURBO_GRAPH_DIFF");
-                return e != nullptr && e[0] == '1';
+                return (e != nullptr && e[0] == '1') || ggml_cuda_fn_l22_graph_diag();
             }();
             if (gdiff && !res && (int) graph->node_props.size() == cgraph->n_nodes) {
                 static std::atomic<int> n_logged{0};
@@ -3606,6 +3943,49 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
+    // [TAG_FN_L22_GRAPH2] swap in a kept instance of this layout, else put the current one aside (at most 2 kept)
+    if (res && !g2_old.empty()) {
+        ggml_cuda_graph::fn_l22_variant cur;
+        cur.graph          = graph->graph;
+        cur.instance       = graph->instance;
+        cur.node_props     = std::move(g2_old);
+        cur.pool_top_known = graph->pool_top_known;
+        memcpy(cur.pool_top, graph->pool_top, sizeof(cur.pool_top));
+        cur.n_replay       = graph->n_replay;
+        cur.last_used      = ggml_time_us();
+
+        for (ggml_cuda_graph::fn_l22_variant & v : graph->fn_l22_alt) {
+            if (ggml_cuda_fn_l22_props_equal(v.node_props, graph->node_props)) {
+                graph->graph          = v.graph;
+                graph->instance       = v.instance;
+                graph->pool_top_known = v.pool_top_known;
+                memcpy(graph->pool_top, v.pool_top, sizeof(graph->pool_top));
+                graph->n_replay_cap    = 1;
+                graph->warmup_complete = true;
+                v = std::move(cur);
+                *nodes_changed = false;
+                cuda_ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_VARIANT_SWAP]++;
+                return false; // the swapped-in instance was captured from exactly these properties
+            }
+        }
+        graph->fn_l22_alt.push_back(std::move(cur));
+        if (graph->fn_l22_alt.size() > 2) {
+            size_t oldest = 0;
+            for (size_t v = 1; v < graph->fn_l22_alt.size(); ++v) {
+                if (graph->fn_l22_alt[v].last_used < graph->fn_l22_alt[oldest].last_used) {
+                    oldest = v;
+                }
+            }
+            graph->fn_l22_alt[oldest].destroy();
+            graph->fn_l22_alt.erase(graph->fn_l22_alt.begin() + oldest);
+        }
+        graph->graph                  = nullptr;
+        graph->instance               = nullptr;
+        graph->replayed_since_capture = false;
+        graph->n_replay_cap           = 0;
+        graph->pool_top_known         = false;
+    }
+
     return res;
 }
 
@@ -3631,11 +4011,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        if (cuda_ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS]
-            CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority));
-        } else {
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
+        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] instance cap, OOM hook
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -6797,6 +7173,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            ggml_cuda_fn_l22_cap_end(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] the pool offsets this capture uses
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -6820,11 +7197,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            if (cuda_ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS] the QSA side stream's kernels keep their high priority
-                CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority));
-            } else {
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-            }
+            // [TAG_FN_L4_QSA_STREAMS] the QSA side stream's kernels keep their high priority (instantiate flags);
+            // [TAG_FN_L22_GRAPHKEEP] the instance cap and the OOM retry
+            ggml_cuda_fn_l22_instantiate(cuda_ctx, graph);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -6932,9 +7307,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph); // [TAG_GRAPH_KEY_MEMO]
+    // [TAG_FN_L22_GRAPHKEEP] host time of the calls inside a log window
+    const bool    fn_l22_win = cuda_ctx->fn_l22_win_left > 0;
+    const int64_t fn_l22_t0  = fn_l22_win ? ggml_time_us() : 0;
+
+    int32_t graph_rows = 0;
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph, &graph_rows); // [TAG_GRAPH_KEY_MEMO]
     if (host_probe) {
         hp_t1 = host_probe_clock::now();
+    }
+
+    // [TAG_FN_L22_GRAPHKEEP] a graph of more token rows than GGML_CUDA_FN_L22_GRAPH_MAXROWS runs eagerly, with no map entry
+    const bool fn_l22_eager = ggml_cuda_fn_l22_graph_keep() >= 1 && graph_rows > ggml_cuda_fn_l22_graph_maxrows();
+    if (fn_l22_eager) {
+        graph_key = GGML_CUDA_FN_L22_EAGER_KEY;
     }
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -6947,12 +7333,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // decode speed. Any change in a node property (a tensor ne/nb or a src data
     // pointer) resets warmup and drops the step back to raw launches.
     // TURBO_GRAPH_PROBE=0 silences; it prints every 512 calls.
-    int gp_reason = 0; // 0=graph used, 1=disabled, 2=incompatible, 3=props changed, 4=warmup
-    if (graph->is_enabled()) {
+    int gp_reason = 0; // 0=graph used, 1=disabled, 2=incompatible, 3=props changed, 4=warmup, 5=eager rows [TAG_FN_L22_GRAPHKEEP]
+    if (fn_l22_eager) {
+        gp_reason = 5;
+    } else if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability_memo(cuda_ctx, cgraph); // [TAG_GRAPH_KEY_MEMO]
         if (graph_compatible) {
             bool nodes_changed = false; // [TAG_FN_L21_RECAP]
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, &nodes_changed);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key, &nodes_changed);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -7060,16 +7448,59 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             return !(e && e[0] == '0');
         }();
         if (probe_on) {
-            static std::atomic<unsigned> n_call{0}, n_reason[5]{};
+            static std::atomic<unsigned> n_call{0}, n_reason[6]{};
             n_reason[gp_reason].fetch_add(1, std::memory_order_relaxed);
             const unsigned n = n_call.fetch_add(1, std::memory_order_relaxed) + 1;
             if ((n & 511u) == 0u) {
-                fprintf(stderr,
-                        "turbo-probe: cuda-graph calls=%u used=%u disabled=%u incompatible=%u props-changed=%u warmup=%u nodes=%d\n",
-                        n, n_reason[0].load(), n_reason[1].load(), n_reason[2].load(),
-                        n_reason[3].load(), n_reason[4].load(), cgraph->n_nodes);
+                if (n_reason[5].load() == 0) {
+                    fprintf(stderr,
+                            "turbo-probe: cuda-graph calls=%u used=%u disabled=%u incompatible=%u props-changed=%u warmup=%u nodes=%d\n",
+                            n, n_reason[0].load(), n_reason[1].load(), n_reason[2].load(),
+                            n_reason[3].load(), n_reason[4].load(), cgraph->n_nodes);
+                } else { // [TAG_FN_L22_GRAPHKEEP]
+                    fprintf(stderr,
+                            "turbo-probe: cuda-graph calls=%u used=%u disabled=%u incompatible=%u props-changed=%u warmup=%u eager-rows=%u nodes=%d\n",
+                            n, n_reason[0].load(), n_reason[1].load(), n_reason[2].load(),
+                            n_reason[3].load(), n_reason[4].load(), n_reason[5].load(), cgraph->n_nodes);
+                }
                 fflush(stderr);
             }
+        }
+        // [TAG_FN_L22_GRAPH2] GGML_CUDA_FN_L22_GRAPHDIAG=1: calls that did not replay, by node count and reason
+        if (ggml_cuda_fn_l22_graph_diag()) {
+            static std::atomic<unsigned> d_call{0}, d_raw[4][6]{};
+            const int bucket = cgraph->n_nodes < 256 ? 0 : cgraph->n_nodes < 1024 ? 1 : cgraph->n_nodes < 4096 ? 2 : 3;
+            if (gp_reason != 0) {
+                d_raw[bucket][gp_reason].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (((d_call.fetch_add(1, std::memory_order_relaxed) + 1) & 1023u) == 0u) {
+                std::string line;
+                const char * bname[4] = { "<256", "<1024", "<4096", ">=4096" };
+                for (int b = 0; b < 4; ++b) {
+                    char buf[160];
+                    snprintf(buf, sizeof(buf), " nodes%s: disabled %u incompat %u props %u warmup %u eager %u;", bname[b],
+                            d_raw[b][1].load(), d_raw[b][2].load(), d_raw[b][3].load(), d_raw[b][4].load(), d_raw[b][5].load());
+                    line += buf;
+                }
+                GGML_LOG_WARN("[TAG_FN_L22_GRAPH2] kind=graph raw calls by size and reason after %u calls:%s\n", d_call.load(), line.c_str());
+            }
+        }
+    }
+
+    // [TAG_FN_L22_GRAPHKEEP] counters (ggml_backend_cuda_graph_counters, the log window)
+    {
+        uint64_t * c = cuda_ctx->fn_l22_cnt;
+        c[GGML_CUDA_FN_L22_CNT_CALLS]++;
+        if (use_cuda_graph && !cuda_graph_update_required) {
+            c[GGML_CUDA_FN_L22_CNT_REPLAY]++;
+            graph->n_replay++;
+            graph->n_replay_cap++;
+        } else if (use_cuda_graph) {
+            c[graph->instance != nullptr ? GGML_CUDA_FN_L22_CNT_RECAP : GGML_CUDA_FN_L22_CNT_CAPTURE]++;
+        } else if (gp_reason == 5) {
+            c[GGML_CUDA_FN_L22_CNT_EAGER_ROWS]++;
+        } else if (gp_reason == 3 || gp_reason == 4) {
+            c[GGML_CUDA_FN_L22_CNT_WARMUP]++;
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -7081,10 +7512,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
+#ifdef USE_CUDA_GRAPH
+        ggml_cuda_fn_l22_cap_begin(cuda_ctx); // [TAG_FN_L22_GRAPHKEEP]
+#endif // USE_CUDA_GRAPH
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    if (fn_l22_win) { // [TAG_FN_L22_GRAPHKEEP]
+        cuda_ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_HOST_US] += (uint64_t) (ggml_time_us() - fn_l22_t0);
+        ggml_cuda_fn_l22_window_tick(cuda_ctx);
+    }
+#endif // USE_CUDA_GRAPH
 
     if (host_probe) {
         const auto us = [](host_probe_clock::duration d) {
@@ -7274,8 +7715,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph); // uid 0 here: always hashed
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    int32_t graph_rows = 0;
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph, &graph_rows); // uid 0 here: always hashed
+    // [TAG_FN_L22_GRAPHKEEP] a graph that will run eagerly gets no map entry here either
+    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx,
+        ggml_cuda_fn_l22_graph_keep() >= 1 && graph_rows > ggml_cuda_fn_l22_graph_maxrows() ? GGML_CUDA_FN_L22_EAGER_KEY : graph_key);
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
@@ -7605,7 +8049,20 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
     }
     ggml_cuda_set_device(ctx->device);
 #ifdef USE_CUDA_GRAPH
-    ctx->cuda_graphs.clear();
+    // [TAG_FN_L22_GRAPHKEEP] G2: with GGML_CUDA_FN_L22_GRAPHKEEP, a mark (ggml_backend_pool_mark) and pools that tracked every
+    // capture, each pool keeps max(keep, mark) and only the instances whose capture used pool memory above what stays
+    // mapped are dropped; otherwise every graph goes, as before
+    bool g2 = ggml_cuda_fn_l22_graph_keep() >= 1 && ctx->fn_l22_mark_valid;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && g2; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS && g2; ++s) {
+            g2 = ctx->pools[d][s] == nullptr || (d == ctx->device && ctx->pools[d][s]->cap_hwm() != (size_t) -1);
+        }
+    }
+    ctx->fn_l22_mark_valid = false;
+    const int n_before = ggml_cuda_fn_l22_graph_keep() >= 1 && !g2 ? ggml_cuda_fn_l22_count_instances(ctx) : 0;
+    if (!g2) {
+        ctx->cuda_graphs.clear();
+    }
     for (auto & m : ctx->graph_key_memo) {
         m = ggml_cuda_graph_key_memo();
     }
@@ -7615,13 +8072,141 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
             if (ctx->pools[d][s]) {
                 ggml_cuda_set_device(d);
-                freed += ctx->pools[d][s]->trim(keep);
+                size_t keep_s = keep;
+#ifdef USE_CUDA_GRAPH
+                if (g2) {
+                    keep_s = std::max(keep, ctx->fn_l22_keep_mark[s]);
+                }
+#endif
+                freed += ctx->pools[d][s]->trim(keep_s);
                 ctx->pools[d][s]->reset_hwm();
             }
         }
     }
     ggml_cuda_set_device(ctx->device);
+#ifdef USE_CUDA_GRAPH
+    if (ggml_cuda_fn_l22_graph_keep() >= 1) {
+        int kept = 0, dropped = 0;
+        if (g2) {
+            const auto above = [ctx](bool known, const size_t * top) {
+                if (!known) {
+                    return true;
+                }
+                for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                    const size_t mapped = ctx->pools[ctx->device][s] ? ctx->pools[ctx->device][s]->reserved() : 0;
+                    if (top[s] > mapped) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            for (auto & [k, g] : ctx->cuda_graphs) {
+                for (size_t v = 0; v < g->fn_l22_alt.size(); ) {
+                    if (above(g->fn_l22_alt[v].pool_top_known, g->fn_l22_alt[v].pool_top)) {
+                        g->fn_l22_alt[v].destroy();
+                        g->fn_l22_alt.erase(g->fn_l22_alt.begin() + v);
+                        dropped++;
+                    } else {
+                        ++v;
+                        kept++;
+                    }
+                }
+                if (g->instance == nullptr) {
+                    continue;
+                }
+                if (above(g->pool_top_known, g->pool_top)) {
+                    g->fn_l22_drop_instance();
+                    dropped++;
+                } else {
+                    kept++;
+                }
+            }
+        } else {
+            dropped = n_before;
+        }
+        ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_TRIM_KEPT]    += kept;
+        ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_TRIM_DROPPED] += dropped;
+        GGML_LOG_WARN("[TAG_FN_L22_PASSLOG] kind=graph ctx=%s %p trim: %.1f MiB given back, instances kept %d dropped %d%s\n",
+                ctx->name.c_str(), (void *) ctx, freed/1048576.0, kept, dropped, g2 ? "" : " (no mark or untracked pools: all graphs cleared)");
+        ggml_cuda_fn_l22_window_start(ctx, 16);
+    }
+#endif
     return freed;
+}
+
+// [TAG_FN_L22_GRAPHKEEP] proc "ggml_backend_pool_mark": the next trim keeps, per pool, what the period since the last mark
+// handed out at most and what the captured instances use
+static void ggml_backend_cuda_pool_mark(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+#ifdef USE_CUDA_GRAPH
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        ggml_cuda_pool * p = ctx->pools[ctx->device][s].get();
+        size_t m = p ? p->used_hwm() : 0;
+        for (const auto & [k, g] : ctx->cuda_graphs) {
+            if (g->instance != nullptr && g->pool_top_known) {
+                m = std::max(m, g->pool_top[s]);
+            }
+            for (const auto & v : g->fn_l22_alt) {
+                if (v.instance != nullptr && v.pool_top_known) {
+                    m = std::max(m, v.pool_top[s]);
+                }
+            }
+        }
+        ctx->fn_l22_keep_mark[s] = m;
+        if (p) {
+            p->reset_hwm();
+        }
+    }
+    ctx->fn_l22_mark_valid = true;
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
+// [TAG_FN_L22_GRAPHKEY] proc "ggml_backend_cuda_set_graph_key_mode": big > 0 hashes every dimension >= big as one value
+static void ggml_backend_cuda_set_graph_key_mode(ggml_backend_t backend, uint32_t big) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+#ifdef USE_CUDA_GRAPH
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->fn_l22_key_big = big;
+    for (auto & m : ctx->graph_key_memo) {
+        m = ggml_cuda_graph_key_memo();
+    }
+#else
+    GGML_UNUSED(big);
+#endif
+}
+
+// [TAG_FN_L22_GRAPHKEEP] proc "ggml_backend_cuda_graph_counters": cumulative counters (ggml_cuda_fn_l22_cnt order)
+static void ggml_backend_cuda_graph_counters(ggml_backend_t backend, uint64_t * out, int n) {
+    if (out == nullptr || n <= 0) {
+        return;
+    }
+    memset(out, 0, n*sizeof(uint64_t));
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+#ifdef USE_CUDA_GRAPH
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_OBJECTS]   = ctx->cuda_graphs.size();
+    ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_INSTANCES] = ggml_cuda_fn_l22_count_instances(ctx);
+    memcpy(out, ctx->fn_l22_cnt, std::min(n, (int) GGML_CUDA_FN_L22_CNT_COUNT)*sizeof(uint64_t));
+#endif
+}
+
+// [TAG_FN_L22_GRAPHKEEP] proc "ggml_backend_cuda_graph_window": one kind=graph log line after the next n calls
+static void ggml_backend_cuda_graph_window(ggml_backend_t backend, int n_calls) {
+    if (!ggml_backend_is_cuda(backend) || n_calls <= 0) {
+        return;
+    }
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_fn_l22_window_start((ggml_backend_cuda_context *) backend->context, n_calls);
+#endif
 }
 
 // [TAG_FN_L3_VRAM_ACCOUNT] the context's per-thread stack limit (the driver grows the local memory to it for every
@@ -8456,8 +9041,21 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
     }
 }
 
+// [TAG_FN_L22_XOVER] proc "ggml_backend_fn_set_offload_min_batch": an override of the op-offload minimum batch (P10's
+// measured crossover); < 0 clears it
+static std::atomic<int> ggml_cuda_fn_l22_offload_min{-1};
+
+static void ggml_backend_cuda_fn_set_offload_min_batch(int min_batch) {
+    ggml_cuda_fn_l22_offload_min.store(min_batch < 0 ? -1 : min_batch, std::memory_order_relaxed);
+}
+
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    const int fn_min = ggml_cuda_fn_l22_offload_min.load(std::memory_order_relaxed); // [TAG_FN_L22_XOVER]
+    if (fn_min >= 0) {
+        return get_op_batch_size(op) >= fn_min;
+    }
 
     // [TAG_FN_L12_PROMPTMIN] GGML_OP_OFFLOAD_MIN_BATCH as it is now: a model's automatic profile sets it at load, after the
     // backend registered (the value read at registration stays the default)
@@ -8620,6 +9218,59 @@ static void ggml_backend_cuda_fn_unregister_host(void * buffer) {
     }
 }
 
+// [TAG_FN_L22_PIN] R-P14-5: a host range registered with a device mapping (pinned DMA share reads it from kernels), and
+// the device address of a registered host pointer (null if the driver has none)
+static bool ggml_backend_cuda_fn_register_host_mapped(void * buffer, size_t size, void ** dev) {
+    if (dev) {
+        *dev = nullptr;
+    }
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    if (dev && cudaHostGetDevicePointer(dev, buffer, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        *dev = nullptr;
+    }
+    return true;
+}
+
+static void * ggml_backend_cuda_fn_host_dev_ptr(const void * host) {
+    void * dev = nullptr;
+    if (host == nullptr || cudaHostGetDevicePointer(&dev, const_cast<void *>(host), 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return dev;
+}
+
+// [TAG_FN_L22_PIN] proc "ggml_backend_fn_device_luid" (P6 DXGI budget): the adapter LUID of a CUDA device, as the 8 bytes
+// of cudaDeviceProp::luid (LowPart, HighPart of the Windows LUID); false off Windows or when the driver gives none
+static bool ggml_backend_cuda_fn_device_luid(ggml_backend_dev_t dev, uint64_t * luid) {
+    if (dev == nullptr || luid == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return false;
+    }
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(dev_ctx->device)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (prop.luidDeviceNodeMask == 0) {
+        return false;
+    }
+    uint64_t v = 0;
+    memcpy(&v, prop.luid, sizeof(v));
+    *luid = v;
+    return v != 0;
+#else
+    return false;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (void * p = ggml_cuda_fn_l22_dmafetch_proc(name)) { // [TAG_FN_L22_DMASHARE] R-P14-4 (stub: nullptr)
@@ -8746,6 +9397,34 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_pool_trim") == 0) {
         return (void *)ggml_backend_cuda_pool_trim;
+    }
+    // [TAG_FN_L22_GRAPHKEEP] [TAG_FN_L22_GRAPHKEY] [TAG_FN_L22_PIN] [TAG_FN_L22_XOVER] [TAG_FN_L22_OOMHOOK] round 22 P7 procs
+    if (strcmp(name, "ggml_backend_pool_mark") == 0) {
+        return (void *)ggml_backend_cuda_pool_mark;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_graph_key_mode") == 0) {
+        return (void *)ggml_backend_cuda_set_graph_key_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_counters") == 0) {
+        return (void *)ggml_backend_cuda_graph_counters;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_window") == 0) {
+        return (void *)ggml_backend_cuda_graph_window;
+    }
+    if (strcmp(name, "ggml_backend_fn_device_luid") == 0) {
+        return (void *)ggml_backend_cuda_fn_device_luid;
+    }
+    if (strcmp(name, "ggml_backend_fn_set_offload_min_batch") == 0) {
+        return (void *)ggml_backend_cuda_fn_set_offload_min_batch;
+    }
+    if (strcmp(name, "ggml_backend_fn_host_dev_ptr") == 0) {
+        return (void *)ggml_backend_cuda_fn_host_dev_ptr;
+    }
+    if (strcmp(name, "ggml_backend_fn_register_host_mapped") == 0) {
+        return (void *)ggml_backend_cuda_fn_register_host_mapped;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_oom_hook") == 0) {
+        return (void *)ggml_backend_cuda_set_oom_hook;
     }
     if (strcmp(name, "ggml_backend_cuda_limits") == 0) { // [TAG_FN_L3_VRAM_ACCOUNT]
         return (void *)ggml_backend_cuda_limits;
