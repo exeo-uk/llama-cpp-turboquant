@@ -2314,6 +2314,168 @@ struct test_glu_split : public test_case {
     }
 };
 
+// [TAG_FN_L22_GLUQ8] (#30489) GLU feeding a batched matmul: the fusion of the GLU into the MMQ activation quantization on
+// the CUDA backend in every input layout (packed, packed+swapped, split, split with a strided up tensor - the last one must
+// not fuse and covers the fallback - and an unrelated matmul between them, which must decline)
+struct test_glu_mul_mat : public test_case {
+    enum layout_t {
+        LAYOUT_PACKED,
+        LAYOUT_PACKED_SWAPPED,
+        LAYOUT_SPLIT,
+        LAYOUT_SPLIT_STRIDED_UP,
+        LAYOUT_NONADJACENT,
+    };
+
+    const ggml_glu_op glu_op;
+    const ggml_type   type;
+    const int64_t     k;
+    const int64_t     m;
+    const int64_t     n;
+    const layout_t    layout;
+    const bool        reuse_glu;
+
+    test_glu_mul_mat(ggml_glu_op glu_op, ggml_type type, int64_t k, int64_t m, int64_t n, layout_t layout, bool reuse_glu = false)
+        : glu_op(glu_op), type(type), k(k), m(m), n(n), layout(layout), reuse_glu(reuse_glu) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(glu_op, type, k, m, n, layout, reuse_glu);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "GLU_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, layout <= LAYOUT_PACKED_SWAPPED ? 2*k : k, n, 2, 2);
+        ggml_tensor * glu;
+        if (layout <= LAYOUT_PACKED_SWAPPED) {
+            glu = ggml_glu(ctx, gate, glu_op, layout == LAYOUT_PACKED_SWAPPED);
+        } else {
+            ggml_tensor * up = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, layout == LAYOUT_SPLIT_STRIDED_UP ? 2*k : k, n, 2, 2);
+            if (layout == LAYOUT_SPLIT_STRIDED_UP) {
+                up = ggml_view_4d(ctx, up, k, n, 2, 2, up->nb[1], up->nb[2], up->nb[3], 0);
+            }
+            glu = ggml_glu_split(ctx, gate, up, glu_op);
+        }
+        if (layout == LAYOUT_NONADJACENT) {
+            ggml_tensor * dummy_w = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * dummy_x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, 2, 2);
+            ggml_tensor * dummy   = ggml_scale(ctx, ggml_mul_mat(ctx, dummy_w, dummy_x), 0.0f);
+            ggml_tensor * weight0 = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * out0    = ggml_mul_mat(ctx, weight0, glu);
+            return ggml_add(ctx, out0, dummy);
+        }
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, glu);
+        if (reuse_glu) {
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, glu));
+        }
+        return out;
+    }
+};
+
+// [TAG_FN_L22_GLUQ8] the same with a MUL_MAT_ID down projection (the routed MoE path)
+struct test_swiglu_mul_mat_id : public test_case {
+    const ggml_type type;
+    const int64_t   k;
+    const int64_t   m;
+    const int64_t   n_expert;
+    const int64_t   n_used;
+    const int64_t   n_tokens;
+
+    test_swiglu_mul_mat_id(ggml_type type, int64_t k, int64_t m, int64_t n_expert, int64_t n_used, int64_t n_tokens)
+        : type(type), k(k), m(m), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, k, m, n_expert, n_used, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "SWIGLU_MUL_MAT_ID";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n_tokens);
+        ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n_tokens);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * weight = ggml_new_tensor_3d(ctx, type, k, m, n_expert);
+        ggml_tensor * ids    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * out    = ggml_mul_mat_id(ctx, weight, glu, ids);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) {
+                    continue;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % (int) n_expert;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// [TAG_FN_L22_GLUFUSE] a whole FFN, up / gate -> GLU -> down: #29948 takes {up, gate, GLU} first and leaves the down matmul
+// plain; where it does not fuse, #30489 may put the GLU into the down matmul's quantization; at decode widths neither runs
+struct test_fn_l22_ffn : public test_case {
+    const ggml_type type;
+    const int64_t   n_embd;
+    const int64_t   n_ff;
+    const int64_t   n_tokens;
+
+    test_fn_l22_ffn(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_tokens)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_ff, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "FFN_FUSION_ORDER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+        ggml_tensor * up     = ggml_mul_mat(ctx, w_up, x);
+        ggml_tensor * gate   = ggml_mul_mat(ctx, w_gate, x);
+        ggml_tensor * glu    = ggml_swiglu_split(ctx, gate, up);
+        return ggml_mul_mat(ctx, w_down, glu);
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -16085,6 +16247,73 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // 27B FFN shape (5120 -> 17408 Q5_K) at a full 1024-token ubatch: unfused MMQ tiles all of K here on a 170-SM GPU, so GGML_CUDA_MMQ_GLU_FUSION=1 fuses it.
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K, GGML_GLU_OP_SWIGLU, 1024, 17408, 5120, false, 1, 1, false, false, true, false, { 1, 1 }));
+
+    // [TAG_FN_L22_GLUFUSE] #29948 head b6e0f0334: the fused path is only used if its tiling fills the GPU (>= 2048 tiles,
+    // enough for up to 252 SMs). One MMA tile per warp (m = 17, 1 column tile) and two (m = 1024, 8 column tiles).
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU,   17, 131072, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1024,  16384, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1024, 16384, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+    for (ggml_glu_op glu_op : { GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, glu_op, 1024, 16384, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1024, 2816, 256, false, 1, 1, false, false, true, false, { 2, 3 }));
+
+    // [TAG_FN_L22_GLUQ8] (#30489) GLU feeding a batched matmul (the MMQ activation quantization fusion)
+    for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+        for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL }) {
+            for (auto layout : {
+                test_glu_mul_mat::LAYOUT_PACKED,
+                test_glu_mul_mat::LAYOUT_PACKED_SWAPPED,
+                test_glu_mul_mat::LAYOUT_SPLIT,
+                test_glu_mul_mat::LAYOUT_SPLIT_STRIDED_UP,
+                test_glu_mul_mat::LAYOUT_NONADJACENT}) {
+                for (int64_t n : { 1, 4, 65 }) {
+                    test_cases.emplace_back(new test_glu_mul_mat(glu_op, type, 768, 128, n, layout));
+                }
+            }
+            test_cases.emplace_back(new test_glu_mul_mat(glu_op, type, 768, 128, 4,  test_glu_mul_mat::LAYOUT_SPLIT, true));
+            test_cases.emplace_back(new test_glu_mul_mat(glu_op, type, 768, 128, 65, test_glu_mul_mat::LAYOUT_SPLIT, true));
+        }
+    }
+    // GLU feeding a MUL_MAT_ID down projection (the routed MoE path)
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n_tokens : { 1, 4, 65, 2048 }) {
+            test_cases.emplace_back(new test_swiglu_mul_mat_id(type, 640, 128, 8, 4, n_tokens));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_S }) {
+        for (int64_t n_tokens : { 4, 65 }) {
+            test_cases.emplace_back(new test_swiglu_mul_mat_id(type, 2560, 64, 8, 4, n_tokens));
+        }
+    }
+
+    // [TAG_FN_L22_GLUFUSE] fusion order on a whole FFN: the 27B FFN (#29948 fuses at 1024 tokens), a Flash-Next shared
+    // expert (640 rows), a narrow prompt and a decode width (neither fusion)
+    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q5_K, 5120, 17408, 1024));
+    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q4_K, 2560,   640, 1024));
+    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q8_0, 2560,   640,  100));
+    test_cases.emplace_back(new test_fn_l22_ffn(GGML_TYPE_Q5_K, 5120, 17408,    2));
+    // Flash-Next routed experts in a prompt: MUL_MAT_ID down projection (#30489 only)
+    test_cases.emplace_back(new test_swiglu_mul_mat_id(GGML_TYPE_Q5_1, 640, 2560, 512, 10, 1024));
+
+    // [TAG_FN_L22_SKCAP] [TAG_FN_L22_MMQ_Y8] (#30553, #30493) stream-k with fewer tiles than SMs (the grid cap) and MMQ at
+    // widths whose y tile is not a multiple of the block (the bounds-checked int2 copy)
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 9, 16, 33, 72 }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 256, n, 4096, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 2560, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, false, 512, 40, 2560));
+    }
+
+    // [TAG_FN_L22_MMVQ_R1] dense Q8_0 at 2..4 columns with >= 2048 rows (one row per block with GGML_CUDA_FN_L22_MMVQ_R1=1)
+    for (int64_t m : { 2048, 2560, 4096 }) {
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 2560, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
