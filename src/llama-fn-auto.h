@@ -150,6 +150,32 @@ LLAMA_API bool     llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool shor
 // the hot-set budget with the lend: the fit's budget plus pool_extra (LLAMA_FN_CBUF_POOL_MIB, also in the tail), never
 // above budget_max nor above free - 256 MiB (unless the fit's budget already is)
 LLAMA_API size_t   llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_t budget_max);
+// [TAG_FN_L22_LENDCLASS] the FULL reserve class of a prompt below the command's width: the smallest of 1024 / 2048 / 4096
+// tokens that holds the whole prompt (the batch plus `after` tokens after it; after < 0: unknown -> 0) and is narrower
+// than base_ub; 0 when none (the old width). The ubatches stay the same (the class holds every one of them).
+LLAMA_API uint32_t llama_fn_l22_lend_class(uint32_t base_ub, uint32_t n_tokens, int64_t after);
+// the tail bytes a class's FULL reserve needs given back: full - small + pool + max(128 MiB, full/16), at most cap (cap 0:
+// no cap); 0 when full <= small
+LLAMA_API size_t   llama_fn_l22_class_need(size_t full_b, size_t small_b, size_t pool_b, size_t cap);
+// [TAG_FN_L22_SCHEDBUF] the graph node budget of a width whose reserve graphs were measured: nodes x 3/2 + 8192, never
+// above the formula's
+LLAMA_API uint32_t llama_fn_l22_sched_nodes(uint32_t formula, uint32_t nodes_measured);
+// [TAG_FN_L22_SAMPSTATIC] the sampling nodes graph_max_nodes counts when every sampler builds n_out_per_seq chains:
+// max(old count, sum of the samplers' nodes x n_out_per_seq)
+LLAMA_API uint32_t llama_fn_l22_sampling_nodes(uint32_t old_count, uint32_t sum_nodes, uint32_t n_out_per_seq);
+// [TAG_FN_L22_E6] (#30694) the state writer's device reads: consecutive ranges of the same tensor, each < 64 KiB, at
+// increasing offsets, merged while the span stays <= 8 x their payload + 1 MiB. groups: [first, last) index pairs
+struct llama_fn_l22_io_range {
+    const void * tensor;
+    size_t       offset;
+    size_t       size;
+};
+LLAMA_API void     llama_fn_l22_io_merge(const std::vector<llama_fn_l22_io_range> & r, std::vector<std::pair<size_t, size_t>> & groups);
+// [TAG_FN_L22_GETTER] the width of the next prompt ubatch (llama_fn_prompt_ubatch_width_ext) for a context in the SMALL
+// state, given the hint `after` (the prompt tokens to come): the rule the next switch to FULL applies (l21 or l20), then
+// the class
+LLAMA_API uint32_t llama_fn_l22_next_width(uint32_t base_ub, uint32_t n_ubatch, bool l21_bigub, bool l21_big_off, bool lendclass,
+        int64_t after);
 
 //
 // model hooks (src/llama.cpp) and lookups

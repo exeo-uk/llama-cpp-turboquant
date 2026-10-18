@@ -883,6 +883,91 @@ size_t llama_fn_cbuf_budget(size_t budget, size_t pool_extra, size_t free, size_
     return std::min(b, budget_max);
 }
 
+// [TAG_FN_L22_P4] ---------------------------------------------------------------------------------------------------
+
+uint32_t llama_fn_l22_lend_class(uint32_t base_ub, uint32_t n_tokens, int64_t after) {
+    if (base_ub == 0 || after < 0) {
+        return 0;
+    }
+    const int64_t total = (int64_t) n_tokens + after;
+    static const uint32_t k_cls[] = { 1024, 2048, 4096 };
+    for (uint32_t c : k_cls) {
+        if (c >= base_ub) {
+            break;
+        }
+        if (total <= (int64_t) c) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+size_t llama_fn_l22_class_need(size_t full_b, size_t small_b, size_t pool_b, size_t cap) {
+    if (full_b <= small_b) {
+        return 0;
+    }
+    const size_t slack = std::max<size_t>((size_t) 128 << 20, full_b/16);
+    const size_t need  = full_b - small_b + pool_b + slack;
+    return cap > 0 ? std::min(need, cap) : need;
+}
+
+uint32_t llama_fn_l22_sched_nodes(uint32_t formula, uint32_t nodes_measured) {
+    if (nodes_measured == 0) {
+        return formula;
+    }
+    const uint64_t n = (uint64_t) nodes_measured*3/2 + 8192;
+    return (uint32_t) std::min<uint64_t>(formula, n);
+}
+
+uint32_t llama_fn_l22_sampling_nodes(uint32_t old_count, uint32_t sum_nodes, uint32_t n_out_per_seq) {
+    const uint64_t s = (uint64_t) sum_nodes*std::max<uint32_t>(1, n_out_per_seq);
+    return (uint32_t) std::max<uint64_t>(old_count, std::min<uint64_t>(s, UINT32_MAX));
+}
+
+void llama_fn_l22_io_merge(const std::vector<llama_fn_l22_io_range> & r, std::vector<std::pair<size_t, size_t>> & groups) {
+    groups.clear();
+    constexpr size_t small = (size_t) 64 << 10;
+    size_t i = 0;
+    while (i < r.size()) {
+        size_t j = i + 1;
+        if (r[i].size < small) {
+            size_t hi      = r[i].offset + r[i].size;
+            size_t payload = r[i].size;
+            while (j < r.size()) {
+                const auto & w = r[j];
+                if (w.tensor != r[i].tensor || w.size >= small || w.offset < hi) {
+                    break;
+                }
+                const size_t nhi = w.offset + w.size;
+                if (nhi - r[i].offset > 8*(payload + w.size) + ((size_t) 1 << 20)) {
+                    break;
+                }
+                hi       = nhi;
+                payload += w.size;
+                ++j;
+            }
+        }
+        groups.push_back({ i, j });
+        i = j;
+    }
+}
+
+uint32_t llama_fn_l22_next_width(uint32_t base_ub, uint32_t n_ubatch, bool l21_bigub, bool l21_big_off, bool lendclass,
+        int64_t after) {
+    if (base_ub == 0) {
+        return n_ubatch;
+    }
+    uint32_t w = !l21_bigub ? llama_fn_l20_full_width(base_ub, n_ubatch, 0, after) :
+                 l21_big_off ? base_ub : llama_fn_l21_full_width(base_ub, n_ubatch, 0, after);
+    if (lendclass && w == base_ub) {
+        const uint32_t c = llama_fn_l22_lend_class(base_ub, 0, after);
+        if (c > 0) {
+            w = c;
+        }
+    }
+    return w;
+}
+
 // [TAG_FN_RAM_FIT] -------------------------------------------------------------------------------------------------
 
 llama_ram_fit_out llama_ram_fit_plan(const llama_ram_fit_in & in) {
