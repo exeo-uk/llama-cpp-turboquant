@@ -680,7 +680,7 @@ void fn_arena_run(fn_pin_state * st) {
             st->reg.drop(u);
             continue;
         }
-        if (!fn_wait_quiet(st)) {
+        if (!fn_wait_quiet(st) || fn_model_gone(st)) {
             break;
         }
         void * p = nullptr;
@@ -790,8 +790,10 @@ bool fn_ranges_run(fn_pin_state * st) {
         for (int k = 0; k < G.n_rng && ok_group; ++k) {
             const int ri = G.first + k; // mapped mode: unit index == plan range index
             const fn_pin::range & r = st->plan.ranges[ri];
-            if (!fn_wait_quiet(st)) {
+            // the model's contexts all gone: the mapping may close soon, nothing more is read or registered
+            if (!fn_wait_quiet(st) || fn_model_gone(st)) {
                 ok_group = false;
+                st->frozen.store(true);
                 break;
             }
             if (st->mode == 2 && !fn_touch(st, r.p, r.n)) {
