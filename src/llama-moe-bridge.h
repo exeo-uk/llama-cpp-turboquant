@@ -82,6 +82,25 @@
 //                                         wait for a hint that is late. 2: the router's input is the next layer's own FFN
 //                                         mixer (hyper-connection norm and gates) applied to this layer's residual, a
 //                                         closer stand-in for that layer's input (a few more small kernels after the post)
+//
+// Round 22, CPU pool (qwen4exp only; off unless set; the first three never change a value):
+//   LLAMA_MOE_POOL_STAGGER=<G>            [TAG_FN_L22_POOL_STAGGER] (split stable / steal) pool thread i walks a job's experts
+//                                         from position (i % G)*n/G on, and pulls its prefetch from the same share on, so at
+//                                         most ~n_threads/G threads fault one cold expert's pages at a time (0 = off, <= 16)
+//   LLAMA_MOE_POOL_PRETOUCH=1             [TAG_FN_L22_PRETOUCH] one helper thread (LLAMA_MOE_POOL_PRETOUCH_CPU=<cpu>, default
+//                                         an SMT sibling of a worker's core) reads one byte per page of the cold experts the
+//                                         next jobs compute (the device's prediction for the next layer, a posted job's later
+//                                         experts) that no job of their layer read within the last 64 jobs
+//   LLAMA_MOE_POOL_JOBPF=1|2              [TAG_FN_L22_JOBPF] one read-ahead request (PrefetchVirtualMemory) before each job:
+//                                         1 its cold experts no job of the layer read within the last 64 jobs, 2 all of them
+//   LLAMA_FN_L22_X_STATS=1                [TAG_FN_L22_X_STATS] per job: the cold experts, and how many of them (and how much
+//                                         routing weight) the rank rule (R = 6..9) and the weight rule (< 0.05, < 0.1) would
+//                                         drop; one line per 4096 jobs and when the executor goes idle. Counters only
+//   LLAMA_FN_L22_X_TAILSKIP=<R>           [TAG_FN_L22_X_TAILSKIP] CHANGES ANSWERS: in decode windows the graph flags
+//   LLAMA_FN_L22_X_TAILSKIP_W=<w>         (GGML_MOE_BRIDGE_JOB_TAIL), a cold expert whose smallest rank over the window is
+//                                         >= R, or whose largest weight is < w, contributes nothing (no renormalization);
+//                                         the sync op of a retried ubatch drops the same experts. R >= n_used: weight rule
+//                                         only. LLAMA_FN_L22_X_TAILSKIP_PF=1: the next-layer prefetch skips ranks >= R
 
 #include <cstdint>
 

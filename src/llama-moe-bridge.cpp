@@ -282,6 +282,12 @@ struct llama_moe_bridge {
         uint32_t             p_seq  = 0;
         std::vector<uint8_t> seen;              // [TAG_FN_R4_REVIEW] [n_expert] scratch of the distinct CPU expert count
         std::vector<uint8_t> trk_seen;          // [TAG_FN_L3_MTP_COST2] [n_expert] scratch of the cold prefix counts
+        // [TAG_FN_L22_X_STATS] [n_expert] scratch of a job's cold experts: smallest rank, largest and summed weight; the list
+        // of the experts set (reset after each job)
+        std::vector<uint8_t> xs_minr;
+        std::vector<float>   xs_maxw;
+        std::vector<float>   xs_sumw;
+        std::vector<int32_t> xs_list;
     };
     std::vector<chan> chans;
     std::unordered_map<const ggml_tensor *, int> by_up;
@@ -341,6 +347,24 @@ struct llama_moe_bridge {
 
     int stall_ms    = 0;
     int stall_every = 0;
+
+    // [TAG_FN_L22_X_TAILSKIP] (qwen4exp, opt-in, changes answers) the rule a job flagged GGML_MOE_BRIDGE_JOB_TAIL carries to
+    // the pool: a cold expert whose smallest rank over the window is >= tail_rank, or whose largest weight is < tail_w,
+    // contributes nothing. tail_pf: the next-layer prefetch skips the ranks the rule drops
+    int   tail_rank = 0;
+    float tail_w    = 0.0f;
+    bool  tail_pf   = false;
+    // [TAG_FN_L22_X_STATS] (qwen4exp) what the rank and weight rules would drop, summed by the job thread: one line per 4096
+    // jobs and when the executor is idle
+    bool  xs_on = false;
+    struct xstats {
+        uint64_t jobs = 0, tokens = 0, cold = 0;
+        uint64_t skip_r[4] = {}, skip_w[2] = {};  // cold experts the rank rule R = 6..9 / the weight rule w < 0.05, 0.1 drops
+        double   mass_r[4] = {}, mass_w[2] = {};  // their routing weight
+        double   mass = 0;                        // all routing weight of the jobs (hot and cold)
+    } xs;
+    // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] the pool's totals every 4096 bridged graphs
+    bool  l22_pool_line = false;
 };
 
 // [TAG_FN_L3_MTP_COST2] add one job's cold prefix counts to the running graph's: for t = 0..T-1 the distinct experts of
@@ -379,6 +403,83 @@ static void br_track_job(llama_moe_bridge * br, llama_moe_bridge::chan & c, cons
         }
     }
     br->trk_layers++;
+}
+
+// [TAG_FN_L22_X_STATS] the summed counters as one line, then zero (job thread)
+static void br_xstats_flush(llama_moe_bridge * br, const char * why) {
+    auto & x = br->xs;
+    if (x.jobs == 0) {
+        return;
+    }
+    const double nj = (double) x.jobs;
+    const double nc = x.cold > 0 ? (double) x.cold : 1.0;
+    const double ms = x.mass > 0.0 ? x.mass : 1.0;
+    LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_STATS] %s: %" PRIu64 " jobs, %.2f tokens and %.2f cold experts each; "
+            "dropped (share of cold experts, share of routing weight): rank >= 6 %.1f%% %.2f%%, >= 7 %.1f%% %.2f%%, >= 8 %.1f%% "
+            "%.2f%%, >= 9 %.1f%% %.2f%%; weight < 0.05 %.1f%% %.2f%%, < 0.1 %.1f%% %.2f%%\n", __func__, br->bid, why, x.jobs,
+            x.tokens/nj, x.cold/nj,
+            100.0*x.skip_r[0]/nc, 100.0*x.mass_r[0]/ms, 100.0*x.skip_r[1]/nc, 100.0*x.mass_r[1]/ms,
+            100.0*x.skip_r[2]/nc, 100.0*x.mass_r[2]/ms, 100.0*x.skip_r[3]/nc, 100.0*x.mass_r[3]/ms,
+            100.0*x.skip_w[0]/nc, 100.0*x.mass_w[0]/ms, 100.0*x.skip_w[1]/nc, 100.0*x.mass_w[1]/ms);
+    x = llama_moe_bridge::xstats();
+}
+
+// [TAG_FN_L22_X_STATS] one job: its cold experts (not in the hot table; no table: every expert), and what the rank rule
+// (smallest rank over the window >= R) and the weight rule (largest weight < w) would drop. Counters only.
+static void br_xstats_job(llama_moe_bridge * br, llama_moe_bridge::chan & c, const int32_t * tbl, int32_t miss,
+        const ggml_moe_bridge_job * j) {
+    const int     T     = j->n_tokens;
+    const int     n_use = j->n_used;
+    const int64_t n_exp = c.up->ne[2];
+    if (c.xs_minr.size() != (size_t) n_exp) {
+        c.xs_minr.assign((size_t) n_exp, 255);
+        c.xs_maxw.assign((size_t) n_exp, 0.0f);
+        c.xs_sumw.assign((size_t) n_exp, 0.0f);
+    }
+    c.xs_list.clear();
+    double mass = 0.0;
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < n_use; ++i) {
+            const int32_t e = j->ids[t*n_use + i];
+            const float   w = j->w ? j->w[t*n_use + i] : 0.0f;
+            mass += w;
+            if (e < 0 || e >= n_exp || (tbl != nullptr && tbl[e] != miss)) {
+                continue;
+            }
+            if (c.xs_minr[e] == 255) {
+                c.xs_list.push_back(e);
+                c.xs_maxw[e] = w;
+                c.xs_sumw[e] = 0.0f;
+            }
+            c.xs_minr[e]  = (uint8_t) std::min<int>(c.xs_minr[e], std::min(i, 254));
+            c.xs_maxw[e]  = std::max(c.xs_maxw[e], w);
+            c.xs_sumw[e] += w;
+        }
+    }
+    auto & x = br->xs;
+    static const float k_w[2] = { 0.05f, 0.1f };
+    for (const int32_t e : c.xs_list) {
+        for (int r = 0; r < 4; ++r) {
+            if (c.xs_minr[e] >= 6 + r) {
+                x.skip_r[r]++;
+                x.mass_r[r] += c.xs_sumw[e];
+            }
+        }
+        for (int k = 0; k < 2; ++k) {
+            if (j->w && c.xs_maxw[e] < k_w[k]) {
+                x.skip_w[k]++;
+                x.mass_w[k] += c.xs_sumw[e];
+            }
+        }
+        c.xs_minr[e] = 255;
+    }
+    x.jobs++;
+    x.tokens += (uint64_t) T;
+    x.cold   += (uint64_t) c.xs_list.size();
+    x.mass   += mass;
+    if (x.jobs >= 4096) {
+        br_xstats_flush(br, "4096 jobs");
+    }
 }
 
 // the job on the CPU MoE pool: runs on the executor thread (spin) or the driver's callback thread (hostfunc)
@@ -513,7 +614,14 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         br->disp_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t_take).count(), std::memory_order_relaxed);
         br->n_disp.fetch_add(1, std::memory_order_relaxed);
     }
-    const ggml_cpu_moe_job job = { layer, j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+    ggml_cpu_moe_job job = { layer, j->n_tokens, j->n_used, j->x, j->ids, j->w, j->out };
+    if ((j->flags & GGML_MOE_BRIDGE_JOB_TAIL) && (br->tail_rank > 0 || br->tail_w > 0.0f)) {
+        // [TAG_FN_L22_X_TAILSKIP] the graph flagged a decode window: the pool drops the tail of its cold experts (the
+        // observer above saw every id, so the hot set learns as before)
+        job.tail_rank = (int8_t) br->tail_rank;
+        job.tail_w    = br->tail_w;
+        job.l22_flags = GGML_MOE_BRIDGE_JOB_TAIL;
+    }
     const bool hold = br->fill_gap && br->dma_on; // [TAG_FN_L3_CPU_FILL] the ring fills wait while the pool reads DRAM
     if (hold) {
         llama_moe_dma_bridge_hold(true);
@@ -568,6 +676,10 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
             llama_fn_dmashare_job_done(br, j->chan, j->seq, (uint64_t) ns, n_cpu); // [TAG_FN_L22_DMASHARE] R-P14-3 (a)
         }
     }
+    if (br->xs_on && ok) { // [TAG_FN_L22_X_STATS] over the hot table (the DMA share's fetched experts count as cold)
+        const bool tbl = (j->flags & GGML_MOE_BRIDGE_JOB_TABLE) && c.tbl_ok;
+        br_xstats_job(br, c, tbl ? c.layer_tbl.table : nullptr, tbl ? c.layer_tbl.table_miss : 0, j);
+    }
     return ok;
 }
 
@@ -621,6 +733,16 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
             return;
         }
         br->n_hint_ok.fetch_add(1, std::memory_order_relaxed);
+        if (br->tail_pf && br->tail_rank > 0 && k > br->tail_rank && (j.flags & GGML_MOE_BRIDGE_JOB_TAIL)) {
+            // [TAG_FN_L22_X_TAILSKIP] _PF: the ranks the tail rule drops are not worth a pull (in place: row t moves down)
+            const int kr = br->tail_rank;
+            for (int tt = 0; tt < t; ++tt) {
+                for (int r = 0; r < kr; ++r) {
+                    ids[tt*kr + r] = ids[tt*k + r];
+                }
+            }
+            k = kr;
+        }
         ggml_cpu_moe_prefetch_job pj = {};
         pj.layer    = lay;
         pj.n_tokens = t;
@@ -630,7 +752,9 @@ static void br_prefetch_next(llama_moe_bridge * br, ggml_cpu_moe_pool * pool, co
         br->pool_pf(pool, &pj);
         return;
     }
-    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, br->pf_k, br->pf_mode, nullptr };
+    // [TAG_FN_L22_X_TAILSKIP] _PF: no pull for the ranks the tail rule drops
+    const int k_pf = br->tail_pf && br->tail_rank > 0 && (j.flags & GGML_MOE_BRIDGE_JOB_TAIL) ? std::min(br->pf_k, br->tail_rank) : br->pf_k;
+    const ggml_cpu_moe_prefetch_job pj = { lay, br->pf_router[nc].data(), j.n_tokens, j.x, k_pf, br->pf_mode, nullptr };
     br->pool_pf(pool, &pj);
 }
 
@@ -732,6 +856,9 @@ static void br_exec_main(llama_moe_bridge * br) {
         if (st_on && !st_slept) { // [TAG_FN_L18_FIRSTANS_STALL] the first sleep after work
             st_slept = true;
             llama_fn_stall_mark("bridge executor sleeps (parked)", br->parked.load(std::memory_order_relaxed) ? 1 : 0);
+        }
+        if (br->xs_on && br->xs.jobs > 0 && std::chrono::steady_clock::now() - last > std::chrono::milliseconds(500)) {
+            br_xstats_flush(br, "idle"); // [TAG_FN_L22_X_STATS]
         }
         std::unique_lock<std::mutex> lk(br->mtx);
         const uint32_t wg_sleep = br->wake_gen.load(std::memory_order_seq_cst);
@@ -997,6 +1124,36 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         br->hint_wait_us = std::min(1000, std::max(0, env_int("LLAMA_MOE_BRIDGE_PF_DEV_WAIT_US", 50)));
     }
 
+    // [TAG_FN_L22_POOL_STAGGER] [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] round 22, CPU pool (qwen4exp only; the same values)
+    int  l22_stagger = 0;
+    bool l22_pt      = false;
+    int  l22_pt_cpu  = -1;
+    int  l22_jobpf   = 0;
+    {
+        const int  stag = std::min(16, std::max(0, env_int("LLAMA_MOE_POOL_STAGGER", 0)));
+        const bool pt   = env_int("LLAMA_MOE_POOL_PRETOUCH", 0) > 0;
+        const int  ptc  = env_int("LLAMA_MOE_POOL_PRETOUCH_CPU", -1);
+        const int  jpf  = std::min(2, std::max(0, env_int("LLAMA_MOE_POOL_JOBPF", 0)));
+        if (model.arch == LLM_ARCH_QWEN4EXP) {
+            l22_stagger = stag;
+            l22_pt      = pt;
+            l22_pt_cpu  = ptc >= 0 && ptc < GGML_MAX_N_THREADS ? ptc : -1;
+            l22_jobpf   = jpf;
+        } else if (stag > 0 || pt || jpf > 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_POOL_STAGGER / _PRETOUCH / _JOBPF act on qwen4exp only: ignored\n", __func__);
+        }
+    }
+    // [TAG_FN_L22_X_STATS] [TAG_FN_L22_X_TAILSKIP] (lookups, qwen4exp only)
+    // R as the graph reads it (llama_fn_l22_x_read: the graph flags a window only with R > 0; R >= n_used = the weight rule
+    // alone)
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        br->xs_on     = llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_X_STATS"));
+        br->tail_rank = std::min(100, std::max(0, (int) llama_fn_l22_x_read(&model).tailskip));
+        const char * tw = llama_fn_env(model, "LLAMA_FN_L22_X_TAILSKIP_W");
+        br->tail_w    = br->tail_rank > 0 && tw && tw[0] ? std::min(1.0f, std::max(0.0f, (float) atof(tw))) : 0.0f;
+        br->tail_pf   = br->tail_rank > 0 && llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_X_TAILSKIP_PF"));
+    }
+
     const int n_pool = std::max(1, env_int("LLAMA_MOE_BRIDGE_THREADS", n_threads > 0 ? n_threads : 1));
     br->pool_params = br->pool_params_default(std::min(n_pool, GGML_MAX_N_THREADS));
     br->pool_params.prio    = std::min(3, std::max(0, env_int("LLAMA_MOE_BRIDGE_PRIO", GGML_SCHED_PRIO_HIGH)));
@@ -1019,6 +1176,23 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
                 "before): a thread of a higher priority on its CPU no longer holds a job's barrier\n", __func__);
     }
     br->hint_fused              = llama_fn_l3_flag(model, "LLAMA_FN_L9_HINTTOPK"); // [TAG_FN_L9_HINTTOPK] qwen4exp only
+    br->pool_params.stagger       = l22_stagger;                    // [TAG_FN_L22_POOL_STAGGER]
+    br->pool_params.pretouch      = l22_pt;                         // [TAG_FN_L22_PRETOUCH]
+    br->pool_params.pretouch_cpu1 = l22_pt_cpu + 1;
+    br->pool_params.jobpf         = l22_jobpf;                      // [TAG_FN_L22_JOBPF]
+    br->pool_params.tail_rank     = br->tail_rank;                  // [TAG_FN_L22_X_TAILSKIP] the sync op's rule
+    br->pool_params.tail_w        = br->tail_w;
+    if (l22_stagger > 0 && br->pool_split == 0) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_POOL_STAGGER] LLAMA_MOE_POOL_STAGGER needs LLAMA_MOE_POOL_SPLIT=stable|steal: no effect\n", __func__);
+    }
+    if (br->tail_rank > 0 || br->tail_w > 0.0f) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_X_TAILSKIP] decode windows the graph flags drop cold experts of rank >= %d (weight rule "
+                "< %.3f: %s), no renormalization; prefetch of dropped ranks %s. CHANGES ANSWERS\n", __func__, br->tail_rank,
+                br->tail_w, br->tail_w > 0.0f ? "on" : "off", br->tail_pf ? "off" : "on");
+    }
+    if (br->xs_on) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_X_STATS] the rank and weight rules' shares every 4096 jobs and at idle (counters only)\n", __func__);
+    }
     if (br->pool_params.pf_fresh) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L6_PF] the prefetch pulls only experts a CPU job read within the last %d jobs\n", __func__,
                 br->pool_params.pf_fresh);
@@ -1038,6 +1212,10 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     if (br->pool_params.dflow) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L4_MEM_POOLBAR] pool jobs without barriers: a down piece waits for its expert's gate / up "
                 "pieces, the thread that ends a block of down rows sums it\n", __func__);
+    }
+    if (l22_pt || l22_jobpf > 0) { // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] the totals line
+        br->pool_get_stats = (pool_get_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_get_stats");
+        br->l22_pool_line  = br->pool_get_stats != nullptr;
     }
     if (br->pool_stats) {
         br->pool_get_stats = (pool_get_stats_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_moe_pool_get_stats");
@@ -1809,6 +1987,17 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                         "by the next post, %.3f MiB each\n", __func__, br->bid, cc, cc ? 100.0*cs/cc : 0.0, cc ? cb/1048576.0/cc : 0.0);
             }
         }
+    }
+    if (br->l22_pool_line && br->pool && br->n_graphs % 4096 == 0) { // [TAG_FN_L22_PRETOUCH] [TAG_FN_L22_JOBPF] totals
+        ggml_cpu_moe_pool_stats ps;
+        br->pool_get_stats(br->pool, &ps, false);
+        LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L22_PRETOUCH] %" PRIu64 " experts queued (%" PRIu64 " dropped), %" PRIu64 " touched, "
+                "%.0f pages and %.1f us each, %.2f process faults each while touching; [TAG_FN_L22_JOBPF] %" PRIu64 " read-ahead "
+                "requests, %.1f ranges / %.2f MiB / %.1f us each, %" PRIu64 " refused\n", __func__, br->bid, ps.pt_queued, ps.pt_dropped,
+                ps.pt_experts, ps.pt_experts ? (double) ps.pt_pages/ps.pt_experts : 0.0, ps.pt_experts ? 1e3*ps.pt_ms/ps.pt_experts : 0.0,
+                ps.pt_experts ? (double) ps.pt_faults/ps.pt_experts : 0.0, ps.jpf_calls,
+                ps.jpf_calls ? (double) ps.jpf_ranges/ps.jpf_calls : 0.0, ps.jpf_calls ? ps.jpf_mib/ps.jpf_calls : 0.0,
+                ps.jpf_calls ? 1e3*ps.jpf_ms/ps.jpf_calls : 0.0, ps.jpf_fail);
     }
     if (br->pool_stats && br->pool && br->n_graphs % 256 == 0) {
         // [TAG_FN_L3_CPU_STATS] the window since the last line (the pool resets with the read)
