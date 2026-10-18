@@ -15,6 +15,21 @@
 #include <cstring>
 #include <vector>
 
+// [TAG_FN_L22_SCHEDBUF] debug lines of the scheduler's growth paths, counted per run
+static int g_grow_ctx = 0;
+static int g_grow_ids = 0;
+
+static void log_cb(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    (void) user_data;
+    if (strstr(text, "[TAG_FN_L22_SCHEDBUF] context buffer") != nullptr) {
+        g_grow_ctx++;
+    }
+    if (strstr(text, "[TAG_FN_L22_SCHEDBUF] backend id arrays") != nullptr) {
+        g_grow_ids++;
+    }
+}
+
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
     _putenv_s(name, value ? value : "");
@@ -271,6 +286,7 @@ static bool run_chain(const char * splits_env, std::vector<float> & out, int * n
 
 int main() {
     int n_fail = 0;
+    ggml_log_set(log_cb, nullptr);
 
     std::vector<float> ref(N_ELEM);
     for (int64_t k = 0; k < N_ELEM; ++k) {
@@ -285,7 +301,9 @@ int main() {
     std::vector<float> out_off, out_on, out_big;
     int splits_off = 0, splits_on = 0, splits_big = 0;
     const bool ok_off = run_chain(nullptr, out_off, &splits_off);
+    const int  grow_off = g_grow_ctx + g_grow_ids;
     const bool ok_on  = run_chain("8", out_on, &splits_on);
+    const int  grow_ctx_on = g_grow_ctx, grow_ids_on = g_grow_ids;
     const bool ok_big = run_chain("4096", out_big, &splits_big);
 
     const auto check = [&](const char * what, bool cond) {
@@ -296,6 +314,8 @@ int main() {
     check("chain runs with GGML_SCHED_FN_L22_SPLITS=8 (grows)", ok_on);
     check("chain runs with GGML_SCHED_FN_L22_SPLITS=4096", ok_big);
     check("thousands of splits", splits_off >= N_NODES/2 && splits_on == splits_off && splits_big == splits_off);
+    check("no growth without the switch", grow_off == 0);
+    check("SPLITS=8 grew the context buffer and the id arrays", grow_ctx_on >= 1 && grow_ids_on >= 1);
     if (ok_off && ok_on && ok_big) {
         check("SPLITS=8 equals the run without the switch (bits)", memcmp(out_on.data(), out_off.data(), N_ELEM*sizeof(float)) == 0);
         check("SPLITS=4096 equals the run without the switch (bits)", memcmp(out_big.data(), out_off.data(), N_ELEM*sizeof(float)) == 0);
