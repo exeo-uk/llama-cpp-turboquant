@@ -217,9 +217,9 @@ std::vector<float> run_pool(const weights & W, const routing & r, const int32_t 
     if (cfg.pretouch || cfg.jobpf > 0) {
         ggml_cpu_moe_pool_stats st;
         ggml_cpu_moe_pool_get_stats(pool, &st, false);
-        if (cfg.jobpf > 0) {
-            TCHECK(st.jpf_calls >= 1 && st.jpf_fail == 0, "jobpf calls %llu fail %llu", (unsigned long long) st.jpf_calls,
-                    (unsigned long long) st.jpf_fail);
+        if (cfg.jobpf > 0) { // the weights here are heap memory: the OS may refuse the read-ahead, the job must not care
+            TCHECK(st.jpf_calls >= 1 && st.jpf_ranges >= 3*st.jpf_calls, "jobpf calls %llu ranges %llu", (unsigned long long) st.jpf_calls,
+                    (unsigned long long) st.jpf_ranges);
         }
         if (cfg.pretouch) {
             TCHECK(st.pt_queued >= 1, "pretouch queued %llu", (unsigned long long) st.pt_queued);
