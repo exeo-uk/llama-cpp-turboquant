@@ -4,6 +4,8 @@
 #include "log.h"
 #include "llama.h"
 
+#include "../../src/llama-ext.h" // [TAG_FN_L22_PPL_PHASE] llama_set_decode_phase_ext
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -575,6 +577,109 @@ static int ppl_batch_len(int j, int n_batch, int first, int n_ctx, int tail) {
     return n;
 }
 
+// [TAG_FN_L22_PPL_PHASE] --fn-decode-phase gen|prompt (this tool's own option, taken out of argv before
+// common_params_parse; env LLAMA_PPL_FN_PHASE as the fallback). gen: the decode-phase flag is GEN before every decode of
+// the sparse base writer and the sparse KLD (not the decoys), so the answer-changing X levers act in their all-output
+// ubatches (-ub 3 / LLAMA_PPL_TAIL_BATCH=3 = verify-shaped graphs); rows that are not outputs keep fn_gen 0 anyway.
+static int32_t g_ppl_phase = LLAMA_FN_PHASE_PROMPT;
+
+// [TAG_FN_L22_PPL_RETRY] decode retries of the sparse paths: count and seconds spent replaying
+static int    g_ppl_retries = 0;
+static double g_ppl_retry_s = 0.0;
+
+static int32_t ppl_decode(llama_context * ctx, llama_batch & batch) {
+    if (g_ppl_phase == LLAMA_FN_PHASE_GEN) {
+        llama_set_decode_phase_ext(ctx, LLAMA_FN_PHASE_GEN);
+    }
+    return llama_decode(ctx, batch);
+}
+
+// the batch of chunk tokens [j, j + n), the scored positions as outputs (pos_out gets them)
+static void ppl_fill_batch(llama_batch & batch, const llama_token * toks, int j, int n, int first, int stride, int n_ctx,
+        bool add_bos, const llama_vocab * vocab, std::vector<int> & pos_out) {
+    common_batch_clear(batch);
+    pos_out.clear();
+    for (int i = 0; i < n; ++i) {
+        const int  pos    = j + i;
+        const bool scored = pos >= first && pos <= n_ctx - 2 && (pos - first) % stride == 0;
+        common_batch_add(batch, add_bos && pos == 0 ? llama_vocab_bos(vocab) : toks[pos], pos, { 0 }, scored);
+        if (scored) {
+            pos_out.push_back(pos);
+        }
+    }
+}
+
+// [TAG_FN_L22_PPL_RETRY] llama_decode of the chunk's batch at j_fail returned -3: a bridge wait timeout that the context
+// could not roll back itself (LLAMA_MOE_BRIDGE_RB=0: the recurrent state already advanced), so the run used to abort
+// (16 of 28 KLD runs on 10-13). Reset the memory as the chunk start does (clear_all: llama_memory_clear, else seq 0 only,
+// as with decoys), replay the chunk's batches before j_fail with the same lengths, outputs and phase (logits ignored,
+// nothing scored twice), then decode the failed batch again. The bridge pauses after a failure and its sync op gives the
+// bridged values ([TAG_FN_R2_BRIDGE_SYNC]), so the scores are the same. On true the batch holds [j_fail, j_fail + n_fail)
+// decoded and pos_out its scored positions. LLAMA_PPL_DECODE_RETRY = retries per chunk (default 2, 0 = abort as before).
+static bool ppl_recover(llama_context * ctx, llama_batch & batch, const llama_token * toks, int c, int j_fail, int n_fail,
+        int n_batch, int first, int stride, int n_ctx, int tail_b, bool add_bos, const llama_vocab * vocab, bool clear_all,
+        int & retries_chunk, std::vector<int> & pos_out) {
+    static const int budget = std::max(0, ppl_env_int("LLAMA_PPL_DECODE_RETRY", 2));
+    std::vector<int> pos_scratch;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    auto spent = [&]() {
+        g_ppl_retry_s += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    };
+    while (true) {
+        if (retries_chunk >= budget) {
+            LOG_ERR("%s: [TAG_FN_L22_PPL_RETRY] chunk %d: llama_decode failed at position %d and the %d retries of "
+                    "LLAMA_PPL_DECODE_RETRY are spent\n", __func__, c, j_fail, budget);
+            spent();
+            return false;
+        }
+        retries_chunk++;
+        g_ppl_retries++;
+        int n_rep = 0;
+        for (int j = 0, n = 0; j < j_fail; j += n) {
+            n = ppl_batch_len(j, n_batch, first, n_ctx, tail_b);
+            n_rep++;
+        }
+        LOG_WRN("%s: [TAG_FN_L22_PPL_RETRY] chunk %d: llama_decode failed (ret -3, a bridge wait timeout) at position %d: "
+                "replaying %d batches (%d tokens) and decoding it again (retry %d of %d)\n", __func__, c, j_fail, n_rep,
+                j_fail, retries_chunk, budget);
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (clear_all) {
+            llama_memory_clear(mem, true);
+        } else {
+            llama_memory_seq_rm(mem, 0, -1, -1);
+        }
+        int32_t ret = 0;
+        for (int j = 0, n = 0; j < j_fail; j += n) {
+            n = ppl_batch_len(j, n_batch, first, n_ctx, tail_b);
+            ppl_fill_batch(batch, toks, j, n, first, stride, n_ctx, add_bos, vocab, pos_scratch);
+            ret = ppl_decode(ctx, batch);
+            if (ret != 0) {
+                break;
+            }
+        }
+        if (ret == 0) {
+            ppl_fill_batch(batch, toks, j_fail, n_fail, first, stride, n_ctx, add_bos, vocab, pos_out);
+            ret = ppl_decode(ctx, batch);
+        }
+        if (ret == 0) {
+            spent();
+            return true;
+        }
+        if (ret != -3) {
+            LOG_ERR("%s: [TAG_FN_L22_PPL_RETRY] chunk %d: the replay failed with ret %d\n", __func__, c, ret);
+            spent();
+            return false;
+        }
+    }
+}
+
+// the end line of a run with retries (none = no line, the output as before)
+static void ppl_retry_report() {
+    if (g_ppl_retries > 0) {
+        LOG("decode retries: %d (replay %.1f s; the eval time includes it) [TAG_FN_L22_PPL_RETRY]\n", g_ppl_retries, g_ppl_retry_s);
+    }
+}
+
 // Sparse streaming base writer: env LLAMA_PPL_SPARSE_K=K with --kl-divergence-base and without --kl-divergence. Only the
 // scored positions p = first, first + stride, ... <= n_ctx - 2 get logits (LLAMA_PPL_SCORE_FIRST, default n_ctx/2;
 // LLAMA_PPL_SCORE_STRIDE, default 1); each batch's rows are appended to the file, no n_ctx x n_vocab buffer.
@@ -671,19 +776,13 @@ static results_perplexity perplexity_sparse_base(llama_context * ctx, const comm
         llama_memory_clear(llama_get_memory(ctx), true);
 
         const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
+        int retries_chunk = 0; // [TAG_FN_L22_PPL_RETRY]
         for (int j = 0, n = 0; j < n_ctx; j += n) {
             n = ppl_batch_len(j, n_batch, first, n_ctx, tail_b);
-            common_batch_clear(batch);
-            pos_out.clear();
-            for (int i = 0; i < n; ++i) {
-                const int  pos    = j + i;
-                const bool scored = pos >= first && pos <= n_ctx - 2 && (pos - first) % stride == 0;
-                common_batch_add(batch, add_bos && pos == 0 ? llama_vocab_bos(vocab) : toks[pos], pos, { 0 }, scored);
-                if (scored) {
-                    pos_out.push_back(pos);
-                }
-            }
-            if (llama_decode(ctx, batch)) {
+            ppl_fill_batch(batch, toks, j, n, first, stride, n_ctx, add_bos, vocab, pos_out);
+            const int32_t ret = ppl_decode(ctx, batch);
+            if (ret != 0 && !(ret == -3 && ppl_recover(ctx, batch, toks, c, j, n, n_batch, first, stride, n_ctx, tail_b, add_bos,
+                                                       vocab, true, retries_chunk, pos_out))) {
                 LOG_ERR("%s: failed to decode\n", __func__);
                 llama_batch_free(batch);
                 return fail();
@@ -729,6 +828,7 @@ static results_perplexity perplexity_sparse_base(llama_context * ctx, const comm
     }
 
     const double ppl = std::exp(nll/count);
+    ppl_retry_report(); // [TAG_FN_L22_PPL_RETRY]
     LOG_INF("Final estimate: PPL = %.4lf (sparse base, %zu scored tokens)\n", ppl, count);
 
     return {tokens, ppl, {}, {}};
@@ -2379,19 +2479,13 @@ static void kl_divergence_sparse(llama_context * ctx, const common_params & para
 
         const llama_token * toks = tokens.data() + size_t(c)*n_ctx;
         int r0 = 0;
+        int retries_chunk = 0; // [TAG_FN_L22_PPL_RETRY]
         for (int j = 0, n = 0; j < (int) n_ctx; j += n) {
             n = ppl_batch_len(j, n_batch, first, (int) n_ctx, tail_b);
-            common_batch_clear(batch);
-            pos_out.clear();
-            for (int i = 0; i < n; ++i) {
-                const int  pos    = j + i;
-                const bool scored = pos >= first && pos <= (int) n_ctx - 2 && (pos - first) % stride == 0;
-                common_batch_add(batch, add_bos && pos == 0 ? llama_vocab_bos(vocab) : toks[pos], pos, { 0 }, scored);
-                if (scored) {
-                    pos_out.push_back(pos);
-                }
-            }
-            if (llama_decode(ctx, batch)) {
+            ppl_fill_batch(batch, toks, j, n, first, stride, (int) n_ctx, add_bos, vocab, pos_out);
+            const int32_t ret = ppl_decode(ctx, batch);
+            if (ret != 0 && !(ret == -3 && ppl_recover(ctx, batch, toks, c, j, n, n_batch, first, stride, (int) n_ctx, tail_b,
+                                                       add_bos, vocab, n_decoys <= 0, retries_chunk, pos_out))) {
                 LOG_ERR("%s : failed to decode\n", __func__);
                 llama_batch_free(batch);
                 return;
@@ -2446,6 +2540,8 @@ static void kl_divergence_sparse(llama_context * ctx, const common_params & para
 
     kld_dump_write(n_chunk, n_scored, first, stride, 1 | ((flags_f & 1) ? 2 : 0) | (n_decoys > 0 ? 4 : 0), kld_values, p_diff_values,
             nll_values, nll_base_values, same_top_values);
+
+    ppl_retry_report(); // [TAG_FN_L22_PPL_RETRY]
 
     kld_print_summary(kld, kld_values, p_diff_values);
 }
@@ -2814,8 +2910,43 @@ int llama_perplexity(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
+    // [TAG_FN_L22_PPL_PHASE] --fn-decode-phase gen|prompt is this tool's own option: taken out before common_params_parse
+    std::string         phase_arg;
+    std::vector<char *> args;
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--fn-decode-phase") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("%s: --fn-decode-phase needs a value: gen or prompt\n", __func__);
+                return 1;
+            }
+            phase_arg = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--fn-decode-phase=", 18) == 0) {
+            phase_arg = argv[i] + 18;
+            continue;
+        }
+        args.push_back(argv[i]);
+    }
+    if (phase_arg.empty()) {
+        const char * e = getenv("LLAMA_PPL_FN_PHASE");
+        phase_arg = e ? e : "";
+    }
+    if (phase_arg == "gen") {
+        g_ppl_phase = LLAMA_FN_PHASE_GEN;
+    } else if (!phase_arg.empty() && phase_arg != "prompt") {
+        LOG_ERR("%s: --fn-decode-phase / LLAMA_PPL_FN_PHASE: '%s' is not gen or prompt\n", __func__, phase_arg.c_str());
         return 1;
+    }
+    const int argc_rest = (int) args.size();
+    args.push_back(nullptr);
+
+    if (!common_params_parse(argc_rest, args.data(), params, LLAMA_EXAMPLE_PERPLEXITY)) {
+        return 1;
+    }
+    if (g_ppl_phase == LLAMA_FN_PHASE_GEN) {
+        LOG_INF("%s: [TAG_FN_L22_PPL_PHASE] decode phase GEN before every decode of the sparse base writer and the sparse KLD "
+                "(the X levers act in all-output ubatches; the other modes ignore it)\n", __func__);
     }
 
     const int32_t n_ctx = params.n_ctx;
