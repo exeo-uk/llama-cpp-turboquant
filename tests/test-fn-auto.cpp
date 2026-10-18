@@ -9,9 +9,11 @@
 #include "ggml-cpu.h"
 
 #include "../src/llama-fn-auto.h"
+#include "../src/llama-fn-l22.h" // [TAG_FN_L22_P10] llama_fn_l22_offload_min
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -757,6 +759,169 @@ static void test_ram_fit() {
     TCHECK(o.over && o.cache_ram_mib == 0, "less than 256 MiB left: prompt cache off (%lld)", (long long) o.cache_ram_mib);
 }
 
+// [TAG_FN_L22_P10] round 22 package P10: stagers, the prompt cost model, the crossover, the ubatch planner, the 1-sequence
+// 16K reserve rule, the SMALLKEEP headroom rule
+static void test_l22_p10() {
+    // stagers switch and formula
+    TCHECK(llama_fn_l22_stagers_mode(nullptr) == 0 && llama_fn_l22_stagers_mode("") == 0 && llama_fn_l22_stagers_mode("0") == 0 &&
+           llama_fn_l22_stagers_mode("off") == 0, "stagers unset / 0 / off -> 0");
+    TCHECK(llama_fn_l22_stagers_mode("auto") == -1 && llama_fn_l22_stagers_mode("AUTO") == -1 && llama_fn_l22_stagers_mode("1") == -1,
+           "stagers auto / 1 -> formula");
+    TCHECK(llama_fn_l22_stagers_mode("6") == 6 && llama_fn_l22_stagers_mode("x") == 0 && llama_fn_l22_stagers_mode("200") == 64,
+           "stagers fixed n, junk off, at most 64");
+    TCHECK(llama_fn_l22_stagers(0, 0, 16, 4) == 16, "no host bytes -> n_max");
+    TCHECK(llama_fn_l22_stagers(1000, 1000, 16, 4) == 16, "all staged -> 16");
+    TCHECK(llama_fn_l22_stagers(0, 1000, 16, 4) == 4, "nothing staged -> 4");
+    TCHECK(llama_fn_l22_stagers(500, 1000, 16, 4) == 8, "half staged -> 8");
+    TCHECK(llama_fn_l22_stagers(1000, 1000, 8, 4) == 8 && llama_fn_l22_stagers(10, 1000, 8, 4) == 4 &&
+           llama_fn_l22_stagers(500, 1000, 8, 4) == 4, "n_max 8: 4..8");
+    TCHECK(llama_fn_l22_stagers(530, 1000, 16, 4) == 8 && llama_fn_l22_stagers(550, 1000, 16, 4) == 9, "rounding");
+    TCHECK(llama_fn_l22_stagers(2000, 1000, 16, 4) == 16 && llama_fn_l22_stagers(500, 1000, 16, 32) == 16, "staged > host, n_min > n_max");
+
+    // depth buckets
+    TCHECK(llama_fn_l22_depth_bucket(0) == 0 && llama_fn_l22_depth_bucket(16383) == 0 && llama_fn_l22_depth_bucket(16384) == 1 &&
+           llama_fn_l22_depth_bucket(65535) == 1 && llama_fn_l22_depth_bucket(65536) == 2 && llama_fn_l22_depth_bucket(163839) == 2 &&
+           llama_fn_l22_depth_bucket(163840) == 3 && llama_fn_l22_depth_bucket(262144) == 3, "bucket bounds 16K / 64K / 160K");
+
+    // cost model: priors, EWMA, clamp
+    llama_fn_l22_cost c;
+    llama_fn_l22_cost_init(c, false);
+    TCHECK(c.pass_ms[0] == 3400.0 && c.gpu_ms_row[3] == 0.42 && c.cpu_ms_row[2] == 4.55 && c.fix_ms == 240.0 && c.big_ms == 300.0 &&
+           !c.pinned, "unpinned priors");
+    llama_fn_l22_cost cp;
+    llama_fn_l22_cost_init(cp, true);
+    TCHECK(cp.pass_ms[1] == 1700.0 && cp.pinned, "pinned priors");
+    llama_fn_l22_cost_pass(c, 0, 1000, 4000.0, 3000.0); // copy-bound: first sample replaces the prior
+    TCHECK(std::fabs(c.pass_ms[0] - 4000.0) < 1e-9 && c.n_pass[0] == 1 && c.n_obs[0] == 1 && c.n_gpu[0] == 0, "first sample, < 2048 rows no gpu");
+    llama_fn_l22_cost_pass(c, 0, 1000, 2000.0, 1500.0);
+    TCHECK(std::fabs(c.pass_ms[0] - 3500.0) < 1e-9, "EWMA alpha 0.25 (%.1f)", c.pass_ms[0]);
+    llama_fn_l22_cost_pass(c, 0, 1000, 3500.0, 3000.0);
+    TCHECK(c.n_pass[0] == 3, "three samples");
+    llama_fn_l22_cost_pass(c, 0, 1000, 14000.0, 13000.0); // a stall: clamped to 2x
+    TCHECK(std::fabs(c.pass_ms[0] - (3500.0 + 0.25*3500.0)) < 1e-9, "outlier clamped to 2x after 3 samples (%.1f)", c.pass_ms[0]);
+    llama_fn_l22_cost c2;
+    llama_fn_l22_cost_init(c2, false);
+    llama_fn_l22_cost_pass(c2, 1, 8192, 3000.0, 10.0); // compute-bound: only lowers the copy estimate
+    TCHECK(c2.pass_ms[1] == 3000.0 && c2.n_pass[1] == 0 && c2.n_gpu[1] == 1 && std::fabs(c2.gpu_ms_row[1] - 2990.0/8192) < 1e-9,
+           "compute-bound pass: copy bound, gpu row sample");
+    llama_fn_l22_cost_pass(c2, 1, 8192, 3200.0, 10.0);
+    TCHECK(c2.pass_ms[1] == 3000.0, "a longer compute-bound pass leaves the copy estimate");
+    llama_fn_l22_cost_cpu(c2, 1, 100, 1000.0);
+    TCHECK(c2.n_cpu[1] == 0, "CPU samples below 128 rows are dropped");
+    llama_fn_l22_cost_cpu(c2, 1, 500, 2000.0);
+    TCHECK(c2.n_cpu[1] == 1 && c2.cpu_ms_row[1] == 4.0, "CPU sample");
+    llama_fn_l22_cost_fix(c2, 200.0, -1.0);
+    TCHECK(c2.fix_ms == 200.0 && c2.n_fix == 1 && c2.n_big == 0 && c2.big_ms == 300.0, "fix sample, no 16K period");
+    llama_fn_l22_cost_pass(c2, 7, 1000, 1.0, 1.0);
+    llama_fn_l22_cost_pass(c2, 1, 0, 1.0, 1.0);
+    TCHECK(c2.n_obs[1] == 2, "bad bucket / zero rows ignored");
+    llama_fn_l22_cost_repin(c2, true);
+    TCHECK(c2.pass_ms[1] == 1700.0 && c2.n_obs[1] == 0 && c2.n_cpu[1] == 1 && c2.pinned, "repin: copy cost from the prior");
+    TCHECK(llama_fn_l22_est_pass(c, 2, 1000) == 3400.0 && std::fabs(llama_fn_l22_est_pass(c, 2, 16384) - 16384*0.42) < 1e-6 &&
+           std::fabs(llama_fn_l22_est_cpu(c, 2, 100) - 455.0) < 1e-9, "estimates");
+
+    // crossover
+    llama_fn_l22_cost x;
+    llama_fn_l22_cost_init(x, false);
+    TCHECK(llama_fn_l22_xover(x, 0, 768, 384, 2048) == 768, "priors, no samples: 768 stays");
+    auto feed = [](llama_fn_l22_cost & k, int b, double pass, double cpu_row, int n) {
+        for (int i = 0; i < n; ++i) {
+            llama_fn_l22_cost_pass(k, b, 1000, pass, pass*0.8);
+            llama_fn_l22_cost_cpu(k, b, 400, cpu_row*400);
+        }
+    };
+    llama_fn_l22_cost x2 = x;
+    feed(x2, 0, 3400.0, 4.55, 2);
+    TCHECK(llama_fn_l22_xover(x2, 0, 768, 384, 2048) == 768, "two samples: no change");
+    feed(x2, 0, 3400.0, 4.55, 1);
+    const int32_t t_prior = llama_fn_l22_xover(x2, 0, 700, 384, 2048);
+    TCHECK(t_prior >= 795 && t_prior <= 805, "measured = priors: ~800 (%d)", t_prior);
+    TCHECK(llama_fn_l22_xover(x2, 0, 768, 384, 2048) == 768, "within 10 %% of 768: kept");
+    llama_fn_l22_cost xp;
+    llama_fn_l22_cost_init(xp, true);
+    feed(xp, 0, 1400.0, 4.55, 3);
+    TCHECK(llama_fn_l22_xover(xp, 0, 768, 384, 2048) == 384, "fast pinned passes: the 384 floor");
+    llama_fn_l22_cost xu;
+    llama_fn_l22_cost_init(xu, false);
+    feed(xu, 0, 5500.0, 4.55, 3);
+    const int32_t t_real = llama_fn_l22_xover(xu, 0, 768, 384, 2048);
+    TCHECK(t_real >= 1100 && t_real <= 1300, "unpinned real-use passes 5.5 s: 1,100-1,300 (%d)", t_real);
+    TCHECK(llama_fn_l22_xover(xu, 0, 768, 384, 768) == 768, "hi 768: never above");
+    TCHECK(llama_fn_l22_xover(xu, 1, 768, 384, 2048) == 768, "buckets are independent");
+    llama_fn_l22_cost xs;
+    llama_fn_l22_cost_init(xs, false);
+    feed(xs, 0, 20000.0, 4.55, 3);
+    TCHECK(llama_fn_l22_xover(xs, 0, 768, 384, 2048) == 2048, "a stream slower than any CPU path in range: hi");
+
+    // ubatch planner (priors unless noted)
+    llama_fn_l22_cost u;
+    llama_fn_l22_cost_init(u, false);
+    double e8 = -1.0, e16 = -1.0;
+    TCHECK(llama_fn_l22_ubplan(u, 0, 8192, 16384, 6000, 2000, 768, true, &e8, &e16) == 8192 && e8 == 0.0 && e16 == 0.0,
+           "R <= 8192: base, not priced");
+    TCHECK(llama_fn_l22_ubplan(u, 0, 8192, 16384, 10000, 0, 768, true, &e8, &e16) == 16384, "R 10,000 unpinned: 16K (%.0f vs %.0f)", e8, e16);
+    TCHECK(std::fabs(e8 - (8192*0.42 + 3400.0 + 240.0)) < 1e-6 && std::fabs(e16 - (10000*0.42 + 240.0 + 300.0)) < 1e-6,
+           "R 10,000 estimates");
+    llama_fn_l22_cost up;
+    llama_fn_l22_cost_init(up, true);
+    TCHECK(llama_fn_l22_ubplan(up, 0, 8192, 16384, 16000, 0, 768, true, &e8, &e16) == 8192, "R 16,000 pinned: 8K (%.0f vs %.0f)", e8, e16);
+    TCHECK(llama_fn_l22_ubplan(up, 0, 8192, 16384, 16384, 16384, 768, true, &e8, &e16) == 16384,
+           "R 32K pinned with the prior 16K extra: within 3 %%, today's 16K kept (%.0f vs %.0f)", e8, e16);
+    llama_fn_l22_cost_fix(up, -1.0, 1000.0);
+    TCHECK(llama_fn_l22_ubplan(up, 0, 8192, 16384, 16384, 16384, 768, true, &e8, &e16) == 8192,
+           "R 32K pinned, measured 16K extra 1 s: 8K (%.0f vs %.0f)", e8, e16);
+    llama_fn_l22_cost uu;
+    llama_fn_l22_cost_init(uu, false);
+    feed(uu, 0, 5500.0, 4.55, 3);
+    TCHECK(llama_fn_l22_ubplan(uu, 0, 8192, 16384, 16384, 16384, 768, true, &e8, &e16) == 16384, "R 32K unpinned 5.5 s: 16K");
+    TCHECK(llama_fn_l22_ubplan(uu, 0, 8192, 16384, 10000, 0, 768, false, &e8, &e16) == 8192 &&
+           llama_fn_l22_ubplan(uu, 0, 8192, 16384, 16384, 16384, 768, false, &e8, &e16) == 8192, "no borrow: base always");
+    llama_fn_l22_ubplan(u, 0, 8192, 16384, 8492, 0, 768, true, &e8, &e16);
+    TCHECK(std::fabs(e8 - (8192*0.42 + 300*4.55 + 240.0)) < 1e-6, "a rest below the crossover is priced as CPU path (%.1f)", e8);
+    llama_fn_l22_ubplan(u, 0, 8192, 16384, 8492, 0, 200, true, &e8, &e16);
+    TCHECK(std::fabs(e8 - (8192*0.42 + 3400.0 + 240.0)) < 1e-6, "a rest above it streams (%.1f)", e8);
+    // identity with today's rule where the planner does not price
+    bool same = true;
+    const uint32_t toks[]  = { 1, 31, 500, 8191, 8192, 8193, 12000, 16383, 16384 };
+    const int64_t  afters[] = { -1, 0, 100, 8191, 8192, 30000 };
+    for (uint32_t n : toks) {
+        for (int64_t a : afters) {
+            const uint32_t l21 = llama_fn_l21_full_width(8192, 16384, n, a);
+            const uint32_t pl  = llama_fn_l22_ubplan(u, 0, 8192, 16384, n, a, 768, true, nullptr, nullptr);
+            const int64_t  r   = (int64_t) n + a;
+            if ((a < 0 || r <= 8192) && pl != l21) {
+                same = false;
+            }
+        }
+    }
+    TCHECK(same, "unknown hint or a prompt within the base width: the l21 width");
+    TCHECK(llama_fn_l22_ubplan(u, 0, 0, 16384, 20000, 0, 768, true, nullptr, nullptr) == 16384 &&
+           llama_fn_l22_ubplan(u, 0, 16384, 16384, 20000, 0, 768, true, nullptr, nullptr) == 16384, "no base width: n_ubatch");
+
+    // BIGUB2: the 1-sequence 16K reserve, prompt sequences of a batch
+    TCHECK(llama_fn_l22_bigub2_ok(2, 4000u*MiB, 3000u*MiB) && llama_fn_l22_bigub2_ok(2, 3000u*MiB, 3000u*MiB), "2 slots, 1-seq 16K >= 2-seq 8K");
+    TCHECK(!llama_fn_l22_bigub2_ok(1, 4000u*MiB, 3000u*MiB) && !llama_fn_l22_bigub2_ok(2, 2999u*MiB, 3000u*MiB) &&
+           !llama_fn_l22_bigub2_ok(4, 0, 0), "1 slot / smaller / unknown: off");
+    const uint32_t rows_a[] = { 9000, 1, 3, 0 };
+    const uint32_t rows_b[] = { 9000, 4000, 2, 0 };
+    TCHECK(llama_fn_l22_prompt_seqs(rows_a, 4, 31) == 1 && llama_fn_l22_prompt_seqs(rows_b, 4, 31) == 2 &&
+           llama_fn_l22_prompt_seqs(rows_b, 4, 4000) == 1 && llama_fn_l22_prompt_seqs(nullptr, 4, 31) == 0, "prompt sequences");
+
+    // SMALLKEEP headroom
+    TCHECK(llama_fn_l22_smallkeep_fits(3000*MiB, 2000*MiB, 256*MiB, 512*MiB) && llama_fn_l22_smallkeep_fits(2768*MiB, 2000*MiB, 256*MiB, 512*MiB),
+           "fits: free >= full + pool + margin");
+    TCHECK(!llama_fn_l22_smallkeep_fits(2767*MiB, 2000*MiB, 256*MiB, 512*MiB), "one MiB short");
+    TCHECK(!llama_fn_l22_smallkeep_fits(SIZE_MAX, 0, 0, 0) && !llama_fn_l22_smallkeep_fits(SIZE_MAX, SIZE_MAX - 10, 100, 0) &&
+           llama_fn_l22_smallkeep_fits(SIZE_MAX, SIZE_MAX - 100, 50, 50), "unknown size, overflow");
+
+    // the PHOT rule's crossover
+    TCHECK(llama_fn_l22_offload_min() == 0, "offload minimum unset");
+    llama_fn_l22_offload_min_set(1100);
+    TCHECK(llama_fn_l22_offload_min() == 1100, "offload minimum set");
+    llama_fn_l22_offload_min_set(-5);
+    TCHECK(llama_fn_l22_offload_min() == 0, "offload minimum cleared");
+}
+
 int main() {
     // no ggml_backend_load_all(): the backends are linked in (GGML_BACKEND_DL=OFF); run with CUDA_VISIBLE_DEVICES=-1
     test_profile_names();
@@ -770,6 +935,7 @@ int main() {
     test_vram_fit();
     test_cbuf();
     test_ram_fit();
+    test_l22_p10(); // [TAG_FN_L22_P10]
 
     printf("test-fn-auto: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-fn-l22.h" // [TAG_FN_L22_PHASE]
+#include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10] llama_fn_l22_cost
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
@@ -639,6 +640,66 @@ private:
     void     l22_rec_begin();
     void     l22_rec_end();
     uint32_t graph_max_nodes_base(uint32_t n_tokens) const;
+
+    // [TAG_FN_L22_P10] round 22, package P10 (stream tuning + G3); every switch off unless set (plan 3.4), qwen4exp target only
+    struct l22_p10_cfg {
+        int  stagers   = 0;     // LLAMA_FN_L22_STAGERS: 0 off, -1 auto, n >= 2 fixed copy threads of the stream
+        int  xover     = 0;     // LLAMA_FN_L22_XOVER: 0 off, 1 the measured crossover, n >= 2 a fixed one
+        bool ubplan    = false; // LLAMA_FN_L22_UBPLAN: the FULL width of a prompt from the cost model
+        int  bigub2    = 0;     // LLAMA_FN_L22_BIGUB2: the 16K FULL reserve for one prompt sequence (2-slot servers)
+        int  smallkeep = 0;     // LLAMA_FN_L22_SMALLKEEP: 1 the SMALL scheduler kept through FULL periods, 2 its bytes in the tail
+        bool observe() const { return xover > 0 || ubplan; }
+    };
+    l22_p10_cfg       l22p;
+    llama_fn_l22_cost l22p_cost;            // [TAG_FN_L22_XOVER] [TAG_FN_L22_UBPLAN]
+    int32_t  l22p_xover_t     = 0;          // the crossover XOVER set (0: none, the stream's own minimum)
+    int64_t  l22p_xover_env   = 0;          // the stream's minimum at the start (0: no lending stream)
+    int      l22p_bucket      = 0;          // depth bucket of the running prompt
+    int64_t  l22p_depth       = 0;          // its first position
+    uint32_t l22p_prompt_seqs = 0;          // [TAG_FN_L22_BIGUB2] sequences of the running batch with more than cbuf_small_t rows
+    uint32_t l22p_nseq        = 0;          // sequences of the running batch
+    uint32_t l22p_passes      = 0;          // stream passes seen in the FULL period
+    bool     l22p_big         = false;      // the FULL period runs at the big width with the borrow out
+    double   l22p_big_ms      = 0.0;        // its borrow + unborrow host ms
+    int64_t  l22p_rows_plan   = 0;          // [TAG_FN_L22_UBPLAN] the rows the switch planned for (batch + hint)
+    double   l22p_est_base    = 0.0, l22p_est_big = 0.0;
+    const char * l22p_why     = "";
+    const char * l22p_src     = "prior";    // the crossover's source: prior / meas / fixed
+    int      l22p_stagers_seen = 0;         // [TAG_FN_L22_STAGERS] copy threads of the last pass
+    std::map<uint32_t, size_t> l22p_class_full; // [TAG_FN_L22_SMALLKEEP] measured FULL bytes per class width
+    uint64_t l22p_n_xover = 0, l22p_n_big = 0, l22p_n_base = 0, l22p_n_bg2_split = 0;
+    bool     l22p_bg2_on      = false;      // [TAG_FN_L22_BIGUB2] the big FULL reserve is made for one sequence
+    bool     l22p_bg2_force   = false;      // cbuf_prepare's 1-sequence probe
+    // [TAG_FN_L22_SMALLKEEP] the SMALL scheduler, its graphs and its expected sizes while a FULL period runs (parked)
+    ggml_backend_sched_ptr              l22_sk_sched;
+    std::array<llm_graph_result_ptr, 2> l22_sk_prev;
+    std::array<llm_graph_result_ptr, 4> l22_sk_width;
+    std::array<llm_graph_result_ptr, 4> l22_sk_noout;
+    llm_graph_result_ptr                l22_sk_reserve;
+    llm_graph_result *                  l22_sk_active  = nullptr;
+    std::vector<size_t>                 l22_sk_exp;
+    uint64_t                            l22_sk_hot_gen = 0;
+    size_t                              l22_sk_bytes   = 0;
+    bool     l22_sk_parked  = false;
+    bool     l22_sk_stale   = false; // a reserve ran outside the cbuf code while parked (adapters, embeddings, ...)
+    bool     l22_sk_in_cbuf = false;
+    int      l22_sk_last    = 0;     // the last FULL switch: 1 parked, 0 not (l22_sk_why)
+    const char * l22_sk_why = "";
+    uint64_t l22_sk_n_park = 0, l22_sk_n_swap = 0, l22_sk_n_drop = 0, l22_sk_n_nofit = 0;
+    void     l22p_init();
+    void     l22p_batch_scan();
+    void     l22p_period_begin();
+    void     l22p_xover_apply();
+    uint32_t l22p_plan_width(uint32_t n_tokens, int64_t after, bool vram_check);
+    void     l22p_observe(uint32_t rows, bool one_seq, double ms);
+    void     l22p_period_end();
+    void     l22p_offload_proc(int v);
+    int32_t  l22p_stream_min() const;
+    bool     l22_sk_park(ggml_backend_dev_t dev, size_t expect_full);
+    void     l22_sk_free_full();
+    void     l22_sk_swap_in(bool restored);
+    void     l22_sk_drop();
+
     bool     dft_set_wide(bool wide);
     llama_context * l20_draft() const;
     bool     cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool & restored, bool async_refill = false); // [TAG_FN_L22_ENDOVERLAP]

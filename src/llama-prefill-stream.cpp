@@ -19,6 +19,8 @@
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 #include "llama-fn-l22.h"    // [TAG_FN_L22_P4] pins, direct I/O, residency, PASSLOG
 #include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
+#include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10]
+#include "llama-fn-auto.h"    // [TAG_FN_L22_STAGERS] llama_fn_l22_stagers
 
 #include "llama-impl.h"
 #include "llama-mmap.h" // [TAG_FN_L15_PFSAHEAD]
@@ -38,6 +40,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdlib> // [TAG_FN_L22_STAGERS]
 #include <cstring>
 #include <deque>
 #include <map>
@@ -135,7 +138,9 @@ struct pfs_state {
     std::vector<ggml_backend_event_t> chunk_ev;
     std::vector<int>                  chunk_state; // 0 free, 1 staged (not dispatched), 2 dispatched; streamer only
     gen5::host_mem                    zeros;
-    gen5::copy_pool                   pool;
+    // [TAG_FN_L22_STAGERS] on the heap: a new thread count is a new pool (a restarted pool's workers would see the old
+    // job generation and run the last copy list again)
+    std::unique_ptr<gen5::copy_pool>  pool;
 
     std::thread             thr;
     std::mutex              mtx;
@@ -175,6 +180,18 @@ struct pfs_state {
     // [TAG_FN_L22_SSDTIER] direct I/O has read for the stream (1), refused before it ever read (-1), not tried (0): the
     // read-ahead leaves the direct-I/O experts out only once it has read, so a refusing reader costs no read-ahead
     std::atomic<int>        dio_state{0};
+
+    // [TAG_FN_L22_P10] round 22, package P10 (all off unless the context turned them on)
+    int            n_threads_max = 8;     // LLAMA_PREFILL_STREAM_THREADS: the pool at init
+    int            stagers_mode  = 0;     // [TAG_FN_L22_STAGERS] 0 off, -1 auto, n >= 2 fixed
+    double         stg_share     = -1.0;  // EWMA (alpha 0.5) of staged / host bytes per pass (-1: none since a pin change)
+    bool           stg_pin       = false; // pins were live at the last lend
+    uint64_t       stg_restarts  = 0;
+    int64_t        cur_rows      = 0;     // [TAG_FN_L22_XOVER] rows of the owner's running ubatch (its thread)
+    llama_pfs_pass last_pass;             // the last finished pass (under mtx)
+    uint64_t       pass_seq      = 0;     // under mtx
+    uint64_t       pass_read     = 0;     // under mtx
+    double         fix_ms        = 0.0;   // host ms of the lends and returns (the owner's thread)
 };
 
 pfs_state * g_pfs = nullptr;
@@ -617,7 +634,7 @@ void pfs_run(pfs_state * s) {
                     }
                 }
                 if (!segs.empty()) {
-                    s->pool.copy_list(segs.data(), (int) segs.size());
+                    s->pool->copy_list(segs.data(), (int) segs.size());
                 }
                 if (dio_tk >= 0) {
                     if (llama_fn_dio_wait(dio_tk)) {
@@ -631,7 +648,7 @@ void pfs_run(pfs_state * s) {
                         for (const auto & r : dio_req) {
                             segs.push_back({ (uint8_t *) r.dst, (const uint8_t *) r.src, r.len });
                         }
-                        s->pool.copy_list(segs.data(), (int) segs.size());
+                        s->pool->copy_list(segs.data(), (int) segs.size());
                     }
                 }
                 s->chunk_state[slot] = 1;
@@ -955,6 +972,24 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         if (B.holds == L->pos) {
             B.consumed = true;
         }
+        // [TAG_FN_L22_XOVER] [TAG_FN_L22_STAGERS] the pass ends at its last layer's release
+        if (L->pos == (int) s->layers.size() - 1) {
+            llama_pfs_pass & p = s->last_pass;
+            p.seq      = ++s->pass_seq;
+            p.rows     = (uint32_t) std::max<int64_t>(0, s->cur_rows);
+            p.wall_ms  = (ggml_time_us() - s->t_ub0)/1e3;
+            p.wait_ms  = s->ub_wait*1e3;
+            p.b_host   = s->ub_bytes;
+            p.b_pinned = s->ub_pinned;
+            p.b_ssd    = s->ub_ssd;
+            p.b_d2d    = s->ub_d2d;
+            p.stagers  = s->pool ? s->pool->size() : 0;
+            if (s->stagers_mode != 0 && s->ub_bytes > 0) {
+                const uint64_t direct = std::min<uint64_t>(s->ub_bytes, s->ub_pinned + s->ub_ssd);
+                const double   sh     = (double) (s->ub_bytes - direct) / (double) s->ub_bytes;
+                s->stg_share = s->stg_share < 0.0 ? sh : 0.5*s->stg_share + 0.5*sh;
+            }
+        }
         if (s->stats && L->pos == (int) s->layers.size() - 1) {
             const double dt = (ggml_time_us() - s->t_ub0) / 1e6;
             LLAMA_LOG_INFO("prefill-stream: ubatch %" PRIu64 ": %zu layers in %.1f ms, %.2f GiB copied (%.1f GiB/s), gates waited %.1f ms, "
@@ -966,9 +1001,9 @@ void pfs_release_op(ggml_tensor * dst, int ith, int nth, void * ud) {
         if (s->l22.passlog >= 2 && L->pos == (int) s->layers.size() - 1) {
             const double dt = (ggml_time_us() - s->t_ub0) / 1e6;
             llama_fn_l22_log("pass", "ubatch=%" PRIu64 " layers=%zu ms=%.1f host_gib=%.2f pinned_gib=%.2f ssd_gib=%.2f d2d_gib=%.2f "
-                    "gate_wait_ms=%.1f miss_share=%.3f miss_layers=%u", s->ctr.ubatches, s->layers.size(), dt*1e3,
+                    "gate_wait_ms=%.1f miss_share=%.3f miss_layers=%u rows=%lld stagers=%d", s->ctr.ubatches, s->layers.size(), dt*1e3,
                     s->ub_bytes/1073741824.0, s->ub_pinned/1073741824.0, s->ub_ssd/1073741824.0, s->ub_d2d/1073741824.0,
-                    s->ub_wait*1e3, s->sums.miss_share, s->sums.miss_layers);
+                    s->ub_wait*1e3, s->sums.miss_share, s->sums.miss_layers, (long long) s->cur_rows, s->pool ? s->pool->size() : 0);
         }
     }
     s->cv.notify_all();
@@ -992,7 +1027,9 @@ void pfs_destroy(pfs_state * s) {
         s->ra_cv.notify_all();
         s->ra_thr.join();
     }
-    s->pool.stop();
+    if (s->pool) {
+        s->pool->stop();
+    }
     if (s->copy) {
         ggml_backend_synchronize(s->copy);
     }
@@ -1028,6 +1065,53 @@ void pfs_destroy(pfs_state * s) {
 }
 
 } // namespace
+
+// [TAG_FN_L22_STAGERS] M7: the copy threads of the next pass, n_max x staged / host (4..n_max). Without live pins every byte
+// is staged (n_max, today's count). The share is the larger of the measured one (EWMA of the last passes, dropped when the
+// pins come or go) and P5's class bytes (a partial unpin shows there at once). A new count is a new pool, made only here:
+// s->mtx held, the streamer idle (no job running or queued), so nothing is inside copy_list
+static void pfs_stagers_apply(pfs_state * s) {
+    if (s->stagers_mode == 0 || !s->pool || s->cur_pos >= 0 || !s->queue.empty()) {
+        return;
+    }
+    const bool pin_live = s->l22.pin && llama_fn_pin_active();
+    if (pin_live != s->stg_pin) {
+        s->stg_pin   = pin_live;
+        s->stg_share = -1.0;
+    }
+    int target = s->n_threads_max;
+    if (s->stagers_mode > 0) {
+        target = s->stagers_mode;
+    } else if (pin_live) {
+        double share = s->stg_share;
+        if (s->model) {
+            const uint64_t ram  = llama_fn_res_stream_bytes(s->model, LLAMA_FN_RES_RAM);
+            const uint64_t pin  = llama_fn_res_stream_bytes(s->model, LLAMA_FN_RES_PIN);
+            const uint64_t ssd  = llama_fn_res_stream_bytes(s->model, LLAMA_FN_RES_SSD);
+            const uint64_t host = ram + pin + ssd;
+            if (host > 0) {
+                const double pred = (double) (ram + (s->l22.ssdtier > 0 ? 0 : ssd)) / (double) host;
+                share = std::max(share, pred);
+            }
+        }
+        if (share >= 0.0) {
+            target = llama_fn_l22_stagers((uint64_t) (std::min(1.0, share)*1e6), 1000000, s->n_threads_max, 4);
+        }
+    }
+    target = std::max(1, std::min(64, target));
+    const int diff = std::abs(target - s->pool->size());
+    if (diff == 0 || (s->stagers_mode < 0 && diff < 2)) {
+        return;
+    }
+    auto np = std::make_unique<gen5::copy_pool>();
+    np->start(target);
+    s->pool.swap(np); // the old pool's workers stop and join here (~1-3 ms)
+    s->stg_restarts++;
+    if (s->stg_restarts <= 3 || s->stg_restarts % 64 == 0) {
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_STAGERS] %d copy threads (restart %" PRIu64 ", staged share %.2f, pins %s)\n",
+                target, s->stg_restarts, s->stg_share, pin_live ? "live" : "off");
+    }
+}
 
 // [TAG_FN_R1_PFS_LEND] borrow the banks from the hot set (the owner's graphs are synchronized); the first time, the bank
 // and layer aliases are placed in the lent range, which is the same range every time
@@ -1077,6 +1161,7 @@ static bool pfs_take(pfs_state * s) {
             B.used_pos = -1;
         }
         s->ctr.lends++;
+        pfs_stagers_apply(s); // [TAG_FN_L22_STAGERS] before any job of this lend
         // [TAG_FN_L22_REFILL] (c) bank 0 starts filling now, before the first gate (which keeps a running or finished copy
         // of layer 0); the slot snapshot of its device copies is taken by the streamer, and no hot-set step runs before
         // that gate
@@ -1296,7 +1381,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
         return fail("no copy backend");
     }
 
-    s->pool.start(n_threads);
+    s->pool = std::make_unique<gen5::copy_pool>();
+    s->pool->start(n_threads);
+    s->n_threads_max = s->pool->size(); // [TAG_FN_L22_STAGERS]
     s->thr = std::thread(pfs_run, s);
     g_pfs = s;
 
@@ -1304,7 +1391,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             "%s ring %zu x %zu MiB, %d copy threads, wrap %s%s\n", s->layers.size(), s->min_tokens, s->n_bufs,
             s->bank_size/1048576.0, s->lend ? " borrowed from the hot set while a prompt streams [TAG_FN_R1_PFS_LEND]" : "",
             s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
-            s->chunk >> 20, s->pool.size(), s->wrap ? "on" : "off",
+            s->chunk >> 20, s->pool->size(), s->wrap ? "on" : "off",
             s->d2d ? ", the hot set's experts slot -> bank on the device [TAG_FN_L14_PFSD2D]" : "");
     return true;
 }
@@ -1371,6 +1458,9 @@ bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t
     if (!s || !s->lend || s->owner != owner) {
         return false;
     }
+    if (n_tokens > 0) {
+        s->cur_rows = n_tokens; // [TAG_FN_L22_XOVER] the pass record's rows
+    }
     const bool want = n_tokens >= s->min_tokens;
     if (want == s->lent) {
         return false;
@@ -1393,10 +1483,14 @@ bool llama_prefill_stream_before_ubatch(const void * owner, ggml_backend_sched_t
     if (sched) {
         ggml_backend_sched_synchronize(sched); // the owner's last graph is done: nothing reads the slots or the banks
     }
+    const int64_t t_fix0 = ggml_time_us(); // [TAG_FN_L22_XOVER] the stream's fixed cost
     if (want) {
-        return pfs_take(s);
+        const bool ok = pfs_take(s);
+        s->fix_ms += (ggml_time_us() - t_fix0)/1e3;
+        return ok;
     }
     pfs_return(s);
+    s->fix_ms += (ggml_time_us() - t_fix0)/1e3;
     return true;
 }
 
@@ -1483,4 +1577,62 @@ llama_pfs_l22_sums llama_prefill_stream_l22_take(const void * owner) {
     s->sums.miss_share  = miss; // the last sample stays
     s->sums.miss_layers = ml;
     return r;
+}
+
+// [TAG_FN_L22_P10] ---------------------------------------------------------------------------------------------------
+
+void llama_prefill_stream_set_stagers(const void * owner, int mode) {
+    std::lock_guard<std::mutex> init_lock(g_pfs_init);
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    s->stagers_mode = mode;
+    s->stg_share    = -1.0;
+    if (mode != 0) {
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_STAGERS] copy threads %s (pool of %d at the start)\n",
+                mode > 0 ? "fixed" : "by the staged share of the host bytes (16 x staged / host, 4..16) while pins are live",
+                s->n_threads_max);
+    }
+}
+
+bool llama_prefill_stream_set_min(const void * owner, int64_t n) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return false;
+    }
+    if (s->min_tokens != INT64_MAX) { // a stream turned off stays off
+        s->min_tokens = std::max<int64_t>(9, n);
+    }
+    return true;
+}
+
+int64_t llama_prefill_stream_get_min(const void * owner) {
+    const pfs_state * s = g_pfs;
+    return s && s->owner == owner ? s->min_tokens : 0;
+}
+
+bool llama_prefill_stream_pass_info(const void * owner, llama_pfs_pass * out) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner || !out) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(s->mtx);
+    if (s->pass_seq == s->pass_read) {
+        return false;
+    }
+    s->pass_read = s->pass_seq;
+    *out = s->last_pass;
+    return true;
+}
+
+double llama_prefill_stream_fix_take(const void * owner) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner) {
+        return 0.0;
+    }
+    const double ms = s->fix_ms;
+    s->fix_ms = 0.0;
+    return ms;
 }
