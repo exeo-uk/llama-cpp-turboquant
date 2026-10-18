@@ -755,6 +755,8 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+extern "C" void * ggml_cpu_fn_mr_kernel_get(enum ggml_type type); // [TAG_FN_L22_CPUSHARE] ggml-cpu.c
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -837,6 +839,13 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_cpu_fn_moe_fused_calls") == 0) {
         return (void *)ggml_cpu_fn_moe_fused_calls;
+    }
+    // [TAG_FN_L22_CPUSHARE] the CPU share op's kernels (src/llama-fn-cpushare.cpp)
+    if (strcmp(name, "ggml_cpu_fn_mr_kernel_get") == 0) {
+        return (void *)ggml_cpu_fn_mr_kernel_get;
+    }
+    if (strcmp(name, "ggml_get_type_traits_cpu") == 0) {
+        return (void *)ggml_get_type_traits_cpu;
     }
 
     // threadpool - TODO:  move to ggml-base
