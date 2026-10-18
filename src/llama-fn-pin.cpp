@@ -167,6 +167,9 @@ double fn_resident_share(const uint8_t * p, size_t n) {
         valid += x.VirtualAttributes.Valid ? 1 : 0;
     }
     return (double) valid/(double) w.size();
+#elif !defined(__linux__)
+    (void) p; (void) page;
+    return 0.0;
 #else
     size_t valid = 0;
     size_t total = 0;

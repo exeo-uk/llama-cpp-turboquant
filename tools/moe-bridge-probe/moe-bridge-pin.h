@@ -19,6 +19,7 @@ struct pin_probe_args {
     size_t                   floor_mib  = 6144;           // RAM floor
     bool                     repeat     = true;           // step 5: the ladder once more
     bool                     mapped     = true;           // register with cudaHostRegisterMapped too (the server does with DMASHARE)
+    size_t                   range_mib  = 256;            // the server's cut (LLAMA_FN_L22_PIN_RANGE_MIB), 0 = whole runs
 };
 
 using pin_say_fn = void (*)(const char * fmt, ...);

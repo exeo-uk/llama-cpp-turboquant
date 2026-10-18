@@ -18,7 +18,7 @@
 //
 //   moe-bridge-probe --only pin [--pin-files a.gguf,b.gguf] [--pin-ladder 4,8,16,32] [--pin-hot-every 0]
 //                    [--alloc-full-mib N] [--alloc-borrow-mib N] [--alloc-vision-mib N] [--lock-mib 1024]
-//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat] [--pin-mapped 1]
+//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat] [--pin-mapped 1] [--pin-range-mib 256]
 
 #include "moe-bridge-pin.h"
 
@@ -545,13 +545,13 @@ int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say) {
     for (const auto & s : sh) {
         shard_layers(s, a.hot_every, layers);
     }
-    const fn_pin::plan plan = fn_pin::build_plan(layers, 4096, false);
+    const fn_pin::plan plan = fn_pin::build_plan(layers, 4096, false, a.range_mib*MIB);
     uint64_t plan_bytes = 0;
     for (const auto & r : plan.ranges) {
         plan_bytes += r.n;
     }
-    SAY("  unit: %zu shard(s), %zu expert layer parts, %zu ranges in %zu groups, %.2f GiB (hot every %d)\n", sh.size(), layers.size(),
-            plan.ranges.size(), plan.groups.size(), gib(plan_bytes), a.hot_every);
+    SAY("  unit: %zu shard(s), %zu expert layer parts, %zu ranges in %zu groups, %.2f GiB (hot every %d, cut %zu MiB)\n", sh.size(),
+            layers.size(), plan.ranges.size(), plan.groups.size(), gib(plan_bytes), a.hot_every, a.range_mib);
     if (plan.ranges.empty()) {
         SAY("verdict: FAIL (no expert tensors found)\n");
         for (auto & s : sh) {
