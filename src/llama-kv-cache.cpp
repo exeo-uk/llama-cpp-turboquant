@@ -227,27 +227,28 @@ bool kvl_map_to(uint32_t cells) {
     return true;
 }
 
-// [TAG_FN_L22_KVGROW] grow ks to `want` cells (`add` new bytes): with pins and low DXGI LOCAL headroom the pins go first;
-// then the hot set gives `extra`, then 512 MiB more per round while the map fails and it still gives more (it returns
-// the bytes it has out); then the pins once more and one last map. false: the map failed (what was mapped stays).
+// [TAG_FN_L22_KVGROW] grow ks to `want` cells (`add` new bytes): the hot set gives `extra`; then, with pins and low DXGI
+// LOCAL headroom, the pins go first; then 512 MiB more per round while the map fails and the hot set still gives more (it
+// returns the bytes it has out); then the pins once more and one last map. false: the map failed (what was mapped stays).
 bool kvl_grow_l22(kvl_state * ks, uint32_t want, size_t extra, size_t add) {
     const size_t mib512 = (size_t) 512 << 20;
     bool oom_called = false;
-    if (llama_fn_pin_active()) {
-        uint64_t budget = 0;
-        uint64_t usage  = 0;
-        if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget < usage + add + mib512) {
-            oom_called = true;
-            llama_fn_pin_on_oom(add);
-            kvl_cur = ks;
-        }
-    }
     size_t out_prev = 0;
     for (int k = 0; k < 64; ++k) {
         size_t out = 0;
         if (g_kvl.release) {
             out = g_kvl.release(g_kvl.owner, extra + (size_t) k*mib512);
             kvl_cur = ks;
+        }
+        if (k == 0 && llama_fn_pin_active()) {
+            // after the hot set's give: its unmapped VRAM has left LOCAL usage (a check before it unpins for bytes it gives)
+            uint64_t budget = 0;
+            uint64_t usage  = 0;
+            if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget < usage + add + mib512) {
+                oom_called = true;
+                llama_fn_pin_on_oom(add);
+                kvl_cur = ks;
+            }
         }
         if (kvl_map_to(want)) {
             return true;
@@ -261,7 +262,7 @@ bool kvl_grow_l22(kvl_state * ks, uint32_t want, size_t extra, size_t add) {
     kvl_cur = ks;
     if (freed && kvl_map_to(want)) {
         LLAMA_LOG_WARN("%s: [TAG_FN_L22_KVGROW] mapped after the pins gave way (%.0f MiB, first call %s)\n", __func__,
-                add/1048576.0, oom_called ? "before the grow" : "none");
+                add/1048576.0, oom_called ? "at the LOCAL check" : "none");
         return true;
     }
     return false;
