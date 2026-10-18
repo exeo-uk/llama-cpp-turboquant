@@ -36,6 +36,10 @@ void llama_prefill_stream_l22_async_return(const void * owner, bool on);
 // the banks are lent right now
 bool llama_prefill_stream_l22_lent(const void * owner);
 
+// [TAG_FN_L22_ENDOVERLAP] a prompt ended with the banks still lent (the answer's first step returns them): the lent layers
+// are hidden from the hot chains until then (the MTP draft's graphs run in between). sched: the owner's scheduler
+void llama_prefill_stream_l22_hold(const void * owner, struct ggml_backend_sched * sched);
+
 // per-prompt sums for PASSLOG (taken and reset)
 struct llama_pfs_l22_sums {
     uint64_t ubatches     = 0;

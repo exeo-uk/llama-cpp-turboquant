@@ -1458,6 +1458,18 @@ bool llama_prefill_stream_l22_lent(const void * owner) {
     return s && s->owner == owner && s->lent;
 }
 
+void llama_prefill_stream_l22_hold(const void * owner, ggml_backend_sched_t sched) {
+    pfs_state * s = g_pfs;
+    if (!s || s->owner != owner || !s->lent || s->hidden) {
+        return;
+    }
+    if (sched) {
+        ggml_backend_sched_synchronize(sched); // the owner's last graph is done before the lookups change
+    }
+    llama_moe_hot_lend_hide(s->owner, true);
+    s->hidden = true;
+}
+
 llama_pfs_l22_sums llama_prefill_stream_l22_take(const void * owner) {
     pfs_state * s = g_pfs;
     if (!s || s->owner != owner) {

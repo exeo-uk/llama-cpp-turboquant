@@ -4587,6 +4587,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // sends the first token now, and the answer's first step makes the switch, with the refills on the upload worker
     if (l22.endoverlap && cbuf_state == CBUF_FULL && n_outputs_all > 0 && !cbuf_pinned && prompt_end && cparams.n_seq_max == 1) {
         l22_end_pending = true;
+        // the MTP draft's graphs run before the answer's first step: the lent layers stay hidden from their hot chains
+        llama_prefill_stream_l22_hold(this, sched.get());
     } else if (cbuf_state == CBUF_FULL && cbuf_eager && !cbuf_pinned && n_tokens_all < cparams.n_batch && prompt_end) {
         cbuf_set(false);
     }
