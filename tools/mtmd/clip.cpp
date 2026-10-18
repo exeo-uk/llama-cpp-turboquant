@@ -20,6 +20,7 @@
 #include <fstream>
 #include <map>
 #include <random>
+#include <tuple>
 #include <stdexcept>
 #include <unordered_set>
 #include <vector>
@@ -177,6 +178,16 @@ struct clip_ctx {
 
     bool support_batch = false;
 
+    // [TAG_FN_L22_VLBATCH] Qwen3-VL: batches of independent stills of one size (clip_image_f32_batch::fn_n_images > 1)
+    bool    fn_vlbatch_on      = false;
+    int32_t fn_reserve_tokens  = 0; // output tokens of the warm-up picture
+    size_t  fn_reserve_compute = 0; // its device compute bytes
+    int64_t fn_hw_patches      = 0; // most patches encoded in one graph so far
+    size_t  fn_limit_test      = 0; // tests: device compute limit forced on any backend (0: off)
+    uint64_t fn_n_split        = 0;
+    std::map<std::tuple<int, int, int>, size_t> fn_need; // (nx, ny, k) -> device compute bytes of a k-image graph
+    ggml_backend_sched_ptr fn_sched_measure;             // measures only, never allocates
+
     // for audio gen, reseeded only when the caller asks for another seed
     std::mt19937 rng{std::random_device{}()};
     uint32_t rng_seed = UINT32_MAX;
@@ -285,6 +296,7 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        fn_sched_measure.reset(); // [TAG_FN_L22_VLBATCH] before the backends it refers to
         delete cpu_twin;
         // [TAG_MTMD_DEVICE_FALLBACK] a backend abandoned after a failed encode is not freed (see backend_abandoned)
         if (!backend_abandoned) {
@@ -1235,6 +1247,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
 
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
+    builder->fn_n_images = imgs.fn_n_images > 1 ? imgs.fn_n_images : 1; // [TAG_FN_L22_VLBATCH]
 
     return builder;
 }
@@ -3833,6 +3846,13 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip) {
         auto batch = get_dummy_batch(ctx_clip);
         warmup(ctx_clip, batch);
+        // [TAG_FN_L22_VLBATCH] the reserve picture: a batch of at most this many output tokens needs about this compute
+        if (ctx_clip.model.modality == CLIP_MODALITY_VISION && !batch.entries.empty()) {
+            ctx_clip.fn_reserve_tokens = clip_n_output_tokens(&ctx_clip, &batch.entries[0]);
+            if (ctx_clip.backend != nullptr && ctx_clip.backend != ctx_clip.backend_cpu && ctx_clip.sched) {
+                ctx_clip.fn_reserve_compute = ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), ctx_clip.backend);
+            }
+        }
     }
 
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
@@ -4589,8 +4609,23 @@ static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * 
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
+    // [TAG_FN_L22_VLBATCH] a batch of independent stills: Qwen3-VL only, every entry one still of the first one's size
+    const bool fn_stills = imgs.fn_n_images > 1;
+    if (fn_stills) {
+        bool ok = ctx->fn_vlbatch_on && ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && !imgs.is_audio &&
+                  imgs.fn_n_images == n_batch_cur;
+        for (int i = 1; ok && i < n_batch_cur; i++) {
+            ok = imgs.entries[i].nx() == imgs.entries[0].nx() && imgs.entries[i].ny() == imgs.entries[0].ny();
+        }
+        if (!ok) {
+            LOG_ERR("%s: [TAG_FN_L22_VLBATCH] batch of %d stills (%d entries) rejected: needs Qwen3-VL with the switch on and pictures of one size\n",
+                    __func__, imgs.fn_n_images, n_batch_cur);
+            return false;
+        }
+    }
+
     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
-    if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
+    if (!ctx->support_batch && !fn_stills && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
     }
@@ -6037,7 +6072,7 @@ static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * 
 
     if (ctx->debug_output_embeddings && embeddings != nullptr) {
         const int64_t n_embd = embeddings->ne[0];
-        const int64_t n_tokens = embeddings->ne[1];
+        const int64_t n_tokens = embeddings->ne[1] * (fn_stills ? embeddings->ne[2] : 1); // [TAG_FN_L22_VLBATCH] all images
         std::vector<float> emb_data(ggml_nelements(embeddings));
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
@@ -6086,6 +6121,11 @@ static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * 
         LOG_INF("Stats: mean=%.6f, std=%.6f, min=%.6f, max=%.6f, sum=%.6f\n",
                 mean, sqrtf(variance), min_val, max_val, sum);
         LOG_INF("=== END MTMD_DEBUG_EMBEDDINGS ===\n\n");
+    }
+
+    // [TAG_FN_L22_VLBATCH] the device high-water a batch may reach while pins are active
+    if (ctx->fn_vlbatch_on && !imgs.is_audio) {
+        ctx->fn_hw_patches = std::max(ctx->fn_hw_patches, (int64_t) num_patches * (fn_stills ? n_batch_cur : 1));
     }
 
     return true;
@@ -6171,6 +6211,7 @@ static clip_ctx * clip_get_cpu_twin(clip_ctx * ctx) {
         loader.load_hparams(twin->model, ctx->model.modality);
         loader.load_tensors(*twin);
         clip_model_loader::init_ctx(*twin);
+        twin->fn_vlbatch_on = ctx->fn_vlbatch_on; // [TAG_FN_L22_VLBATCH] a fallback encode of a batch of stills
     } catch (const std::exception & e) {
         LOG_ERR("%s: failed to load the CPU copy of the encoder from %s: %s\n", __func__, ctx->fname.c_str(), e.what());
         delete twin;
@@ -6585,11 +6626,8 @@ static bool clip_encode_impl_lent(clip_ctx * ctx, clip_encode_params * params, c
     return clip_encode_impl(ctx, params, st);
 }
 
-bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
-    clip_lend_scope lend(ctx, params ? params->imgs : nullptr); // [TAG_FN_L17_VISION_LEND] no-op unless parked
-    if (!lend.ok) {
-        return false;
-    }
+// one graph with the device fallback (the body of clip_encode inside the lend scope)
+static bool clip_encode_one(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (!clip_device_fallback_eligible(ctx)) {
         clip_encode_status st;
         return clip_encode_impl_lent(ctx, params, &st);
@@ -6606,7 +6644,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (igpu_max_tokens > 0 && ctx->model.modality == CLIP_MODALITY_VISION && !entries.empty() &&
         ggml_backend_dev_type(ggml_backend_get_device(ctx->backend)) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
         int n_tokens = clip_n_output_tokens(ctx, &entries[0]);
-        if (ctx->support_batch) {
+        if (ctx->support_batch || params->imgs->fn_n_images > 1) { // [TAG_FN_L22_VLBATCH] stills count each
             n_tokens = 0;
             for (const auto & entry : entries) {
                 n_tokens += clip_n_output_tokens(ctx, &entry);
@@ -6616,7 +6654,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             clip_ctx * twin = clip_get_cpu_twin(ctx);
             if (twin != nullptr) {
                 LOG_INF("%s: image of %d tokens is above MTMD_IGPU_MAX_TOKENS=%d, encoding it on the CPU instead of %s\n",
-                        __func__, n_tokens, igpu_max_tokens, ggml_backend_name(ctx->backend));
+                        "clip_encode", n_tokens, igpu_max_tokens, ggml_backend_name(ctx->backend));
                 return clip_encode_on_cpu_twin(ctx, twin, params);
             }
         }
@@ -6649,11 +6687,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     const std::string dev_name = ggml_backend_name(ctx->backend);
     LOG_WRN("%s: WARNING: the %s encoder failed on %s (%s); it runs on the CPU from now on, retrying this encode on the CPU\n",
-            __func__, ctx->model.modality == CLIP_MODALITY_AUDIO ? "audio" : "vision", dev_name.c_str(), reason.c_str());
+            "clip_encode", ctx->model.modality == CLIP_MODALITY_AUDIO ? "audio" : "vision", dev_name.c_str(), reason.c_str());
 
     clip_ctx * twin = clip_get_cpu_twin(ctx);
     if (twin == nullptr) {
-        LOG_ERR("%s: no CPU copy of the encoder, this encode fails\n", __func__);
+        LOG_ERR("%s: no CPU copy of the encoder, this encode fails\n", "clip_encode");
         return false;
     }
 
@@ -6667,6 +6705,191 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     ctx->cpu_only          = true;
 
     return clip_encode_on_cpu_twin(ctx, twin, params);
+}
+
+// [TAG_FN_L22_VLBATCH] ----------------------------------------------------------------------------------------------------
+// A batch of B same-size stills is one graph when its compute buffer fits the device memory this encode may use, else it
+// runs as balanced groups. Limit: the compute part of the current lend; without a lend what the scheduler holds (at least
+// the warm-up reserve); no limit on the CPU. While pins are active, no graph may have more patches than one already run
+// (the CUDA pool then reaches no new high-water).
+
+std::vector<int> clip_fn_l22_split_plan(int n, const std::function<bool(int)> & fits) {
+    std::vector<int> plan;
+    if (n <= 0) {
+        return plan;
+    }
+    int kmax = 1;
+    for (int k = n; k > 1; --k) {
+        if (fits(k)) {
+            kmax = k;
+            break;
+        }
+    }
+    const int groups = (n + kmax - 1) / kmax;
+    for (int g = 0; g < groups; ++g) {
+        plan.push_back(n / groups + (g < n % groups ? 1 : 0));
+    }
+    return plan;
+}
+
+static size_t clip_fn_l22_limit(const clip_ctx * ctx) {
+    if (ctx->fn_limit_test > 0) {
+        return ctx->fn_limit_test;
+    }
+    if (ctx->cpu_only || ctx->backend == nullptr || ctx->backend == ctx->backend_cpu) {
+        return SIZE_MAX;
+    }
+    const auto & L = ctx->lend;
+    if (L.on) {
+        const size_t t = L.out ? L.taken : L.bytes;
+        return t > L.w ? t - L.w : 0;
+    }
+    const size_t cur = ctx->sched ? ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend) : 0;
+    return std::max(cur, ctx->fn_reserve_compute);
+}
+
+// device compute bytes of a k-image graph of nx x ny pictures, measured with a scheduler that never allocates (the
+// weights must be on the device: parked weights would count as compute)
+size_t clip_fn_l22_need_bytes(struct clip_ctx * ctx, int nx, int ny, int k) {
+    const auto key = std::make_tuple(nx, ny, k);
+    const auto it  = ctx->fn_need.find(key);
+    if (it != ctx->fn_need.end()) {
+        return it->second;
+    }
+    int bi = -1;
+    for (size_t i = 0; i < ctx->backend_ptrs.size(); ++i) {
+        if (ctx->backend_ptrs[i] == ctx->backend) {
+            bi = (int) i;
+        }
+    }
+    GGML_ASSERT(bi >= 0);
+    if (!ctx->fn_sched_measure) {
+        ctx->fn_sched_measure.reset(
+            ggml_backend_sched_new(ctx->backend_ptrs.data(), ctx->backend_buft.data(), ctx->backend_ptrs.size(), 8192, false, true));
+    }
+    const int64_t t0 = ggml_time_us();
+    clip_image_f32_batch b;
+    for (int i = 0; i < k; ++i) {
+        clip_image_f32 img;
+        img.set_size({ nx, ny }, true, false); // placeholder: the graph reads only the size
+        b.entries.push_back(std::move(img));
+    }
+    b.fn_n_images = k > 1 ? k : 0;
+    ggml_cgraph * gf = clip_get_graph_builder(ctx, b)->build();
+    std::vector<size_t> sizes(ctx->backend_ptrs.size(), 0);
+    ggml_backend_sched_reserve_size(ctx->fn_sched_measure.get(), gf, sizes.data());
+    const size_t need = sizes[(size_t) bi];
+    ctx->fn_need[key] = need;
+    LOG_INF("%s: [TAG_FN_L22_VLBATCH] %d x %dx%d: %.1f MiB compute on %s (measured in %.1f ms)\n", __func__, k, nx, ny,
+            need/1048576.0, ggml_backend_name(ctx->backend), (ggml_time_us() - t0)/1000.0);
+    return need;
+}
+
+static bool clip_fn_l22_encode_stills(clip_ctx * ctx, clip_encode_params * params) {
+    const clip_image_f32_batch & imgs = *params->imgs;
+    const int B = (int) imgs.entries.size();
+    if (!ctx->fn_vlbatch_on || imgs.fn_n_images != B || params->out_embd == nullptr || ctx->model.hparams.patch_size <= 0) {
+        return clip_encode_one(ctx, params); // clip_encode_impl rejects a wrong batch
+    }
+    const clip_image_f32 & e0 = imgs.entries[0];
+    const int     ps    = ctx->model.hparams.patch_size;
+    const int64_t p1    = (int64_t) (e0.nx() / ps) * (int64_t) (e0.ny() / ps);
+    const size_t  limit = clip_fn_l22_limit(ctx);
+    const bool    pins  = limit != SIZE_MAX && llama_fn_pin_active();
+    const int64_t hw    = std::max(ctx->fn_hw_patches, p1);
+    auto fits = [&](int k) {
+        if (pins && (int64_t) k * p1 > hw) {
+            return false;
+        }
+        return limit == SIZE_MAX || clip_fn_l22_need_bytes(ctx, e0.nx(), e0.ny(), k) <= limit;
+    };
+    std::vector<int> plan;
+    try {
+        plan = clip_fn_l22_split_plan(B, fits);
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: [TAG_FN_L22_VLBATCH] the batch graph could not be measured (%s): one picture per graph\n", __func__, e.what());
+        plan.assign((size_t) B, 1);
+    }
+    if (plan.size() == 1) {
+        return clip_encode_one(ctx, params);
+    }
+
+    ctx->fn_n_split++;
+    std::string groups;
+    for (const int k : plan) {
+        groups += (groups.empty() ? "" : "+") + std::to_string(k);
+    }
+    const auto it_b = ctx->fn_need.find(std::make_tuple(e0.nx(), e0.ny(), B));
+    LOG_WRN("%s: [TAG_FN_L22_VLBATCH] %d pictures %dx%d: %.0f MiB compute, limit %.0f MiB%s: groups %s\n", __func__, B,
+            e0.nx(), e0.ny(), it_b != ctx->fn_need.end() ? it_b->second/1048576.0 : 0.0, limit/1048576.0,
+            pins ? " (pins: no new high-water)" : "", groups.c_str());
+    // the lend's size record would describe one group, not this batch
+    ctx->lend.fresh = false;
+
+    const size_t per = (size_t) clip_n_output_tokens(ctx, &e0) * (size_t) clip_n_mmproj_embd(ctx);
+    auto & out = *params->out_embd;
+    if (!out.empty() && out.size() != per * (size_t) B) {
+        LOG_ERR("%s: [TAG_FN_L22_VLBATCH] output buffer has %zu elements but expected %zu\n", __func__, out.size(), per * (size_t) B);
+        return false;
+    }
+    int done = 0;
+    for (const int k : plan) {
+        clip_image_f32_batch sub;
+        sub.entries.assign(imgs.entries.begin() + done, imgs.entries.begin() + done + k);
+        sub.fn_n_images = k > 1 ? k : 0;
+        std::vector<float> sub_out(per * (size_t) k);
+        clip_encode_params sp = *params;
+        sp.imgs     = &sub;
+        sp.out_embd = &sub_out;
+        if (!clip_encode_one(ctx, &sp)) {
+            return false;
+        }
+        if (!out.empty()) {
+            std::memcpy(out.data() + per * (size_t) done, sub_out.data(), per * (size_t) k * sizeof(float));
+        }
+        done += k;
+    }
+    return true;
+}
+
+bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    clip_lend_scope lend(ctx, params ? params->imgs : nullptr); // [TAG_FN_L17_VISION_LEND] no-op unless parked
+    if (!lend.ok) {
+        return false;
+    }
+    if (params != nullptr && params->imgs != nullptr && params->imgs->fn_n_images > 1) {
+        return clip_fn_l22_encode_stills(ctx, params); // [TAG_FN_L22_VLBATCH]
+    }
+    return clip_encode_one(ctx, params);
+}
+
+bool clip_fn_l22_enable_batch(struct clip_ctx * ctx) {
+    if (ctx == nullptr || ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL || ctx->model.modality != CLIP_MODALITY_VISION) {
+        return false;
+    }
+    ctx->fn_vlbatch_on = true;
+    if (ctx->cpu_twin != nullptr) {
+        ctx->cpu_twin->fn_vlbatch_on = true;
+    }
+    return true;
+}
+
+bool clip_fn_l22_batch_on(const struct clip_ctx * ctx) {
+    return ctx != nullptr && ctx->fn_vlbatch_on;
+}
+
+int32_t clip_fn_l22_reserve_tokens(const struct clip_ctx * ctx) {
+    return ctx != nullptr ? ctx->fn_reserve_tokens : 0;
+}
+
+void clip_fn_l22_set_test_limit(struct clip_ctx * ctx, size_t bytes) {
+    if (ctx != nullptr) {
+        ctx->fn_limit_test = bytes;
+    }
+}
+
+uint64_t clip_fn_l22_n_split(const struct clip_ctx * ctx) {
+    return ctx != nullptr ? ctx->fn_n_split : 0;
 }
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
