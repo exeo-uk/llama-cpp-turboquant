@@ -1869,6 +1869,12 @@ bool llama_moe_bridge_dma(const llama_moe_bridge * br) {
     return br != nullptr && br->dma_on;
 }
 
+void llama_moe_bridge_l22_dma_off(const llama_moe_bridge * br) {
+    if (br != nullptr && br->l22_dmashare) {
+        const_cast<llama_moe_bridge *>(br)->dma_on = false; // the bridge object is mutable; P14's interface passes it const
+    }
+}
+
 bool llama_moe_bridge_active(const llama_moe_bridge * br) {
     return br != nullptr && br->active && !br->disabled;
 }

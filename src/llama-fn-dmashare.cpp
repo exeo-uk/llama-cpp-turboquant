@@ -22,6 +22,7 @@
 #include "llama-model.h"
 #include "llama-moe-bridge.h"
 #include "llama-moe-gen5.h"
+#include "llama-moecache.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -106,6 +107,7 @@ struct dma_state {
     dma_stats        st;
     int64_t          open_tickets = 0;
     uint64_t         graphs_total = 0;
+    bool             dormant      = false; // R-REV-12: no pin in this run: banks freed, no view, no fetch node
 };
 
 std::mutex               g_dma_mtx; // creation and free
@@ -419,6 +421,9 @@ const llama_moe_dma_view * llama_fn_dmashare_view(const llama_moe_bridge * br, c
     if (it == s->layer_of_up.end()) {
         return nullptr;
     }
+    if (s->dormant) {
+        return nullptr; // R-REV-12
+    }
     if (!s->cuda_tried) {
         dma_cuda_init(s);
     }
@@ -609,6 +614,34 @@ void llama_fn_dmashare_graph_end(const llama_moe_bridge * br, uint32_t err, doub
         }
     }
     s->pend_layers.clear();
+    // R-REV-12: registration ended with no active pin (refused, nothing planned, all unpinned) or no pin state at all:
+    // nothing can be copied any more. The banks go back to the driver, no later graph gets a fetch node (the view says
+    // none, the bridge stops fetching, the graph generation moves so no graph built with fetch nodes runs again)
+    const int ph = llama_fn_pin_phase();
+    if (!s->dormant && (ph == 3 || (ph == 2 && !llama_fn_pin_active()))) {
+        s->dormant = true;
+        for (auto & L : s->layers) {
+            for (int32_t t : L.pend.tickets) {
+                llama_fn_pin_release(t);
+            }
+            s->open_tickets -= (int64_t) L.pend.tickets.size();
+            L.pend.tickets.clear();
+            L.pend.on = false;
+        }
+        llama_moe_bridge_l22_dma_off(br);
+        llama_moe_hot_generation_bump();
+        const size_t freed = s->bank_bytes;
+        if (s->buf != nullptr) {
+            ggml_backend_buffer_free(s->buf);
+            s->buf = nullptr;
+        }
+        for (auto & G : s->groups) {
+            G.view = llama_moe_dma_view();
+        }
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_DMASHARE] no pinned pages in this run (pin phase %d): the DMA share stops, %.0f MiB of banks "
+                "freed, later graphs fetch nothing\n", __func__, ph, freed/(double) DMA_MIB);
+        llama_fn_l22_log("dma", "what=off reason=nopins phase=%d freed_mib=%.0f", ph, freed/(double) DMA_MIB);
+    }
     const int lvl = llama_fn_l22_passlog_level();
     const uint64_t every = lvl >= 2 ? 32 : 256;
     if (lvl >= 1 && s->st.graphs >= every) {

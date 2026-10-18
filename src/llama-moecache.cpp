@@ -5449,6 +5449,10 @@ uint64_t llama_moe_hot_generation() {
     return g_hot_gen.load(std::memory_order_acquire);
 }
 
+void llama_moe_hot_generation_bump() {
+    g_hot_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
 size_t llama_moe_hot_kv_release(const void * owner, size_t need) {
     moe_cache * mc = g_cache;
     if (mc && mc->sl_on) {

@@ -159,6 +159,8 @@ size_t   llama_moe_hot_kv_out();
 size_t   llama_moe_hot_kv_release(const void * owner, size_t need);
 size_t   llama_moe_hot_kv_restore(const void * owner, size_t keep);
 uint64_t llama_moe_hot_generation();
+// R-REV-12: no graph built before this call is reused (a graph-shaping state outside the hot set changed, e.g. P14 off)
+void     llama_moe_hot_generation_bump();
 
 // [TAG_FN_L17_VISION_LEND] the parked projector's VRAM rides on the KV cache's lend: the fit adds its bytes to `want`, and
 // _vis_set(bytes) after an init that holds them all. _vis_take (the owner's graphs synchronized): `bytes` more go out

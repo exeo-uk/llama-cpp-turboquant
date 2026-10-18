@@ -144,6 +144,9 @@ int                llama_moe_bridge_hint_mode(const llama_moe_bridge * br);
 // each job's experts over PCIe (GGML_OP_MOE_HOST_FETCH) while the CPU computes the rest. false: no DMA share (logged).
 bool               llama_moe_bridge_attach_dma(llama_moe_bridge * br, const void * owner);
 bool               llama_moe_bridge_dma(const llama_moe_bridge * br);
+// [TAG_FN_L22_DMASHARE] R-REV-12: P14's share gave up (no pin in this run): later graphs fetch nothing (owner thread, the
+// bridge's graph synced, no job running)
+void               llama_moe_bridge_l22_dma_off(const llama_moe_bridge * br);
 
 // graph side. active: graphs built now may use it (not paused after an error, not disabled)
 bool llama_moe_bridge_active(const llama_moe_bridge * br);
