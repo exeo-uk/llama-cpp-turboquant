@@ -308,9 +308,12 @@ public:
             for (auto & p : ps) {
                 queue.push_back(std::move(p));
             }
-            st.tickets++;
         }
         cv.notify_all();
+        {
+            std::lock_guard<std::mutex> g(smtx);
+            st.tickets++;
+        }
         return id;
     }
 
