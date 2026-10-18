@@ -1096,7 +1096,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
+    // [TAG_FN_L22_OOMHOOK] R-REV-7: a device buffer after ready with pins active (a compute buffer that grows inside a
+    // decode, a KV or bank allocation): DXGI LOCAL headroom first, one unpin and retry on failure (no hook: unchanged)
+    ggml_cuda_fn_l22_oom_precheck(size);
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size)) {
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -3833,6 +3840,19 @@ static void ggml_cuda_fn_l22_cap_end(ggml_backend_cuda_context * ctx, ggml_cuda_
 }
 
 // one "[TAG_FN_L22_PASSLOG] kind=graph" line per window (PASSLOG format; ggml cannot call libllama's helper)
+// [TAG_FN_L22_PASSLOG] R-REV-11: libllama's resolved LLAMA_FN_L22_PASSLOG (proc "ggml_backend_cuda_set_passlog_level");
+// -1 = never set (the lines print as before)
+static std::atomic<int> ggml_cuda_fn_l22_passlog{-1};
+
+static void ggml_backend_cuda_set_passlog_level(int level) {
+    ggml_cuda_fn_l22_passlog.store(level, std::memory_order_relaxed);
+}
+
+static bool ggml_cuda_fn_l22_passlog_on(void) {
+    const int v = ggml_cuda_fn_l22_passlog.load(std::memory_order_relaxed);
+    return v < 0 || v >= 1;
+}
+
 static void ggml_cuda_fn_l22_window_start(ggml_backend_cuda_context * ctx, int n) {
     ctx->fn_l22_win_left = n;
     ctx->fn_l22_win_len  = n;
@@ -3841,6 +3861,9 @@ static void ggml_cuda_fn_l22_window_start(ggml_backend_cuda_context * ctx, int n
 
 static void ggml_cuda_fn_l22_window_tick(ggml_backend_cuda_context * ctx) {
     if (ctx->fn_l22_win_left <= 0 || --ctx->fn_l22_win_left > 0) {
+        return;
+    }
+    if (!ggml_cuda_fn_l22_passlog_on()) {
         return;
     }
     const uint64_t * c = ctx->fn_l22_cnt;
@@ -7482,7 +7505,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (gp_reason != 0) {
                 d_raw[bucket][gp_reason].fetch_add(1, std::memory_order_relaxed);
             }
-            if (((d_call.fetch_add(1, std::memory_order_relaxed) + 1) & 1023u) == 0u) {
+            if (((d_call.fetch_add(1, std::memory_order_relaxed) + 1) & 1023u) == 0u && ggml_cuda_fn_l22_passlog_on()) {
                 std::string line;
                 const char * bname[4] = { "<256", "<1024", "<4096", ">=4096" };
                 for (int b = 0; b < 4; ++b) {
@@ -8146,8 +8169,10 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
         }
         ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_TRIM_KEPT]    += kept;
         ctx->fn_l22_cnt[GGML_CUDA_FN_L22_CNT_TRIM_DROPPED] += dropped;
-        GGML_LOG_WARN("[TAG_FN_L22_PASSLOG] kind=graph ctx=%s %p trim: %.1f MiB given back, instances kept %d dropped %d%s\n",
-                ctx->name.c_str(), (void *) ctx, freed/1048576.0, kept, dropped, g2 ? "" : " (no mark or untracked pools: all graphs cleared)");
+        if (ggml_cuda_fn_l22_passlog_on()) {
+            GGML_LOG_WARN("[TAG_FN_L22_PASSLOG] kind=graph ctx=%s %p trim: %.1f MiB given back, instances kept %d dropped %d%s\n",
+                    ctx->name.c_str(), (void *) ctx, freed/1048576.0, kept, dropped, g2 ? "" : " (no mark or untracked pools: all graphs cleared)");
+        }
         ggml_cuda_fn_l22_window_start(ctx, 16);
     }
 #endif
@@ -9442,6 +9467,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_fn_register_host_mapped") == 0) {
         return (void *)ggml_backend_cuda_fn_register_host_mapped;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_passlog_level") == 0) { // [TAG_FN_L22_PASSLOG] R-REV-11
+        return (void *)ggml_backend_cuda_set_passlog_level;
     }
     if (strcmp(name, "ggml_backend_cuda_set_oom_hook") == 0) {
         return (void *)ggml_backend_cuda_set_oom_hook;
