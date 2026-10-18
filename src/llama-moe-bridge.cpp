@@ -1543,10 +1543,11 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
     // [TAG_FN_L22_X_PRIOR] P12 (qwen4exp, opt-in): the prior's table on the router's device (before ready) and, with
     // LLAMA_FN_L22_X_PRIOR_STATS=raw, a raw-id area per channel for the unbiased top-k. Unset: nothing allocated, same layout
     if (model.arch == LLM_ARCH_QWEN4EXP) {
+        // [TAG_FN_L22_TBO] chain 0's channels: a chain channel repeats its layer (the table is indexed by il)
         std::vector<std::pair<int, const ggml_tensor *>> pl;
-        pl.reserve(br->chans.size());
-        for (const auto & c : br->chans) {
-            pl.emplace_back(c.il, c.up);
+        pl.reserve((size_t) br->n_chan0);
+        for (int i = 0; i < br->n_chan0; ++i) {
+            pl.emplace_back(br->chans[i].il, br->chans[i].up);
         }
         br->prior_on  = llama_fn_prior_init(model, dev, pl);
         br->prior_raw = br->prior_on && llama_fn_prior_raw_wanted();
