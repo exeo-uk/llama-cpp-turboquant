@@ -3,6 +3,8 @@
 #include "llama-fn-tier.h"
 
 #include "llama-fn-auto.h"
+#include "llama-fn-l22.h"    // [TAG_FN_L22_RESSET] llama_fn_pin_shutdown
+#include "llama-fn-l22-p5.h" // [TAG_FN_L22_RESSET] the residency table, the warm list, direct I/O
 #include "llama-fn-stall.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
@@ -64,6 +66,10 @@ static std::atomic<int64_t> g_hush_budget_us{-1};
 static std::atomic<int64_t> g_hush_used_us{0};
 static std::atomic<int64_t> g_hush_t0_us{0};
 static std::atomic<bool>    g_hush_spent_logged{false};
+// [TAG_FN_L22_REWARM] the last begin / end of a decode or prompt scope or stream layer (steady clock, us), kept while on
+static std::atomic<bool>    g_p5_track{false};
+static std::atomic<int64_t> g_p5_act_us{0};
+static void fn_p5_stamp();
 
 namespace {
 
@@ -138,6 +144,7 @@ struct llama_fn_tier {
     HANDLE                                        go   = nullptr; // [TAG_FN_L15_WARM]
     std::thread                                   worker;
 #endif
+    const llama_model *                           model = nullptr; // [TAG_FN_L22_RESSET] for the deleter (the residency table)
 };
 
 namespace {
@@ -604,6 +611,12 @@ void llama_fn_tier_deleter::operator()(llama_fn_tier * t) const {
     if (t->worker.joinable()) {
         t->worker.join();
     }
+    // [TAG_FN_L22_RESSET] before the mappings close: the pin thread and its registrations (P6), then the residency service
+    // thread and the direct-I/O readers
+    if (t->model != nullptr) {
+        llama_fn_pin_shutdown(t->model);
+        llama_fn_p5_free(*t->model);
+    }
     for (int l = 0; l < (int) t->layers.size(); ++l) {
         for (int e = 0; e < t->layers[l].n_exp; ++e) {
             fn_tier_unlock(t, { l, e });
@@ -769,6 +782,132 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     }
 }
 
+// [TAG_FN_L22_RESSET] the warm pass driven by the residency table: only what the prompt stream reads from the host (cold
+// experts, every expert of a lend / tail / KV layer), minus pinned and SSD-class experts, in stream order; each piece re-reads
+// its experts' flags before it reads (the pin planner marks from its own thread, the hot set keeps filling). Budget: the
+// available RAM minus LLAMA_FN_L15_WARM_FREE_MIB minus the pinned bytes not in RAM yet, and it stops when the available RAM
+// falls below that floor. Same threads, yield rule and layer marks as fn_warm.
+static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_out) {
+    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const size_t page = si.dwPageSize ? si.dwPageSize : 4096;
+    std::vector<size_t> layer_end;
+    size_t pin_pending = 0;
+    size_t skipped     = 0;
+    const std::vector<llama_fn_p5_piece> pcs = llama_fn_p5_warm_list(model, (size_t) 64 << 20, layer_end, &pin_pending, &skipped);
+    *secs_out = 0.0;
+    if (pcs.empty()) {
+        return 0;
+    }
+    size_t total = 0;
+    for (const auto & pc : pcs) {
+        total += pc.n;
+    }
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
+    const size_t budget = (size_t) ms.ullAvailPhys > keep + pin_pending ? (size_t) ms.ullAvailPhys - keep - pin_pending : 0;
+    PROCESS_MEMORY_COUNTERS pm0 = {};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pm0, sizeof(pm0));
+    const int n_thr = std::max(1, std::min(32, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_THREADS", 16)));
+    const size_t n_use = pcs.size();
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> used{0};
+    std::atomic<bool>   full{false};
+    std::atomic<const char *> why{nullptr};
+    std::unique_ptr<std::atomic<uint8_t>[]> done(new std::atomic<uint8_t>[n_use + 1]());
+    g_warm_layer_end = layer_end;
+    g_warm_mark.store(0);
+    g_warm_running.store(true, std::memory_order_release);
+    std::atomic<int> n_named{0};
+    auto run = [&]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); // [TAG_FN_L15_WARMYIELD]
+        llama_fn_thread_name("warm", n_named.fetch_add(1)); // [TAG_FN_L18_FIRSTANS_STALL]
+        std::vector<std::pair<const char *, size_t>> rs;
+        for (size_t i = next.fetch_add(1); i < n_use; i = next.fetch_add(1)) {
+            if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0 || full.load()) {
+                return;
+            }
+            rs.clear();
+            const size_t b = llama_fn_p5_piece_ranges(model, pcs[i], rs);
+            MEMORYSTATUSEX m1;
+            m1.dwLength = sizeof(m1);
+            GlobalMemoryStatusEx(&m1);
+            if (used.fetch_add(b) + b > budget || (size_t) m1.ullAvailPhys < keep) {
+                used.fetch_sub(b);
+                why.store((size_t) m1.ullAvailPhys < keep ? "available RAM below the floor" : "budget");
+                full.store(true);
+                return;
+            }
+            for (const auto & r : rs) {
+                // [TAG_FN_L15_WARMYIELD] 2 MiB at a time, each after 50 ms without an answer step
+                const size_t sub = (size_t) 2 << 20;
+                for (size_t o0 = 0; o0 < r.second; o0 += sub) {
+                    while ((g_warm_small_decodes.load(std::memory_order_relaxed) > 0 ||
+                            fn_warm_now_us() - g_warm_small_end_us.load(std::memory_order_relaxed) < 50000 ||
+                            llama_fn_hushed()) && // [TAG_FN_L19_TTFT_HUSH]
+                           WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+                        Sleep(2);
+                    }
+                    const size_t n0 = std::min(sub, r.second - o0);
+                    WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) (r.first + o0), (SIZE_T) n0 };
+                    if (pf != nullptr) {
+                        pf(GetCurrentProcess(), 1, &e, 0);
+                    }
+                    const uintptr_t a0 = ((uintptr_t) r.first + o0)/page*page;
+                    for (uintptr_t a = a0; a < (uintptr_t) r.first + o0 + n0; a += page) {
+                        (void) *(volatile const char *) a;
+                    }
+                }
+            }
+            done[i].store(1);
+            for (size_t m = g_warm_mark.load(); m < n_use && done[m].load(); ) {
+                if (g_warm_mark.compare_exchange_weak(m, m + 1)) {
+                    m++;
+                }
+            }
+        }
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    llama_fn_stall_mark("warm pass begins (pieces, MiB)", (int64_t) n_use, (int64_t) (total >> 20)); // [TAG_FN_L18_FIRSTANS_STALL]
+    std::vector<std::thread> ths;
+    for (int k = 1; k < n_thr; ++k) {
+        ths.emplace_back(run);
+    }
+    run();
+    for (auto & th : ths) {
+        th.join();
+    }
+    g_warm_running.store(false, std::memory_order_release);
+    llama_fn_stall_mark("warm pass ends"); // [TAG_FN_L18_FIRSTANS_STALL]
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    PROCESS_MEMORY_COUNTERS pm1 = {};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pm1, sizeof(pm1));
+    size_t n_done = 0;
+    for (size_t i = 0; i < n_use; ++i) {
+        n_done += done[i].load() ? 1 : 0;
+    }
+    const size_t warmed = std::min(used.load(), total);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] [TAG_FN_L22_RESSET] %.2f of %.2f GiB of routed experts read into the working set in "
+            "%.1f s by %d threads (the streamed set only: %.2f GiB left to VRAM, pins and direct I/O; %.1f GiB of RAM was available, %.1f GiB kept free, "
+            "%.2f GiB of pins pending; working set %.1f -> %.1f GiB)\n", __func__, warmed/1073741824.0, total/1073741824.0, secs,
+            n_thr, skipped/1073741824.0, ms.ullAvailPhys/1073741824.0, keep/1073741824.0, pin_pending/1073741824.0,
+            pm0.WorkingSetSize/1073741824.0, pm1.WorkingSetSize/1073741824.0);
+    if (n_done < n_use && WaitForSingleObject(stop, 0) != WAIT_OBJECT_0) {
+        size_t left = 0;
+        for (size_t i = 0; i < n_use; ++i) {
+            left += done[i].load() ? 0 : pcs[i].n;
+        }
+        LLAMA_LOG_WARN("%s: [TAG_FN_L15_WARM] %.2f GiB of routed experts did not fit in the available RAM (streamed set, %s): the idle "
+                "re-warm or the SSD tier takes them\n", __func__, left/1073741824.0, why.load() ? why.load() : "stopped");
+    }
+    *secs_out = secs;
+    return warmed;
+}
+
 llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & ml) {
     if (!fn_tier_on(model)) {
         if (!fn_warm_on(model) || !ml.use_mmap) {
@@ -810,12 +949,25 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
         }
         const llama_model * m = &model;
         llama_fn_tier * t = w.get();
+        w->model = m;
+        llama_fn_p5_on_build(model, ml); // [TAG_FN_L22_SSDTIER] the readers need the loader's file offsets
         w->worker = std::thread([m, t, delay]() {
             const HANDLE hs[2] = { t->stop, t->go };
             if (WaitForMultipleObjects(2, hs, FALSE, delay) == WAIT_OBJECT_0) {
                 return;
             }
-            fn_warm(*m, t->stop);
+            // [TAG_FN_L22_RESSET] the residency table, the pin planner's start and the SSD pre-plan come first
+            const bool p5 = llama_fn_p5_ready(*m);
+            size_t warmed = 0;
+            double secs   = 0.0;
+            if (p5 && llama_fn_p5_resset(*m)) {
+                warmed = fn_warm_l22(*m, t->stop, &secs);
+            } else {
+                fn_warm(*m, t->stop);
+            }
+            if (p5 && WaitForSingleObject(t->stop, 0) != WAIT_OBJECT_0) {
+                llama_fn_p5_after_warm(*m, warmed, secs);
+            }
         });
         LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] the routed experts are read into the working set in the background after the first "
                 "decode (working-set maximum %.1f GiB)\n", __func__, (ms.ullTotalPhys/10*9)/1073741824.0);
@@ -897,6 +1049,7 @@ llama_fn_tier_ptr llama_fn_tier_build(llama_model & model, llama_model_loader & 
 
 // [TAG_FN_L15_WARM] see llama-fn-tier.h
 void llama_fn_warm_go(bool ready) {
+    fn_p5_stamp(); // [TAG_FN_L22_REWARM] every trunk decode ends here
     static std::atomic<bool> done{false};
     if (done.load(std::memory_order_relaxed)) {
         return;
@@ -923,6 +1076,7 @@ void llama_fn_warm_go(bool ready) {
 // [TAG_FN_L15_WARM] see llama-fn-tier.h
 void llama_fn_warm_wait_layer(int il) {
 #ifdef _WIN32
+    fn_p5_stamp(); // [TAG_FN_L22_REWARM] a prompt's stream reached a layer
     if (!g_warm_running.load(std::memory_order_acquire) || il < 0 || il >= (int) g_warm_layer_end.size()) {
         return;
     }
@@ -1037,6 +1191,7 @@ void llama_fn_warm_small_decode(bool begin) {
         g_warm_small_end_us.store(fn_warm_now_us(), std::memory_order_relaxed);
         g_warm_small_decodes.fetch_sub(1, std::memory_order_relaxed);
     }
+    fn_p5_stamp(); // [TAG_FN_L22_REWARM]
 #else
     GGML_UNUSED(begin);
 #endif
@@ -1044,6 +1199,7 @@ void llama_fn_warm_small_decode(bool begin) {
 
 // [TAG_FN_L19_TTFT_HUSH] see llama-fn-tier.h
 void llama_fn_hush(bool begin) {
+    fn_p5_stamp(); // [TAG_FN_L22_REWARM] a prompt batch or a FULL reserve begins / ends
     if (begin) {
         if (g_fn_hush.fetch_add(1, std::memory_order_relaxed) == 0) {
             g_hush_t0_us.store(fn_warm_now_us(), std::memory_order_relaxed); // [TAG_FN_L19_TTFT_HUSH_BUDGET]
@@ -1088,4 +1244,27 @@ void llama_fn_thread_priority_highest() {
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
+}
+
+// [TAG_FN_L22_REWARM] see llama-fn-l22-p5.h
+static void fn_p5_stamp() {
+    if (g_p5_track.load(std::memory_order_relaxed)) {
+        g_p5_act_us.store(fn_warm_now_us(), std::memory_order_relaxed);
+    }
+}
+
+void llama_fn_p5_track(bool on) {
+    g_p5_act_us.store(fn_warm_now_us(), std::memory_order_relaxed);
+    g_p5_track.store(on, std::memory_order_relaxed);
+}
+
+int64_t llama_fn_p5_now_us() {
+    return fn_warm_now_us();
+}
+
+bool llama_fn_p5_busy(int64_t * last_us) {
+    if (last_us) {
+        *last_us = g_p5_act_us.load(std::memory_order_relaxed);
+    }
+    return g_warm_small_decodes.load(std::memory_order_relaxed) > 0 || g_fn_hush.load(std::memory_order_relaxed) > 0;
 }
