@@ -179,6 +179,12 @@ const func_builtins & global_builtins();
 
 std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
 
+// [TAG_FN_L22_JSONFLOAT] floats as Python writes them (tojson, |string, |safe; upstream #30362 + #30483) and one scope per
+// loop iteration (#30533). Off (default) = the old output. set: the server's value (model profile); unset: the
+// environment variable LLAMA_FN_L22_JSONFLOAT, read once
+void set_l22_jsonfloat(bool on);
+bool l22_jsonfloat();
+
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
 

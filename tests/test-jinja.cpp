@@ -1,5 +1,7 @@
 #include <string>
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <random>
 #include <cstdlib>
 
@@ -37,6 +39,8 @@ static void test_stats(testing & t);
 static void test_caps(testing & t);
 static void test_string_parts(testing & t);
 static void test_fuzzing(testing & t);
+static void test_l22_jsonfloat(testing & t);
+static int  l22_golden(const std::string & path);
 
 static bool g_python_mode = false;
 
@@ -53,6 +57,9 @@ int main(int argc, char *argv[]) {
         std::string arg = argv[i];
         if (arg == "-py") {
             g_python_mode = true;
+        } else if (arg == "--l22-golden" && i + 1 < argc) {
+            // [TAG_FN_L22_JSONFLOAT] render a chat template file with float tool data, old and new float output
+            return l22_golden(argv[++i]);
         } else {
             t.set_filter(arg);
         }
@@ -78,6 +85,7 @@ int main(int argc, char *argv[]) {
         t.test("caps", test_caps);
         t.test("string parts", test_string_parts);
         t.test("fuzzing", test_fuzzing);
+        t.test("l22 json floats", test_l22_jsonfloat);
     }
 
     return t.summary();
@@ -2878,4 +2886,216 @@ static void test_fuzzing(testing & t) {
                 {{"data", std::string("hello\xfe\xffworld")}}
             ));
     });
+}
+
+//
+// [TAG_FN_L22_JSONFLOAT] round 22 E8: floats as Python writes them (#30362, #30483), a scope per loop iteration (#30533).
+// Switch on: the upstream cases; switch off: the old output.
+//
+
+// the tojson lines of our chat template (templates/qwen-fixed-chat-template.jinja: tools in the system block, an XML
+// tool call's parameters)
+static const char * L22_GOLDEN_SNIPPET =
+    "{%- for tool in tools %}{{- '\\n' }}{{- tool | tojson }}{%- endfor %}|"
+    "{%- for args_name, args_value in args.items() %}<parameter={{ args_name }}>"
+    "{%- if args_value is string %}{%- set _av = args_value %}{%- else %}{%- set _av = args_value | tojson %}{%- endif %}"
+    "{{- _av }}</parameter>{%- endfor %}";
+
+static json l22_golden_vars() {
+    json schema = {
+        {"type", "object"},
+        {"properties", {
+            {"x", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 100.0}, {"default", 1.5}}}
+        }}
+    };
+    json tool = {{"type", "function"}, {"function", {{"name", "set_view"}, {"parameters", schema}}}};
+    json args = {{"lat", 48.858844}, {"zoom", 15.0}, {"style", {{"opacity", 0.85}}}, {"name", "Paris"}};
+    return {{"tools", json::array({tool})}, {"args", args}};
+}
+
+static void test_l22_jsonfloat(testing & t) {
+    jinja::set_l22_jsonfloat(true);
+
+    // upstream #30362
+    test_template(t, "tojson floats",
+        "{{ data|tojson }}",
+        {{"data", json::array({0.1, 1.0, 100.0, 8.3, 123456789.0, 48.858844, 0.30000000000000004, -0.0, 5.960464477539063e-08})}},
+        "[0.1, 1.0, 100.0, 8.3, 123456789.0, 48.858844, 0.30000000000000004, -0.0, 5.960464477539063e-08]"
+    );
+
+    test_template(t, "tojson floats, exponent",
+        "{{ data|tojson }}",
+        {{"data", json::array({1e15, 1e16, 0.0001, 0.00001, 1.5e10, -2.5e-7, 5e-324, 1.7976931348623157e308})}},
+        "[1000000000000000.0, 1e+16, 0.0001, 1e-05, 15000000000.0, -2.5e-07, 5e-324, 1.7976931348623157e+308]"
+    );
+
+    test_template(t, "tojson floats, nested with indent=2",
+        "{{ data|tojson(indent=2) }}",
+        {{"data", {{"total", 20.0}, {"items", json::array({{{"price", 9.99}, {"qty", 2}}})}}}},
+        "{\n  \"total\": 20.0,\n  \"items\": [\n    {\n      \"price\": 9.99,\n      \"qty\": 2\n    }\n  ]\n}"
+    );
+
+    test_template(t, "float|string",
+        "{{ a|string }} {{ b|string }} {{ (b * 10)|string }}",
+        {{"a", 1.0}, {"b", 1e308}},
+        "1.0 1e+308 inf"
+    );
+
+    // upstream #30483
+    test_template(t, "nan and inf",
+        "{{ [p|float, n|float, q|float]|tojson }} {{ {p|float: 1}|tojson }} {{ p|float|string }} {{ n|float|string }} {{ q|float|safe }}",
+        {{"p", "inf"}, {"n", "-inf"}, {"q", "nan"}},
+        "[Infinity, -Infinity, NaN] {\"Infinity\": 1} inf -inf nan"
+    );
+
+    // upstream #30533
+    test_template(t, "loop assignments do not persist between iterations",
+        "{% for i in [1, 2] %}{% if i == 1 %}{% set x = 7 %}{% endif %}{{ x is defined }};{% endfor %}",
+        json::object(),
+        "True;False;"
+    );
+
+    test_template(t, "loop assignments shadow outer variables",
+        "{% set x = 9 %}{% for i in [1, 2] %}{% if i == 1 %}{% set x = 7 %}{% endif %}{{ x }};{% endfor %}{{ x }}",
+        json::object(),
+        "7;9;9"
+    );
+
+    test_template(t, "nested loop assignments do not persist between iterations",
+        "{% for i in [1, 2] %}{% for j in [1, 2] %}{% if j == 1 %}{% set x = i %}{% endif %}{{ x is defined }};{% endfor %}{% endfor %}",
+        json::object(),
+        "True;False;True;False;"
+    );
+
+    test_template(t, "reasoning is local to each message",
+        "{% for m in messages %}{% if m.reasoning_content is string %}{% set reasoning_content = m.reasoning_content %}{% elif '</think>' in m.content %}{% set reasoning_content = m.content.split('</think>')[0].split('<think>')[-1] %}{% endif %}[{{ reasoning_content is defined }}:{{ reasoning_content if reasoning_content is defined else '' }}]{% endfor %}",
+        {{"messages", json::array({
+            {{"reasoning_content", "first"}, {"content", "answer"}},
+            {{"content", "answer"}},
+            {{"reasoning_content", nullptr}, {"content", "answer"}},
+            {{"reasoning_content", 1}, {"content", "answer"}},
+            {{"reasoning_content", ""}, {"content", "answer"}},
+            {{"content", "<think>embedded</think>answer"}},
+            {{"content", "answer"}}
+        })}},
+        "[True:first][False:][False:][False:][True:][True:embedded][False:]"
+    );
+
+    test_template(t, "namespace state still crosses iterations",
+        "{% set ns = namespace(n=0) %}{% for i in [1, 2, 3] %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}",
+        json::object(),
+        "6"
+    );
+
+    test_template(t, "golden: our template's tojson lines",
+        L22_GOLDEN_SNIPPET,
+        l22_golden_vars(),
+        "\n{\"type\": \"function\", \"function\": {\"name\": \"set_view\", \"parameters\": {\"type\": \"object\", \"properties\": "
+        "{\"x\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 100.0, \"default\": 1.5}}}}}|"
+        "<parameter=lat>48.858844</parameter><parameter=zoom>15.0</parameter><parameter=style>{\"opacity\": 0.85}</parameter>"
+        "<parameter=name>Paris</parameter>"
+    );
+
+    // switch off: the old output
+    jinja::set_l22_jsonfloat(false);
+
+    test_template(t, "off: tojson floats",
+        "{{ data|tojson }}",
+        {{"data", json::array({0.1, 1.0, 100.0, 123456789.0, 48.858844})}},
+        "[0.1, 1, 100, 1.23457e+08, 48.8588]"
+    );
+
+    test_template(t, "off: float|string",
+        "{{ a|string }}",
+        {{"a", 1.0}},
+        "1"
+    );
+
+    test_template(t, "off: loop assignments persist between iterations",
+        "{% for i in [1, 2] %}{% if i == 1 %}{% set x = 7 %}{% endif %}{{ x is defined }};{% endfor %}",
+        json::object(),
+        "True;True;"
+    );
+
+    test_template(t, "off: golden",
+        L22_GOLDEN_SNIPPET,
+        l22_golden_vars(),
+        "\n{\"type\": \"function\", \"function\": {\"name\": \"set_view\", \"parameters\": {\"type\": \"object\", \"properties\": "
+        "{\"x\": {\"type\": \"number\", \"minimum\": 0, \"maximum\": 100, \"default\": 1.5}}}}}|"
+        "<parameter=lat>48.8588</parameter><parameter=zoom>15</parameter><parameter=style>{\"opacity\": 0.85}</parameter>"
+        "<parameter=name>Paris</parameter>"
+    );
+}
+
+// test-jinja --l22-golden <template>: render a whole chat template with float tool data, old and new float output, and
+// check that the new one carries the numbers as written
+static int l22_golden(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "l22-golden: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    const std::string tmpl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    json gv = l22_golden_vars();
+    json tool_call = {
+        {"type", "function"},
+        {"function", {{"name", "set_view"}, {"arguments", gv.at("args")}}}
+    };
+    json messages = json::array({
+        {{"role", "system"}, {"content", "You are a helpful assistant."}},
+        {{"role", "user"}, {"content", "Show Paris."}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({tool_call})}},
+        {{"role", "tool"}, {"content", "{\"ok\": true, \"zoom\": 15.0}"}},
+        {{"role", "user"}, {"content", "Thanks."}}
+    });
+    json vars = {
+        {"messages", messages},
+        {"tools", gv.at("tools")},
+        {"add_generation_prompt", true},
+        {"bos_token", ""},
+        {"eos_token", "<|im_end|>"}
+    };
+
+    auto render = [&](bool on) -> std::string {
+        jinja::set_l22_jsonfloat(on);
+        jinja::lexer lexer;
+        auto lexer_res = lexer.tokenize(tmpl);
+        jinja::program ast = jinja::parse_from_tokens(lexer_res);
+        jinja::context ctx(tmpl);
+        jinja::global_from_json(ctx, vars, true);
+        jinja::runtime runtime(ctx);
+        const jinja::value results = runtime.execute(ast);
+        auto parts = runtime.gather_string_parts(results);
+        std::string out;
+        for (const auto & part : parts->as_string().parts) {
+            out += part.val;
+        }
+        return out;
+    };
+
+    std::string r_old, r_new;
+    try {
+        r_old = render(false);
+        r_new = render(true);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "l22-golden: render failed: %s\n", e.what());
+        return 1;
+    }
+    jinja::set_l22_jsonfloat(false);
+
+    printf("===== old floats =====\n%s\n===== new floats =====\n%s\n=====\n", r_old.c_str(), r_new.c_str());
+    int bad = 0;
+    for (const char * want : { "\"minimum\": 0.0", "\"maximum\": 100.0", "\"default\": 1.5", "48.858844", "15.0", "0.85" }) {
+        if (r_new.find(want) == std::string::npos) {
+            printf("l22-golden: new render misses %s\n", want);
+            bad++;
+        }
+    }
+    if (r_old.find("48.8588") == std::string::npos || r_old.find("48.858844") != std::string::npos) {
+        printf("l22-golden: old render does not show the old 6-digit float\n");
+        bad++;
+    }
+    printf("l22-golden: %s\n", bad == 0 ? "OK" : "FAILED");
+    return bad == 0 ? 0 : 1;
 }

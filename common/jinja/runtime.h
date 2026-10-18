@@ -74,16 +74,13 @@ struct context {
     }
     ~context() = default;
 
-    context(const context & parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto & pvar = parent.env->as_ordered_object();
-        for (const auto & pair : pvar) {
-            set_val(pair.first, pair.second);
-        }
-        current_time = parent.current_time;
-        is_get_stats = parent.is_get_stats;
-        src = parent.src;
-    }
+    // inherit variables (for example, when entering a new scope). Upstream #30562: copy the parent's env instead of
+    // inserting every key again (same keys in the same order: the parent starts with the same constants)
+    context(const context & parent) :
+        src(parent.src),
+        current_time(parent.current_time),
+        is_get_stats(parent.is_get_stats),
+        env(mk_val<value_object>(*parent.env)) {}
 
     value get_val(const std::string & name) {
         value default_val = mk_val<value_undefined>(name);
