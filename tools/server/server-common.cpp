@@ -6,9 +6,18 @@
 #include "mtmd-helper.h"
 #include "chat.h"
 #include "base64.hpp"
+#include "tokcache.h"             // [TAG_FN_L22_TOKCACHE]
+#include "../../src/llama-ext.h"  // [TAG_FN_L22] llama_model_fn_env
+#include "../../src/llama-fn-l22.h"
+
+namespace jinja { // [TAG_FN_L22_JSONFLOAT] common/jinja/value.h
+void set_l22_jsonfloat(bool on);
+bool l22_jsonfloat();
+}
 
 #include "server-common.h"
 
+#include <atomic>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -16,6 +25,7 @@
 #include <cstring>
 #include <type_traits>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 #ifdef _WIN32
@@ -864,6 +874,72 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
     return result;
 }
 
+// [TAG_FN_L22] round 22 P2 ------------------------------------------------------------------------------------------
+
+namespace {
+
+struct server_l22_cfg {
+    std::once_flag    once;
+    std::atomic<bool> set{false};    // server_fn_l22_init ran
+    std::atomic<bool> tokcache{false};
+    std::atomic<int>  passlog{0};
+};
+
+server_l22_cfg  g_l22;
+common_tokcache g_l22_tokcache(4, (size_t) 64 << 20, 4096); // [TAG_FN_L22_TOKCACHE] the last 4 prompts of 4 KB or more
+
+void server_l22_apply(const llama_model * model, bool with_jsonfloat) {
+    const bool tc = llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE"));
+    const bool vf = llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_TOKCACHE_VERIFY"));
+    const char * pl = llama_model_fn_env(model, "LLAMA_FN_L22_PASSLOG");
+    g_l22.tokcache.store(tc);
+    g_l22.passlog.store(pl ? std::atoi(pl) : 0);
+    g_l22_tokcache.n_verify.store(tc && vf ? 32 : 0);
+    if (with_jsonfloat) {
+        jinja::set_l22_jsonfloat(llama_fn_l22_switch_on(llama_model_fn_env(model, "LLAMA_FN_L22_JSONFLOAT")));
+    }
+}
+
+// the environment's values until server_fn_l22_init sets the model's
+void server_l22_env_once() {
+    std::call_once(g_l22.once, [] {
+        if (!g_l22.set.load()) {
+            server_l22_apply(nullptr, false); // jinja reads LLAMA_FN_L22_JSONFLOAT itself
+        }
+    });
+}
+
+} // namespace
+
+void server_fn_l22_init(const llama_model * model) {
+    server_l22_apply(model, true);
+    g_l22.set.store(true);
+    llama_fn_l22_log("switch", "server text tools: JSONFLOAT=%d TOKCACHE=%d TOKCACHE_VERIFY=%d PASSLOG=%d",
+            jinja::l22_jsonfloat() ? 1 : 0, g_l22.tokcache.load() ? 1 : 0, g_l22_tokcache.n_verify.load() > 0 ? 1 : 0,
+            g_l22.passlog.load());
+}
+
+// [TAG_FN_L22_TOKCACHE] the prompt text through the tokenizer cache when it is on; a timing line for long texts or slow
+// encodes (also with the cache off at PASSLOG >= 1: the number to compare against)
+static llama_tokens server_tokenize_text(const llama_vocab * vocab, const std::string & s, bool add_special, bool parse_special) {
+    server_l22_env_once();
+    const bool use = g_l22.tokcache.load(std::memory_order_relaxed);
+    if (!use && g_l22.passlog.load(std::memory_order_relaxed) < 1) {
+        return common_tokenize(vocab, s, add_special, parse_special);
+    }
+    const int64_t t0 = ggml_time_us();
+    common_tokcache_stats st;
+    llama_tokens res = common_tokenize_cached(vocab, s, add_special, parse_special, use ? &g_l22_tokcache : nullptr, &st);
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    if (s.size() >= 65536 || ms >= 5.0 || st.mismatch) {
+        static const char * paths[] = { "full encode", "same text", "prefix re-use", "cache off" };
+        llama_fn_l22_log("turn", "[TAG_FN_L22_TOKCACHE] tokenize %zu bytes -> %zu ids in %.2f ms (%s, re-used %zu ids / %zu bytes%s%s)",
+                s.size(), res.size(), ms, paths[std::min(std::max(st.path, 0), 3)], st.reused_ids, st.reused_bytes,
+                st.verified ? ", verified" : "", st.mismatch ? ", MISMATCH: the cache is off from now on" : "");
+    }
+    return res;
+}
+
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
     // or the first element of the json_prompt array is a string.
@@ -877,10 +953,10 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 
                 llama_tokens p;
                 if (first) {
-                    p = common_tokenize(vocab, s, add_special, parse_special);
+                    p = server_tokenize_text(vocab, s, add_special, parse_special);
                     first = false;
                 } else {
-                    p = common_tokenize(vocab, s, false, parse_special);
+                    p = server_tokenize_text(vocab, s, false, parse_special);
                 }
 
                 prompt_tokens.insert(prompt_tokens.end(), p.begin(), p.end());
@@ -894,7 +970,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
         }
     } else {
         auto s = json_prompt.template get<std::string>();
-        prompt_tokens = common_tokenize(vocab, s, add_special, parse_special);
+        prompt_tokens = server_tokenize_text(vocab, s, add_special, parse_special);
     }
 
     return prompt_tokens;
@@ -936,8 +1012,76 @@ server_tokens process_mtmd_prompt(
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
-    for (auto & file : files) {
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+
+    // [TAG_FN_L22_IMGDEC] pictures that stb_image reads (PNG, JPEG, BMP, GIF) are decoded on several threads first
+    // (mtmd_helper_bitmap_init_from_buf is thread-safe); the loop below takes them in file order, the rest as before
+    std::vector<mtmd_helper_bitmap_wrapper> pre(files.size(), mtmd_helper_bitmap_wrapper{ nullptr, nullptr });
+    std::vector<char> pre_done(files.size(), 0);
+    struct pre_guard { // frees what an early throw leaves behind
+        std::vector<mtmd_helper_bitmap_wrapper> & v;
+        ~pre_guard() {
+            for (auto & w : v) {
+                if (w.bitmap) {
+                    mtmd_bitmap_free(w.bitmap);
+                }
+                if (w.video_ctx) {
+                    mtmd_helper_video_free(w.video_ctx);
+                }
+            }
+        }
+    } pre_free{ pre };
+    server_l22_env_once();
+    {
+        const int n_thr = mctx ? mtmd_l22_imgdec_threads(mctx) : 1;
+        std::vector<size_t> idx;
+        if (n_thr > 1) {
+            for (size_t i = 0; i < files.size(); i++) {
+                const auto & f = files[i];
+                const size_t n = f.size();
+                const unsigned char * b = (const unsigned char *) f.data();
+                const bool png = n >= 8 && std::memcmp(b, "\x89PNG\r\n\x1a\n", 8) == 0;
+                const bool jpg = n >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF;
+                const bool bmp = n >= 2 && b[0] == 'B' && b[1] == 'M';
+                const bool gif = n >= 4 && std::memcmp(b, "GIF8", 4) == 0;
+                if (png || jpg || bmp || gif) {
+                    idx.push_back(i);
+                }
+            }
+        }
+        if (idx.size() >= 2) {
+            const int64_t t0 = ggml_time_us();
+            std::atomic<size_t> next{0};
+            auto work = [&]() {
+                for (size_t k = next.fetch_add(1); k < idx.size(); k = next.fetch_add(1)) {
+                    const size_t i = idx[k];
+                    pre[i] = mtmd_helper_bitmap_init_from_buf(mctx, files[i].data(), files[i].size(), is_placeholder, init_opt);
+                    pre_done[i] = 1;
+                }
+            };
+            std::vector<std::thread> th;
+            const size_t n_th = std::min((size_t) n_thr, idx.size());
+            for (size_t t = 1; t < n_th; t++) {
+                try {
+                    th.emplace_back(work);
+                } catch (...) {
+                    break; // no thread: the caller decodes the rest
+                }
+            }
+            work();
+            for (auto & t : th) {
+                t.join();
+            }
+            if (g_l22.passlog.load(std::memory_order_relaxed) >= 1) {
+                llama_fn_l22_log("media", "[TAG_FN_L22_IMGDEC] %zu pictures decoded on %zu threads in %.1f ms", idx.size(),
+                        th.size() + 1, (ggml_time_us() - t0)/1000.0);
+            }
+        }
+    }
+
+    for (size_t i_file = 0; i_file < files.size(); i_file++) {
+        const auto & file = files[i_file];
+        auto out = pre_done[i_file] ? pre[i_file] : mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+        pre[i_file] = mtmd_helper_bitmap_wrapper{ nullptr, nullptr };
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
         }

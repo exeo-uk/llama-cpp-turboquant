@@ -11,6 +11,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "tokcache.h" // [TAG_FN_L22_TOKCACHE]
 #include "unicode.h"
 
 #include "../src/llama-ext.h" // [TAG_TURBOT] llama_turbot_set_plan_path, [TAG_TURBOT_ANY_SIDECAR] llama_turbot_set_sidecar_path
@@ -1856,6 +1857,24 @@ std::vector<llama_token> common_tokenize(
         result.resize(n_tokens);
     }
     return result;
+}
+
+// [TAG_FN_L22_TOKCACHE]
+std::vector<llama_token> common_tokenize_cached(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+                        bool   add_special,
+                        bool   parse_special,
+          common_tokcache    * cache,
+    common_tokcache_stats    * stats) {
+    if (cache == nullptr) {
+        if (stats) {
+            *stats = common_tokcache_stats();
+            stats->path = 3;
+        }
+        return common_tokenize(vocab, text, add_special, parse_special);
+    }
+    return common_tokcache_tokenize(*cache, vocab, text, add_special, parse_special, stats);
 }
 
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
