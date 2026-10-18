@@ -288,6 +288,12 @@ void res_queue_drop(res_table * t, const std::vector<std::pair<int, int>> & ex) 
     }
 }
 
+// no decode or prompt scope runs now nor ran in the last 50 ms
+bool res_quiet() {
+    int64_t act = 0;
+    return !llama_fn_p5_busy(&act) && llama_fn_p5_now_us() - act >= 50000;
+}
+
 // [TAG_FN_L22_RESSET] the layers in the prefill stream's lend range, estimated as llama_moe_hot_lend places it
 // (llama-moecache.cpp) for the banks pfs_take asks for (llama-prefill-stream.cpp): before the first lend the hot set's
 // view does not mark them yet, and their residents would look VRAM-held at ready
@@ -532,7 +538,11 @@ void res_ssd_plan(res_table * t, int stage) {
     for (const auto & x : drop) {
         dropped += t->L[x.first].eb;
     }
-    t->dropq.insert(t->dropq.end(), drop.begin(), drop.end()); // t->mtx is held
+    if (res_quiet()) {
+        res_drop(t, drop); // now: the room it frees counts for the warm pass and the next plan
+    } else {
+        t->dropq.insert(t->dropq.end(), drop.begin(), drop.end()); // t->mtx is held
+    }
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDTIER] %s: the streamed set needs %.2f GiB, %.2f GiB in RAM, %.2f GiB available (floor %.1f, "
             "pins pending %.2f): %.2f GiB of %zu least-routed cold experts are read by direct I/O in prompts (%.2f GiB of them "
             "leave the working set)\n", __func__, stage == 0 ? "before the warm pass" : "what does not fit", need/1073741824.0,
@@ -1046,7 +1056,11 @@ void llama_fn_p5_after_warm(const llama_model & model, size_t warmed, double sec
         for (const auto & x : d) {
             dropped += t->L[x.first].eb;
         }
-        res_queue_drop(t, d);
+        if (res_quiet()) {
+            res_drop(t, d); // now: the stage-1 plan below sees the room it frees
+        } else {
+            res_queue_drop(t, d);
+        }
     }
     res_ssd_plan(t, 1);
     double share = 1.0;

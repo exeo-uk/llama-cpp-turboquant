@@ -891,8 +891,8 @@ static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_
         n_done += done[i].load() ? 1 : 0;
     }
     const size_t warmed = std::min(used.load(), total);
-    LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] [TAG_FN_L22_RESSET] %.2f of %.2f GiB of streamed routed experts read into the working set in "
-            "%.1f s by %d threads (%.2f GiB left to VRAM, pins and direct I/O; %.1f GiB of RAM was available, %.1f GiB kept free, "
+    LLAMA_LOG_INFO("%s: [TAG_FN_L15_WARM] [TAG_FN_L22_RESSET] %.2f of %.2f GiB of routed experts read into the working set in "
+            "%.1f s by %d threads (the streamed set only: %.2f GiB left to VRAM, pins and direct I/O; %.1f GiB of RAM was available, %.1f GiB kept free, "
             "%.2f GiB of pins pending; working set %.1f -> %.1f GiB)\n", __func__, warmed/1073741824.0, total/1073741824.0, secs,
             n_thr, skipped/1073741824.0, ms.ullAvailPhys/1073741824.0, keep/1073741824.0, pin_pending/1073741824.0,
             pm0.WorkingSetSize/1073741824.0, pm1.WorkingSetSize/1073741824.0);
@@ -901,7 +901,7 @@ static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_
         for (size_t i = 0; i < n_use; ++i) {
             left += done[i].load() ? 0 : pcs[i].n;
         }
-        LLAMA_LOG_WARN("%s: [TAG_FN_L15_WARM] %.2f GiB of streamed routed experts did not fit in the available RAM (%s): the idle "
+        LLAMA_LOG_WARN("%s: [TAG_FN_L15_WARM] %.2f GiB of routed experts did not fit in the available RAM (streamed set, %s): the idle "
                 "re-warm or the SSD tier takes them\n", __func__, left/1073741824.0, why.load() ? why.load() : "stopped");
     }
     *secs_out = secs;
