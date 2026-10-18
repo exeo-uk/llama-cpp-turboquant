@@ -3516,19 +3516,28 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // on the old object and take the RECAP path (capture + cudaGraphExecUpdate); the property compare is unchanged.
 // [TAG_FN_L22_GRAPHKEEP] rows: the token rows of the graph, from the weight matmuls (src1 rows; MUL_MAT_ID src1->ne[2]) and
 // the embedding GET_ROWS. Not the widest node: GDN decode graphs have conv / concat nodes with ne[1] = d_inner.
+// Only a src0 in a weights buffer counts for MUL_MAT / GET_ROWS: a leaf input in the compute buffer is not a weight. The
+// Flash-Next QSA selection gathers the picked pools' cell indices with GET_ROWS(pool_idxs, top_k) of n_top_pool (512) ids
+// per decode row, so beyond 512 pools (long contexts) every decode graph counted 512 rows and ran eagerly (no CUDA graph:
+// 57.7 vs 20.2 ms per decode step at 18K, r22 end test T2 identity arms)
+static bool ggml_cuda_fn_l22_is_weight(const ggml_tensor * a) {
+    return a->op == GGML_OP_NONE && a->view_src == nullptr && a->buffer != nullptr &&
+           ggml_backend_buffer_get_usage(a->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 static int64_t ggml_cuda_fn_l22_node_rows(const ggml_tensor * t) {
     const ggml_tensor * a = t->src[0];
     const ggml_tensor * b = t->src[1];
     if (a == nullptr || b == nullptr) {
         return 0;
     }
-    if (t->op == GGML_OP_MUL_MAT && a->op == GGML_OP_NONE) {
+    if (t->op == GGML_OP_MUL_MAT && ggml_cuda_fn_l22_is_weight(a)) {
         return ggml_nrows(b) / std::max<int64_t>(1, a->ne[2]*a->ne[3]);
     }
     if (t->op == GGML_OP_MUL_MAT_ID) {
         return b->ne[2];
     }
-    if (t->op == GGML_OP_GET_ROWS && a->op == GGML_OP_NONE && b->type == GGML_TYPE_I32) {
+    if (t->op == GGML_OP_GET_ROWS && ggml_cuda_fn_l22_is_weight(a) && b->type == GGML_TYPE_I32) {
         return ggml_nelements(b);
     }
     return 0;
