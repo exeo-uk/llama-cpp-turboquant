@@ -1,5 +1,6 @@
 #include <string>
 #include <iostream>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <random>

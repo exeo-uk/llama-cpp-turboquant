@@ -6416,8 +6416,8 @@ struct clip_lend_scope {
 
     clip_lend_scope(clip_ctx * c, const clip_image_f32_batch * imgs) : ctx(c) {
         auto & L = ctx->lend;
-        if (!L.on) {
-            return;
+        if (!L.on || ctx->cpu_only) {
+            return; // no lock: a CPU encode can take minutes
         }
         lk = std::unique_lock<std::recursive_mutex>(L.mu);
         if (ctx->cpu_only) {
