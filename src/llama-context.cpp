@@ -7322,6 +7322,19 @@ void llama_context::l22_oom_pre(size_t need) {
     if (!llama_fn_pin_active()) {
         return;
     }
+    // the compute buffers the context holds now are freed before the reserve allocates (sched_reserve makes a new
+    // scheduler): only the rest is new device memory. P6 unpins for good, so a gross need would cost pins every switch
+    size_t held = 0;
+    if (sched) {
+        ggml_backend_dev_t hd = llama_moe_hot_device(model);
+        for (auto & backend : backends) {
+            ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+            if (d != nullptr && (hd != nullptr ? d == hd : ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU)) {
+                held += ggml_backend_sched_get_buffer_size(sched.get(), backend.get());
+            }
+        }
+    }
+    need = need > held ? need - held : 0;
     uint64_t budget = 0, usage = 0;
     if (!llama_fn_dxgi_query(0, 0, &budget, &usage)) {
         return;
