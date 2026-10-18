@@ -24,3 +24,9 @@ llama_fn_arena_ptr llama_fn_arena_build(llama_model & model, llama_model_loader 
 // [TAG_FN_L14_ARENA] [p, p + n) lies in an arena chunk that is registered with the GPU driver (at most
 // LLAMA_FN_L14_ARENA_PIN_MIB of the arena, default 0): a device copy may read it directly, without a staging copy
 bool llama_fn_arena_pinned(const void * p, size_t n);
+
+// [TAG_FN_L22_PIN] the first segment of [p, p + n) for llama_fn_pin_query: up to the end of the registered chunk that
+// holds p (*pinned = true), else up to the next registered chunk or n (*pinned = false)
+size_t llama_fn_arena_pinned_span(const void * p, size_t n, bool * pinned);
+// [TAG_FN_L22_PIN] some arena chunk is registered (cheap)
+bool llama_fn_arena_pinned_any();

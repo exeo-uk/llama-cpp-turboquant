@@ -3,7 +3,7 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 
 set(TARGET moe-bridge-probe)
-add_executable(${TARGET} moe-bridge-probe.cu moe-bridge-selftest.cpp) # [TAG_MOE_BRIDGE] --selftest uses ggml
+add_executable(${TARGET} moe-bridge-probe.cu moe-bridge-selftest.cpp moe-bridge-pin.cpp) # [TAG_MOE_BRIDGE] --selftest uses ggml; [TAG_FN_L22_PIN] test 7
 target_link_libraries(${TARGET} PRIVATE ggml CUDA::cudart CUDA::cuda_driver Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if (MSVC)

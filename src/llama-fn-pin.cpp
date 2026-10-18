@@ -1,10 +1,1305 @@
 // [TAG_FN_L22_PIN] round 22 P6: pinned (registered) host ranges of the streamed experts, the DXGI budget helper and the
-// out-of-memory unpin hook, src/llama-fn-l22.h. P0 stub: no pins.
+// out-of-memory unpin hook (src/llama-fn-l22.h, plan section P6, GPU-fault class rules 3.6).
+//
+// LLAMA_FN_L22_PIN (qwen4exp profile / environment; unset or 0 = nothing here runs: no thread, no state, no call):
+//   1  at ready (llama_fn_pin_on_ready, called by the warm pass after the FIT and the residency table), the RAM-class
+//      experts are planned as per-expert coalesced ranges of the mapped model (LLAMA_FN_L22_PIN_UNIT=ranges, default;
+//      spans = one span per fully streamed layer; arena = the fallback copy), marked PIN so the warm pass skips them,
+//      and one background thread registers them range by range (Portable | ReadOnly) on pages this process has not
+//      touched: the driver brings them in. Budget after every range: DXGI NON_LOCAL (budget - usage - charge >=
+//      LLAMA_FN_L22_PIN_MARGIN_MIB 8192), DXGI LOCAL (headroom >= min(reserve_need + LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB
+//      1024, headroom before the first pin - 256 MiB)), RAM (available - new bytes >= LLAMA_FN_L22_PIN_FLOOR_MIB 6144 +
+//      LLAMA_FN_L22_PIN_WARM_KEEP_MIB 0), LLAMA_FN_L22_PIN_MAX_MIB (0 = no cap). Stop at the first refusal, CUDA error
+//      or rule; the last range is unregistered on a rule break.
+//   2  as 1, but each range is touched (read in) before it is registered ("touched" mode, when the probe says
+//      untouched registration fails or is slow but touched pages lock).
+// The arena (spec 9; LLAMA_FN_L22_PIN_UNIT=arena or a refusal at the very first range): committed private chunks of
+// 1 GiB (<= min(LLAMA_FN_L22_PIN_ARENA_MIB 16384, commit headroom - 8 GiB)) registered at once (before touch), filled
+// with the planned experts by direct I/O (llama_fn_dio_submit; the mapped bytes when it cannot), checked against the
+// mapping; llama_fn_pin_query answers the copy's address. Arena experts are not marked PIN: the decode CPU path still
+// reads their mapped copies, which the warm pass keeps.
+// After registration the thread watches every 2 s: LOCAL headroom below the watcher threshold (reserve_need, at most
+// the ready headroom - 512 MiB; LLAMA_FN_L22_PIN_TEST_LOCAL_MIB forces one) or available RAM below the floor for two
+// samples unpins the last ranges (as the OOM hook). Any unpin ends registration for the process (no relock).
+// llama_fn_pin_on_oom(need): the callers' allocation hook (plan 3.6): drain the last ranges (tickets back to 0, bounded),
+// unregister them until LOCAL headroom >= need + 512 MiB (or that many bytes when DXGI shows no charge), unmark.
 
 #include "llama-fn-l22.h"
+#include "llama-fn-pin.h"
+#include "llama-fn-pin-core.h"
+
+#include "llama-fn-arena.h"
+#include "llama-fn-auto.h"
+#include "llama-fn-tier.h"
+#include "llama-impl.h"
+#include "llama-model.h"
+#include "llama-moecache.h"
+
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#    include <psapi.h>
+#    include <dxgi1_4.h>
+#else
+#    include <sys/mman.h>
+#    include <unistd.h>
+#    include <fstream>
+#endif
+
+namespace {
+
+constexpr uint64_t FN_MIB = 1ull << 20;
+constexpr uint64_t FN_GIB = 1ull << 30;
+
+int64_t fn_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void fn_sleep_ms(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+double fn_gib(uint64_t b) {
+    return (double) b/(double) FN_GIB;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// OS helpers
+
+size_t fn_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? si.dwPageSize : 4096;
+#else
+    const long p = sysconf(_SC_PAGESIZE);
+    return p > 0 ? (size_t) p : 4096;
+#endif
+}
+
+uint64_t fn_avail_ram() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullAvailPhys : 0;
+#else
+    std::ifstream f("/proc/meminfo");
+    std::string k;
+    uint64_t v = 0;
+    std::string unit;
+    while (f >> k >> v >> unit) {
+        if (k == "MemAvailable:") {
+            return v*1024;
+        }
+    }
+    return 0;
+#endif
+}
+
+uint64_t fn_total_ram() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
+#else
+    const long n = sysconf(_SC_PHYS_PAGES);
+    const long p = sysconf(_SC_PAGESIZE);
+    return n > 0 && p > 0 ? (uint64_t) n*(uint64_t) p : 0;
+#endif
+}
+
+// commit limit - commit charge (bytes); 0 when unknown
+uint64_t fn_commit_room() {
+#if defined(_WIN32)
+    PERFORMANCE_INFORMATION pi;
+    pi.cb = sizeof(pi);
+    if (!GetPerformanceInfo(&pi, sizeof(pi))) {
+        return 0;
+    }
+    return pi.CommitLimit > pi.CommitTotal ? (uint64_t) (pi.CommitLimit - pi.CommitTotal)*(uint64_t) pi.PageSize : 0;
+#else
+    return fn_avail_ram();
+#endif
+}
+
+// the share of [p, p + n) in this process's working set, one page sampled per 2 MiB (at most 4096 samples)
+double fn_resident_share(const uint8_t * p, size_t n) {
+    if (n == 0) {
+        return 1.0;
+    }
+    const size_t page = fn_page_size();
+    size_t step = (size_t) 2 << 20;
+    while (n/step > 4096) {
+        step *= 2;
+    }
+#if defined(_WIN32)
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> w;
+    for (size_t o = 0; o < n; o += step) {
+        PSAPI_WORKING_SET_EX_INFORMATION x = {};
+        x.VirtualAddress = (PVOID) (p + o/page*page);
+        w.push_back(x);
+    }
+    if (w.empty() || !QueryWorkingSetEx(GetCurrentProcess(), w.data(), (DWORD) (w.size()*sizeof(w[0])))) {
+        return 0.0;
+    }
+    size_t valid = 0;
+    for (const auto & x : w) {
+        valid += x.VirtualAttributes.Valid ? 1 : 0;
+    }
+    return (double) valid/(double) w.size();
+#elif !defined(__linux__)
+    (void) p; (void) page;
+    return 0.0;
+#else
+    size_t valid = 0;
+    size_t total = 0;
+    for (size_t o = 0; o < n; o += step) {
+        unsigned char v = 0;
+        void * a = (void *) ((uintptr_t) (p + o)/page*page);
+        if (mincore(a, page, &v) == 0) {
+            valid += (v & 1) ? 1 : 0;
+        }
+        total++;
+    }
+    return total ? (double) valid/(double) total : 0.0;
+#endif
+}
+
+// [lo, hi) lies in one mapped view of a file
+bool fn_one_view(const uint8_t * lo, const uint8_t * hi) {
+#if defined(_WIN32)
+    if (hi <= lo) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION a = {};
+    MEMORY_BASIC_INFORMATION b = {};
+    if (!VirtualQuery(lo, &a, sizeof(a)) || !VirtualQuery(hi - 1, &b, sizeof(b))) {
+        return false;
+    }
+    return a.Type == MEM_MAPPED && b.Type == MEM_MAPPED && a.AllocationBase == b.AllocationBase;
+#else
+    (void) lo; (void) hi;
+    return false;
+#endif
+}
+
+// asks the OS to read [p, p + n) (asynchronous); a no-op elsewhere
+void fn_prefetch(const uint8_t * p, size_t n) {
+#if defined(_WIN32)
+    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (pf != nullptr && n > 0) {
+        WIN32_MEMORY_RANGE_ENTRY e = { (PVOID) p, (SIZE_T) n };
+        pf(GetCurrentProcess(), 1, &e, 0);
+    }
+#else
+    (void) p; (void) n;
+#endif
+}
+
+void * fn_commit_alloc(size_t n) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void * p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+void fn_commit_free(void * p, size_t n) {
+    if (p == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    (void) n;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, n);
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DXGI: the adapter by LUID (plan P6.2)
+
+using fn_luid_fn_t  = bool (*)(ggml_backend_dev_t, uint64_t *);
+using fn_reg_fn_t   = bool (*)(void *, size_t);
+using fn_unreg_fn_t = void (*)(void *);
+using fn_devptr_t   = void * (*)(const void *); // R-P14-5 (P7): cudaHostGetDevicePointer of a registered address
+using fn_regmap_t   = bool (*)(void *, size_t, void **); // R-P14-5 (P7): register Portable | ReadOnly | Mapped + device pointer
+using fn_oomfn_t    = bool (*)(size_t, void *);
+using fn_set_oom_t  = void (*)(fn_oomfn_t, void *);    // R-P7-2 (P7): ggml-cuda calls it once before failing an allocation
+
+std::atomic<uint64_t> g_default_luid{0};
+
+#if defined(_WIN32)
+struct fn_dxgi_entry {
+    uint64_t        luid   = 0;
+    IDXGIAdapter3 * ad     = nullptr;
+    size_t          ded    = 0;
+    UINT            vendor = 0;
+};
+
+std::mutex                 g_dxgi_mtx;
+std::vector<fn_dxgi_entry> g_dxgi;
+bool                       g_dxgi_done = false;
+
+void fn_dxgi_enum_locked() {
+    if (g_dxgi_done) {
+        return;
+    }
+    g_dxgi_done = true;
+    HMODULE lib = LoadLibraryA("dxgi.dll");
+    using create_t = HRESULT (WINAPI *)(REFIID, void **);
+    create_t create = lib ? (create_t) (void *) GetProcAddress(lib, "CreateDXGIFactory1") : nullptr;
+    IDXGIFactory1 * fac = nullptr;
+    if (!create || FAILED(create(__uuidof(IDXGIFactory1), (void **) &fac)) || !fac) {
+        return;
+    }
+    IDXGIAdapter1 * a1 = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &a1) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d = {};
+        IDXGIAdapter3 * a3 = nullptr;
+        if (SUCCEEDED(a1->GetDesc1(&d)) && SUCCEEDED(a1->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &a3))) {
+            fn_dxgi_entry e;
+            static_assert(sizeof(d.AdapterLuid) == sizeof(uint64_t), "LUID size");
+            memcpy(&e.luid, &d.AdapterLuid, sizeof(uint64_t));
+            e.ad     = a3;
+            e.ded    = (size_t) d.DedicatedVideoMemory;
+            e.vendor = d.VendorId;
+            g_dxgi.push_back(e);
+        }
+        a1->Release();
+    }
+    fac->Release();
+}
+#endif
+
+// the LUID of a device (nullptr: CUDA device 0): the CUDA proc (P7), else the NVIDIA adapter whose dedicated memory is
+// closest to its total. 0: no such device (no CUDA device visible)
+uint64_t fn_dev_luid(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    if (dev == nullptr && reg != nullptr && ggml_backend_reg_dev_count(reg) > 0) {
+        dev = ggml_backend_reg_dev_get(reg, 0);
+    }
+    if (dev == nullptr) {
+        return 0;
+    }
+    auto fn = reg ? (fn_luid_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_device_luid") : nullptr;
+    uint64_t l = 0;
+    if (fn != nullptr && dev != nullptr && fn(dev, &l) && l != 0) {
+        return l;
+    }
+#if defined(_WIN32)
+    size_t fr = 0;
+    size_t tot = 0;
+    if (dev != nullptr) {
+        ggml_backend_dev_memory(dev, &fr, &tot);
+    }
+    std::lock_guard<std::mutex> lk(g_dxgi_mtx);
+    fn_dxgi_enum_locked();
+    size_t best = SIZE_MAX;
+    for (const auto & e : g_dxgi) {
+        if (e.vendor != 0x10DE) {
+            continue;
+        }
+        const size_t dist = e.ded > tot ? e.ded - tot : tot - e.ded;
+        if (dist < best) {
+            best = dist;
+            l    = e.luid;
+        }
+    }
+#endif
+    return l;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the pin state (one per process: the model the warm pass called first)
+
+struct fn_group_state {
+    bool marked = false; // its experts carry the PIN mark
+    int  n_on   = 0;     // its ranges registered now
+};
+
+// one layer at plan time: the residency classes and the hot set's view (tv: 1 read, 0 busy, -1 no hot set / layer)
+struct fn_layer_view {
+    std::vector<uint8_t> cls;
+    std::vector<int32_t> slot;
+    std::vector<float>   cnt;
+    std::vector<uint8_t> vol;
+    int                  tv = -1;
+};
+
+struct fn_pin_state {
+    const llama_model * model = nullptr;
+    int  mode = 1;     // 1 untouched, 2 touched
+    int  unit = 0;     // 0 ranges, 1 spans, 2 arena
+    bool arena = false;
+
+    fn_pin::plan           plan;
+    int                    n_take = 0;   // groups planned (in plan order)
+    fn_pin::registry       reg;
+    std::vector<int>       unit_group;   // mapped mode: unit -> group
+    std::vector<std::vector<int>> unit_groups; // arena: groups served by a chunk
+    std::vector<fn_group_state> gst;
+
+    fn_pin::budget_cfg cfg;
+    uint64_t reserve_need = 0;
+    uint64_t l_ready      = 0;    // LOCAL headroom before the first registration
+    bool     l_ready_ok   = false;
+    uint64_t watch_local  = 0;    // the watcher's LOCAL threshold
+    uint64_t arena_max    = 0;
+    uint64_t nl_base = 0, l_base = 0;
+    bool     base_ok = false;
+
+    fn_reg_fn_t   reg_fn   = nullptr;
+    fn_unreg_fn_t unreg_fn = nullptr;
+    fn_devptr_t   devptr   = nullptr;
+    fn_regmap_t   regmap   = nullptr; // set only with LLAMA_FN_L22_DMASHARE (P14 reads pinned pages by device address)
+    fn_set_oom_t  set_oom  = nullptr;
+    bool          oom_hooked = false;
+    ggml_backend_dev_t dev = nullptr;
+    uint64_t luid = 0;
+
+    std::thread             th;
+    std::mutex              op_mtx;   // one register / unregister at a time
+    std::mutex              wake_mtx;
+    std::condition_variable wake_cv;
+    std::atomic<bool>       stop{false};
+    std::atomic<bool>       frozen{false};   // no more registrations (an unpin happened, or registration ended)
+    std::atomic<bool>       registering{false};
+
+    // arena chunks (registry units)
+    std::vector<std::pair<void *, size_t>> chunks;
+
+    // counters
+    std::atomic<uint64_t> n_refused{0};
+    std::atomic<uint64_t> n_oom{0};
+    std::atomic<uint64_t> n_valve{0};
+    std::atomic<uint64_t> n_watch{0};
+    std::atomic<uint64_t> unpinned{0};
+    double   reg_secs = 0.0;
+    int      stop_rule = fn_pin::RULE_OK;
+};
+
+std::mutex                  g_pin_mtx;
+std::atomic<fn_pin_state *> g_pin{nullptr};
+
+// decode activity (llama_fn_pin_decode_mark) and the stream's queries while registering
+std::atomic<int>     g_dec_running{0};
+std::atomic<int64_t> g_dec_end_us{0};
+std::atomic<int64_t> g_query_us{0};
+std::atomic<bool>    g_query_stamp{false};
+
+// llama_fn_pin_note_need: the largest value per kind (llama_fn_pin_need)
+constexpr int         FN_NEED_N = 5;
+std::atomic<uint64_t> g_need[FN_NEED_N];
+
+void fn_log(const char * fmt, ...) {
+    char text[1536];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    llama_fn_l22_log("pin", "%s", text);
+}
+
+uint64_t fn_mib_switch(const llama_model & m, const char * name, int def) {
+    return (uint64_t) std::max(0, llama_fn_l3_int(m, name, def))*FN_MIB;
+}
+
+// reserve_need (plan P6.4): the device bytes a later allocation may add beyond what the hot set gives back for it
+uint64_t fn_reserve_need(const llama_model & m) {
+    if (const char * v = llama_fn_env(m, "LLAMA_FN_L22_PIN_RESERVE_MIB")) {
+        if (v[0]) {
+            return (uint64_t) std::max(0, atoi(v))*FN_MIB;
+        }
+    }
+    const uint64_t full   = g_need[LLAMA_FN_PIN_NEED_FULL_EXTRA].load();
+    const uint64_t borrow = g_need[LLAMA_FN_PIN_NEED_BORROW].load();
+    const uint64_t vision = g_need[LLAMA_FN_PIN_NEED_VISION_LEND].load();
+    const uint64_t kv     = g_need[LLAMA_FN_PIN_NEED_KV_GROW].load();
+    const uint64_t inst   = g_need[LLAMA_FN_PIN_NEED_GRAPH_INST].load();
+    return full + borrow + vision + (kv ? kv : 512*FN_MIB) + 64*(inst ? inst : 2*FN_MIB) + 512*FN_MIB;
+}
+
+// the budget inputs now
+fn_pin::budget_in fn_read_budget(fn_pin_state * st) {
+    fn_pin::budget_in b;
+#if defined(_WIN32)
+    b.have_nl = llama_fn_dxgi_query(st->luid, 1, &b.nl_budget, &b.nl_usage);
+    b.have_l  = llama_fn_dxgi_query(st->luid, 0, &b.l_budget, &b.l_usage);
+#else
+    // Linux (plan P6.4): RAM/2 - 8 GiB for the registered bytes; LOCAL from the device's free memory
+    const uint64_t tot = fn_total_ram();
+    b.have_nl   = true;
+    b.nl_budget = tot/2 > 8*FN_GIB ? tot/2 - 8*FN_GIB : 0;
+    b.nl_usage  = st->reg.active_bytes();
+    if (st->dev != nullptr) {
+        size_t fr = 0;
+        size_t to = 0;
+        ggml_backend_dev_memory(st->dev, &fr, &to);
+        b.have_l   = to > 0;
+        b.l_budget = to;
+        b.l_usage  = to - fr;
+    }
+#endif
+    b.avail  = fn_avail_ram();
+    b.pinned = st->reg.active_bytes();
+    return b;
+}
+
+int64_t fn_local_headroom(fn_pin_state * st, bool * ok) {
+    uint64_t bud = 0;
+    uint64_t use = 0;
+    *ok = false;
+#if defined(_WIN32)
+    if (!llama_fn_dxgi_query(st->luid, 0, &bud, &use)) {
+        return 0;
+    }
+#else
+    if (st->dev == nullptr) {
+        return 0;
+    }
+    size_t fr = 0;
+    size_t to = 0;
+    ggml_backend_dev_memory(st->dev, &fr, &to);
+    bud = to;
+    use = to - fr;
+#endif
+    *ok = true;
+    return (int64_t) bud - (int64_t) use;
+}
+
+// the experts of group g: PIN on / off (mapped mode only; the model must still be alive)
+void fn_mark_group(fn_pin_state * st, int g, bool on) {
+    if (g < 0 || g >= (int) st->gst.size() || st->gst[g].marked == on) {
+        return;
+    }
+    const fn_pin::group & G = st->plan.groups[g];
+    for (int e = G.e0; e < G.e1; ++e) {
+        llama_fn_res_mark_pin(st->model, G.il, e, on);
+    }
+    st->gst[g].marked = on;
+}
+
+// the unregister of one unit (called by the registry after its drain): the device registration goes, an arena chunk is
+// freed, the experts of its groups lose the mark. alive = false: the model is going away (no mark changes)
+void fn_unreg_unit(fn_pin_state * st, const fn_pin::reg_unit & U, bool alive) {
+    if (st->unreg_fn != nullptr && U.p != nullptr) {
+        st->unreg_fn(U.p);
+    }
+    const int u = U.id;
+    if (st->arena) {
+        fn_commit_free(U.p, U.n);
+        if (alive && u >= 0 && u < (int) st->unit_groups.size()) {
+            for (int g : st->unit_groups[u]) {
+                st->gst[g].n_on = 0;
+            }
+        }
+        return;
+    }
+    if (u >= 0 && u < (int) st->unit_group.size()) {
+        const int g = st->unit_group[u];
+        if (g >= 0) {
+            st->gst[g].n_on = std::max(0, st->gst[g].n_on - 1);
+            if (alive) {
+                fn_mark_group(st, g, false);
+            }
+        }
+    }
+}
+
+// the contexts of the model are all gone: the server is shutting down (never dereferences the model)
+bool fn_model_gone(fn_pin_state * st) {
+    return llama_fn_ctx_list(*st->model).empty();
+}
+
+// unpin the last registered units until done() (checked before each one); timeout per busy unit. Returns bytes freed
+uint64_t fn_unpin(fn_pin_state * st, const std::function<bool(uint64_t freed)> & done, int64_t timeout_us, bool alive, int * n_units) {
+    uint64_t freed = 0;
+    int n = st->reg.unpin_lifo([&]() { return done(freed); }, timeout_us,
+            [&](const fn_pin::reg_unit & U) {
+                fn_unreg_unit(st, U, alive);
+                freed += U.n;
+            }, nullptr);
+    st->unpinned.fetch_add(freed);
+    if (n_units) {
+        *n_units = n;
+    }
+    return freed;
+}
+
+// waits while a decode runs or ended < 50 ms ago, while a prompt scope hushes the background readers, while the warm
+// pass waits for answer steps, and while the stream queried < 200 ms ago. false: stop
+bool fn_wait_quiet(fn_pin_state * st) {
+    size_t mark = 0;
+    while (!st->stop.load(std::memory_order_relaxed)) {
+        const int64_t now = fn_now_us();
+        const bool busy = g_dec_running.load(std::memory_order_relaxed) > 0 ||
+                          now - g_dec_end_us.load(std::memory_order_relaxed) < 50000 ||
+                          now - g_query_us.load(std::memory_order_relaxed) < 200000 ||
+                          llama_fn_hushed() || llama_fn_warm_state(&mark) == 2;
+        if (!busy) {
+            return true;
+        }
+        fn_sleep_ms(2);
+    }
+    return false;
+}
+
+// reads one byte per page of [p, p + n) after a prefetch; checks stop / quiet every 2 MiB
+bool fn_touch(fn_pin_state * st, const uint8_t * p, size_t n) {
+    const size_t page = fn_page_size();
+    fn_prefetch(p, n);
+    for (size_t o = 0; o < n; o += page) {
+        if ((o & (((size_t) 2 << 20) - 1)) == 0 && !fn_wait_quiet(st)) {
+            return false;
+        }
+        (void) *(volatile const uint8_t *) (p + o);
+    }
+    return true;
+}
+
+// ggml-cuda's allocation hook (R-P7-2): one unpin before a graph instantiate or a pool growth fails
+bool fn_cuda_oom(size_t need, void * ud) {
+    (void) ud;
+    return llama_fn_pin_on_oom(need);
+}
+
+// one registration; *dev = the device address when known (0 else)
+bool fn_register(fn_pin_state * st, void * p, size_t n, uint64_t * dev) {
+    *dev = 0;
+    void * d = nullptr;
+    const bool ok = st->regmap != nullptr ? st->regmap(p, n, &d) : st->reg_fn(p, n);
+    if (!ok) {
+        return false;
+    }
+    if (d == nullptr && st->devptr != nullptr) {
+        d = st->devptr(p);
+    }
+    *dev = (uint64_t) (uintptr_t) d;
+    // pins are active from here: ggml-cuda may ask for an unpin before it fails an allocation
+    if (!st->oom_hooked && st->set_oom != nullptr) {
+        st->set_oom(fn_cuda_oom, nullptr);
+        st->oom_hooked = true;
+    }
+    return true;
+}
+
+void fn_unhook_oom(fn_pin_state * st) {
+    if (st->oom_hooked && st->set_oom != nullptr) {
+        st->set_oom(nullptr, nullptr);
+        st->oom_hooked = false;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the arena (spec 9)
+
+constexpr size_t FN_ARENA_CHUNK = (size_t) 1 << 30;
+
+// rebuilds the registry for the arena: the planned groups in plan order, packed into chunks of 1 GiB (whole groups,
+// pieces of a range larger than a chunk split at page edges). Returns the bytes planned. No unit is active.
+uint64_t fn_arena_plan(fn_pin_state * st) {
+    const size_t page = fn_page_size();
+    struct piece {
+        const uint8_t * p;
+        size_t          n;
+        int             group;
+        int             src;
+    };
+    std::vector<std::vector<piece>> ch;   // per chunk
+    std::vector<size_t>             used;
+    uint64_t total = 0;
+    for (int g = 0; g < st->n_take; ++g) {
+        const fn_pin::group & G = st->plan.groups[g];
+        std::vector<piece> ps;
+        size_t gbytes = 0;
+        for (int k = 0; k < G.n_rng; ++k) {
+            const fn_pin::range & r = st->plan.ranges[G.first + k];
+            for (size_t o = 0; o < r.n; o += FN_ARENA_CHUNK) {
+                const size_t n = std::min(FN_ARENA_CHUNK, r.n - o);
+                ps.push_back({ r.p + o, n, g, G.first + k });
+                gbytes += n;
+            }
+        }
+        if (total + gbytes > st->arena_max) {
+            break;
+        }
+        for (const piece & x : ps) {
+            if (ch.empty() || used.back() + x.n > FN_ARENA_CHUNK) {
+                ch.emplace_back();
+                used.push_back(0);
+            }
+            ch.back().push_back(x);
+            used.back() += (x.n + page - 1)/page*page;
+        }
+        total += gbytes;
+    }
+    std::vector<fn_pin::registry::in_range> rs;
+    st->unit_groups.assign(ch.size(), {});
+    st->chunks.assign(ch.size(), { nullptr, 0 });
+    for (size_t u = 0; u < ch.size(); ++u) {
+        size_t off = 0;
+        for (const piece & x : ch[u]) {
+            fn_pin::registry::in_range r;
+            r.p    = x.p;
+            r.n    = x.n;
+            r.copy = (const uint8_t *) (uintptr_t) off; // an offset until the chunk exists (fn_arena_run fixes it)
+            r.unit = (int) u;
+            r.src  = x.src;
+            rs.push_back(r);
+            off += (x.n + page - 1)/page*page;
+            if (std::find(st->unit_groups[u].begin(), st->unit_groups[u].end(), x.group) == st->unit_groups[u].end()) {
+                st->unit_groups[u].push_back(x.group);
+            }
+        }
+        st->chunks[u].second = off;
+    }
+    st->reg.build(rs, (int) ch.size());
+    return total;
+}
+
+// allocates, registers and fills the chunks in order; stops at the first rule, refusal or failed fill
+void fn_arena_run(fn_pin_state * st) {
+    const size_t page = fn_page_size();
+    const int n_units = st->reg.n_units();
+    int n_ok = 0;
+    uint64_t bytes_ok = 0;
+    const int64_t t0 = fn_now_us();
+    for (int u = 0; u < n_units && !st->stop.load() && !st->frozen.load(); ++u) {
+        const size_t sz = st->chunks[u].second;
+        if (sz == 0) {
+            st->reg.drop(u);
+            continue;
+        }
+        if (!fn_wait_quiet(st) || fn_model_gone(st)) {
+            break;
+        }
+        void * p = nullptr;
+        {
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            if (st->frozen.load()) {
+                break;
+            }
+            fn_pin::budget_cfg cfg = st->cfg;
+            const fn_pin::budget_in b = fn_read_budget(st);
+            const int rule = fn_pin::check(b, cfg, sz, sz);
+            const uint64_t room = fn_commit_room();
+            if (rule != fn_pin::RULE_OK || room < sz + 8*FN_GIB) {
+                st->stop_rule = rule != fn_pin::RULE_OK ? rule : fn_pin::RULE_RAM;
+                fn_log("event=arena_stop chunk=%d rule=%s commit_room_gib=%.2f", u, rule != fn_pin::RULE_OK ? fn_pin::rule_name(rule) : "commit",
+                        fn_gib(room));
+                break;
+            }
+            p = fn_commit_alloc(sz);
+            if (p == nullptr) {
+                fn_log("event=arena_stop chunk=%d reason=alloc", u);
+                break;
+            }
+            // registered at once, before any byte is written (register before touch)
+            uint64_t dev = 0;
+            if (!fn_register(st, p, sz, &dev)) {
+                st->n_refused.fetch_add(1);
+                fn_commit_free(p, sz);
+                fn_log("event=arena_stop chunk=%d reason=refused", u);
+                break;
+            }
+            st->chunks[u].first = p;
+            st->reg.set_unit(u, p, sz);
+            st->reg.set_unit_dev(u, dev);
+        }
+        // the copies (outside the lock: an OOM hook meanwhile freezes registration and this chunk goes below):
+        // direct I/O, else the mapped bytes
+        const fn_pin::reg_unit & U = st->reg.unit_at(u);
+        std::vector<llama_fn_dio_req> reqs;
+        for (int i : U.ranges) {
+            const fn_pin::reg_range & r = st->reg.range_at(i);
+            reqs.push_back({ r.p, r.n, (uint8_t *) p + (size_t) (uintptr_t) r.copy });
+        }
+        bool filled = false;
+        const int ticket = llama_fn_dio_submit(st->model, reqs.data(), (int) reqs.size());
+        if (ticket >= 0) {
+            filled = llama_fn_dio_wait(ticket);
+        }
+        if (!filled) {
+            for (const auto & q : reqs) {
+                memcpy(q.dst, q.src, q.len);
+            }
+        }
+        // the same bytes as the mapping: the first and last 4 KiB of every piece
+        bool same = true;
+        for (const auto & q : reqs) {
+            const size_t k = std::min<size_t>(q.len, 4096);
+            same = same && memcmp(q.dst, q.src, k) == 0 && memcmp((const uint8_t *) q.dst + q.len - k, (const uint8_t *) q.src + q.len - k, k) == 0;
+        }
+        std::lock_guard<std::mutex> op(st->op_mtx);
+        if (!same || st->frozen.load() || st->stop.load()) {
+            st->unreg_fn(p);
+            fn_commit_free(p, sz);
+            st->chunks[u].first = nullptr;
+            st->reg.set_unit(u, nullptr, 0);
+            st->reg.drop(u);
+            if (!same) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L22_PIN] arena chunk %d differs from the mapped model: the arena stops\n", __func__, u);
+            }
+            break;
+        }
+        (void) page;
+        st->reg.fix_copies(u, (const uint8_t *) p);
+        st->reg.activate(u);
+        n_ok++;
+        bytes_ok += sz;
+        if (n_ok == 1 || (bytes_ok & (2*FN_GIB - 1)) < sz) {
+            const fn_pin::budget_in b2 = fn_read_budget(st);
+            fn_log("event=arena_step chunks=%d pinned_gib=%.2f dio=%d nl_use_gib=%.2f/%.2f l_use_gib=%.2f/%.2f avail_gib=%.2f",
+                    n_ok, fn_gib(bytes_ok), ticket >= 0 && filled ? 1 : 0, fn_gib(b2.nl_usage), fn_gib(b2.nl_budget),
+                    fn_gib(b2.l_usage), fn_gib(b2.l_budget), fn_gib(b2.avail));
+        }
+    }
+    for (int u = 0; u < n_units; ++u) {
+        if (st->reg.unit_at(u).state.load() == fn_pin::ST_PLANNED) {
+            st->reg.drop(u);
+        }
+    }
+    st->reg_secs = (fn_now_us() - t0)/1e6;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] arena: %d chunk(s), %.2f GiB of experts registered in %.1f s\n", __func__, n_ok,
+            fn_gib(bytes_ok), st->reg_secs);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// mapped ranges (spec 3, 5)
+
+// registers the planned groups range by range; true when it ended with a refusal at the very first range (arena)
+bool fn_ranges_run(fn_pin_state * st) {
+    int n_ok = 0;
+    uint64_t bytes_ok = 0;
+    uint64_t next_log = 2*FN_GIB;
+    const int64_t t0 = fn_now_us();
+    bool first_refused = false;
+    for (int g = 0; g < st->n_take && !st->stop.load() && !st->frozen.load(); ++g) {
+        const fn_pin::group & G = st->plan.groups[g];
+        bool ok_group = true;
+        for (int k = 0; k < G.n_rng && ok_group; ++k) {
+            const int ri = G.first + k; // mapped mode: unit index == plan range index
+            const fn_pin::range & r = st->plan.ranges[ri];
+            // the model's contexts all gone: the mapping may close soon, nothing more is read or registered
+            if (!fn_wait_quiet(st) || fn_model_gone(st)) {
+                ok_group = false;
+                st->frozen.store(true);
+                break;
+            }
+            if (st->mode == 2 && !fn_touch(st, r.p, r.n)) {
+                ok_group = false;
+                break;
+            }
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            if (st->frozen.load() || st->stop.load()) {
+                ok_group = false;
+                break;
+            }
+            fn_pin::budget_cfg cfg = st->cfg;
+            fn_pin::budget_in b = fn_read_budget(st);
+            const double res = st->mode == 2 ? 1.0 : fn_resident_share(r.p, r.n);
+            const uint64_t add_new = (uint64_t) ((1.0 - res)*(double) r.n);
+            int rule = fn_pin::check(b, cfg, r.n, add_new);
+            if (rule != fn_pin::RULE_OK) {
+                st->stop_rule = rule;
+                fn_log("event=stop rule=%s range=%d pinned_gib=%.2f nl_gib=%.2f/%.2f l_gib=%.2f/%.2f l_keep_gib=%.2f avail_gib=%.2f",
+                        fn_pin::rule_name(rule), ri, fn_gib(b.pinned), fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage),
+                        fn_gib(b.l_budget), fn_gib(cfg.l_keep), fn_gib(b.avail));
+                ok_group = false;
+                st->frozen.store(true);
+                break;
+            }
+            const int64_t tr = fn_now_us();
+            uint64_t dev = 0;
+            const bool done = fn_register(st, (void *) r.p, r.n, &dev);
+            const int64_t dt = fn_now_us() - tr;
+            if (!done) {
+                st->n_refused.fetch_add(1);
+                st->reg.drop(ri);
+                first_refused = n_ok == 0;
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] range %d (%.1f MiB, layer %d part %d) refused by the driver after %.1f ms: "
+                        "registration stops\n", __func__, ri, r.n/1048576.0, r.il, r.part, dt/1e3);
+                fn_log("event=refused range=%d mib=%.1f first=%d", ri, r.n/1048576.0, first_refused ? 1 : 0);
+                ok_group = false;
+                st->frozen.store(true);
+                break;
+            }
+            st->reg.set_unit_dev(ri, dev);
+            st->reg.activate(ri);
+            st->gst[g].n_on++;
+            n_ok++;
+            bytes_ok += r.n;
+            // the measured charge per registered byte, then the rules again with the real numbers
+            const fn_pin::budget_in b2 = fn_read_budget(st);
+            if (st->base_ok && b2.pinned >= 256*FN_MIB) {
+                if (b2.have_nl) {
+                    st->cfg.nl_ratio = std::max(0.0, std::min(2.0, ((double) b2.nl_usage - (double) st->nl_base)/(double) b2.pinned));
+                }
+                if (b2.have_l) {
+                    st->cfg.l_ratio = std::max(0.0, std::min(2.0, ((double) b2.l_usage - (double) st->l_base)/(double) b2.pinned));
+                }
+            }
+            rule = fn_pin::check(b2, st->cfg, 0, 0);
+            if (rule != fn_pin::RULE_OK) {
+                st->stop_rule = rule;
+                st->frozen.store(true);
+                if (st->reg.drain(ri, 2000000, [&](const fn_pin::reg_unit & U) { fn_unreg_unit(st, U, true); })) {
+                    n_ok--;
+                    bytes_ok -= r.n;
+                }
+                fn_log("event=stop_after rule=%s range=%d nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f", fn_pin::rule_name(rule), ri,
+                        fn_gib(b2.nl_usage), fn_gib(b2.nl_budget), fn_gib(b2.l_usage), fn_gib(b2.l_budget), fn_gib(b2.avail));
+                ok_group = false;
+                break;
+            }
+            if (bytes_ok >= next_log || n_ok == 1) {
+                next_log = (bytes_ok/(2*FN_GIB) + 1)*2*FN_GIB;
+                fn_log("event=step ranges=%d pinned_gib=%.2f secs=%.1f last_ms=%.1f nl_gib=%.2f/%.2f l_gib=%.2f/%.2f "
+                        "nl_ratio=%.3f l_ratio=%.4f avail_gib=%.2f resident=%.2f", n_ok, fn_gib(bytes_ok), (fn_now_us() - t0)/1e6, dt/1e3,
+                        fn_gib(b2.nl_usage), fn_gib(b2.nl_budget), fn_gib(b2.l_usage), fn_gib(b2.l_budget), st->cfg.nl_ratio,
+                        st->cfg.l_ratio, fn_gib(b2.avail), res);
+            }
+        }
+        (void) ok_group;
+    }
+    // what did not get registered loses its mark; planned units never tried are dropped
+    {
+        std::lock_guard<std::mutex> op(st->op_mtx);
+        for (int g = 0; g < (int) st->gst.size(); ++g) {
+            if (st->gst[g].marked && st->gst[g].n_on < st->plan.groups[g].n_rng) {
+                fn_mark_group(st, g, false);
+            }
+        }
+        for (int u = 0; u < st->reg.n_units(); ++u) {
+            if (st->reg.unit_at(u).state.load() == fn_pin::ST_PLANNED) {
+                st->reg.drop(u);
+            }
+        }
+    }
+    st->reg_secs = (fn_now_us() - t0)/1e6;
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s), %.2f GiB of experts registered in %.1f s (%s, stop: %s, refused %d)\n", __func__,
+            n_ok, fn_gib(bytes_ok), st->reg_secs, st->mode == 2 ? "touched" : "before touch", fn_pin::rule_name(st->stop_rule),
+            (int) st->n_refused.load());
+    return first_refused;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the thread: registration, then the watcher and the valve (spec 5, 7, 8)
+
+void fn_thread(fn_pin_state * st) {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    llama_fn_l22_log("pin", "event=thread_start mode=%d unit=%d groups=%d", st->mode, st->unit, st->n_take);
+    g_query_stamp.store(true);
+    st->registering.store(true);
+    if (st->unit == 2) {
+        fn_arena_run(st);
+    } else if (fn_ranges_run(st) && !st->stop.load()) {
+        // a refusal at the very first range: the arena (spec 9), the marks off (arena experts keep their mapped copies)
+        {
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            for (int g = 0; g < (int) st->gst.size(); ++g) {
+                fn_mark_group(st, g, false);
+            }
+            st->arena = true;
+            st->frozen.store(false);
+            const uint64_t planned = fn_arena_plan(st);
+            fn_log("event=arena_fallback planned_gib=%.2f chunks=%d", fn_gib(planned), st->reg.n_units());
+        }
+        fn_arena_run(st);
+    }
+    st->registering.store(false);
+    g_query_stamp.store(false);
+    st->frozen.store(true);
+    {
+        const fn_pin::budget_in b = fn_read_budget(st);
+        fn_log("event=ready pinned_gib=%.2f units=%d secs=%.1f stop=%s nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f reserve_need_gib=%.2f "
+                "watch_local_gib=%.2f", fn_gib(st->reg.active_bytes()), st->reg.n_active_units(), st->reg_secs,
+                fn_pin::rule_name(st->stop_rule), fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget),
+                fn_gib(b.avail), fn_gib(st->reserve_need), fn_gib(st->watch_local));
+    }
+    // the watcher and the valve, every 2 s
+    int low = 0;
+    int64_t t_status = fn_now_us();
+    while (!st->stop.load()) {
+        {
+            std::unique_lock<std::mutex> lk(st->wake_mtx);
+            st->wake_cv.wait_for(lk, std::chrono::seconds(2), [&]() { return st->stop.load(); });
+        }
+        if (st->stop.load()) {
+            break;
+        }
+        if (!st->reg.any_active()) {
+            continue;
+        }
+        if (fn_model_gone(st)) {
+            // every context is gone (shutdown): nothing copies any more; unregister before the mapping closes
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            int n = 0;
+            const int64_t t_end = fn_now_us() + 3000000;
+            const uint64_t b = fn_unpin(st, [&](uint64_t) { return fn_now_us() > t_end; }, 200000, false, &n);
+            if (!st->reg.any_active()) {
+                fn_unhook_oom(st);
+            }
+            fn_log("event=contexts_gone unpinned_gib=%.2f units=%d left=%d", fn_gib(b), n, st->reg.n_active_units());
+            break;
+        }
+        bool lok = false;
+        const int64_t head = fn_local_headroom(st, &lok);
+        const uint64_t thr = st->watch_local;
+        if (lok && head < (int64_t) thr) {
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            st->n_watch.fetch_add(1);
+            int n = 0;
+            const uint64_t b = fn_unpin(st, [&](uint64_t) {
+                bool ok2 = false;
+                const int64_t h2 = fn_local_headroom(st, &ok2);
+                return !ok2 || h2 >= (int64_t) (thr + 512*FN_MIB);
+            }, 200000, true, &n);
+            bool ok3 = false;
+            const int64_t h3 = fn_local_headroom(st, &ok3);
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] watcher: LOCAL headroom %.2f GiB < %.2f GiB: %d range(s), %.2f GiB unpinned, headroom now %.2f GiB\n",
+                    __func__, head/(double) FN_GIB, fn_gib(thr), n, fn_gib(b), h3/(double) FN_GIB);
+            fn_log("event=watcher headroom_gib=%.2f thr_gib=%.2f unpinned_gib=%.2f units=%d headroom_after_gib=%.2f pinned_gib=%.2f",
+                    head/(double) FN_GIB, fn_gib(thr), fn_gib(b), n, h3/(double) FN_GIB, fn_gib(st->reg.active_bytes()));
+        }
+        const uint64_t avail = fn_avail_ram();
+        low = avail < st->cfg.floor ? low + 1 : 0;
+        if (low >= 2) {
+            low = 0;
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            st->n_valve.fetch_add(1);
+            int n = 0;
+            const uint64_t want = st->cfg.floor + FN_GIB;
+            const uint64_t b = fn_unpin(st, [&](uint64_t) { return fn_avail_ram() >= want; }, 200000, true, &n);
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] valve: %.2f GiB of RAM available (floor %.2f GiB): %d range(s), %.2f GiB unpinned, %.2f GiB available now\n",
+                    __func__, fn_gib(avail), fn_gib(st->cfg.floor), n, fn_gib(b), fn_gib(fn_avail_ram()));
+            fn_log("event=valve avail_gib=%.2f floor_gib=%.2f unpinned_gib=%.2f units=%d pinned_gib=%.2f", fn_gib(avail),
+                    fn_gib(st->cfg.floor), fn_gib(b), n, fn_gib(st->reg.active_bytes()));
+        }
+        if (fn_now_us() - t_status > 60000000) {
+            t_status = fn_now_us();
+            const fn_pin::budget_in b = fn_read_budget(st);
+            fn_log("event=status pinned_gib=%.2f units=%d users=%d nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f oom=%d valve=%d watcher=%d "
+                    "unpinned_gib=%.2f", fn_gib(st->reg.active_bytes()), st->reg.n_active_units(), st->reg.users_total(), fn_gib(b.nl_usage),
+                    fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(b.avail), (int) st->n_oom.load(),
+                    (int) st->n_valve.load(), (int) st->n_watch.load(), fn_gib(st->unpinned.load()));
+        }
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------------------------------
+// src/llama-fn-l22.h
+
+bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budget, uint64_t * usage) {
+    if (budget) {
+        *budget = 0;
+    }
+    if (usage) {
+        *usage = 0;
+    }
+#if defined(_WIN32)
+    if (luid == 0) {
+        luid = g_default_luid.load(std::memory_order_relaxed);
+        if (luid == 0) {
+            luid = fn_dev_luid(nullptr);
+            g_default_luid.store(luid, std::memory_order_relaxed);
+        }
+        if (luid == 0) {
+            return false; // no CUDA device
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_dxgi_mtx);
+    fn_dxgi_enum_locked();
+    for (const auto & e : g_dxgi) {
+        if (e.luid != luid || e.ad == nullptr) {
+            continue;
+        }
+        DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+        if (FAILED(e.ad->QueryVideoMemoryInfo(0, non_local ? DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            return false;
+        }
+        if (budget) {
+            *budget = info.Budget;
+        }
+        if (usage) {
+            *usage = info.CurrentUsage;
+        }
+        return true;
+    }
+    return false;
+#else
+    (void) luid; (void) non_local;
+    return false;
+#endif
+}
 
 void llama_fn_pin_on_ready(const llama_model * model) {
-    (void) model;
+    if (model == nullptr || model->arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+    const int pin = llama_fn_l3_int(*model, "LLAMA_FN_L22_PIN", 0);
+    if (pin <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_pin_mtx);
+    if (g_pin.load() != nullptr) {
+        return;
+    }
+    const int64_t t0 = fn_now_us();
+    ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
+    auto reg_fn   = creg ? (fn_reg_fn_t)   ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_register_host")   : nullptr;
+    auto unreg_fn = creg ? (fn_unreg_fn_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_unregister_host") : nullptr;
+    if (reg_fn == nullptr || unreg_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] no CUDA host registration in this build: no pins\n", __func__);
+        return;
+    }
+
+    std::unique_ptr<fn_pin_state> st(new fn_pin_state());
+    st->model    = model;
+    st->mode     = pin >= 2 ? 2 : 1;
+    st->reg_fn   = reg_fn;
+    st->unreg_fn = unreg_fn;
+    st->devptr   = (fn_devptr_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_host_dev_ptr");
+    st->set_oom  = (fn_set_oom_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_set_oom_hook");
+    // device addresses of pinned pages only for the decode DMA share (P14): the mapped flag is not needed by copies
+    if (llama_fn_l22_switch_on(llama_fn_env(*model, "LLAMA_FN_L22_DMASHARE"))) {
+        st->regmap = (fn_regmap_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_register_host_mapped");
+    }
+    st->dev      = llama_moe_hot_device(*model);
+    if (st->dev == nullptr && ggml_backend_reg_dev_count(creg) > 0) {
+        st->dev = ggml_backend_reg_dev_get(creg, 0);
+    }
+    st->luid = fn_dev_luid(st->dev);
+    g_default_luid.store(st->luid, std::memory_order_relaxed);
+    {
+        const char * u = llama_fn_env(*model, "LLAMA_FN_L22_PIN_UNIT");
+        const std::string s = u ? u : "";
+        st->unit = s == "spans" ? 1 : s == "arena" ? 2 : 0;
+    }
+    st->cfg.nl_margin = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MARGIN_MIB", 8192);
+    st->cfg.l_margin  = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", 1024);
+    st->cfg.floor     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_FLOOR_MIB", 6144);
+    st->cfg.warm_keep = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_WARM_KEEP_MIB", 0);
+    st->cfg.max_pin   = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MAX_MIB", 0);
+    st->arena_max     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_ARENA_MIB", 16384);
+#if !defined(_WIN32)
+    st->cfg.nl_margin = 0; // the Linux rule is the cap RAM/2 - 8 GiB itself
+#endif
+
+    // the layers: host-mapped routed experts, their classes and the hot set's view
+    const size_t page = fn_page_size();
+    const int n_layer = (int) model->layers.size();
+    std::vector<fn_pin::layer_in> layers;
+    std::vector<fn_layer_view>    views;
+    int n_busy = 0;
+    int n_vram = 0;
+    size_t host_bytes = 0;
+    const int64_t t_view_end = fn_now_us() + 3000000; // the hot set's view: retries while busy, 3 s in all
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & L = model->layers[il];
+        const ggml_tensor * ts[3] = { L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps };
+        fn_pin::layer_in in;
+        in.il = il;
+        bool ok = true;
+        int n_exp = 0;
+        for (int k = 0; k < 3 && ok; ++k) {
+            const uint8_t * p0 = nullptr;
+            size_t n0 = 0;
+            // the mapped model (CPU_Mapped) or plain host memory; never a buffer the driver already pins (CUDA_Host)
+            const char * bt = ts[k] && ts[k]->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(ts[k]->buffer)) : "";
+            if (ts[k] == nullptr || !llama_fn_expert_host_range(model, il, 0, k, &p0, &n0) ||
+                (strcmp(bt, "CPU_Mapped") != 0 && strcmp(bt, "CPU") != 0)) {
+                ok = false;
+                break;
+            }
+            in.t[k].data     = p0;
+            in.t[k].stride   = n0;
+            in.t[k].n_expert = (int) ts[k]->ne[2];
+            n_exp = k == 0 ? in.t[k].n_expert : std::min(n_exp, in.t[k].n_expert);
+        }
+        if (!ok || n_exp <= 0) {
+            continue;
+        }
+        fn_layer_view v;
+        v.slot.assign(n_exp, -1);
+        v.cnt.assign(n_exp, 0.0f);
+        v.vol.assign(n_exp, 0);
+        for (int k = 0; k < 50 && (v.tv = llama_moe_hot_tier_view(ts[0], v.slot.data(), v.cnt.data(), v.vol.data(), n_exp)) == 0 &&
+                fn_now_us() < t_view_end; ++k) {
+            fn_sleep_ms(10);
+        }
+        n_busy += v.tv == 0 ? 1 : 0;
+        v.cls.resize(n_exp);
+        for (int e = 0; e < n_exp; ++e) {
+            v.cls[e] = llama_fn_res_class(model, il, e);
+            n_vram  += v.cls[e] == LLAMA_FN_RES_VRAM ? 1 : 0;
+        }
+        for (int k = 0; k < 3; ++k) {
+            host_bytes += (size_t) n_exp*in.t[k].stride;
+        }
+        views.push_back(std::move(v));
+        layers.push_back(std::move(in));
+    }
+    // the classes: P5's residency table when it is built (it says VRAM somewhere; it also knows the stream's lend layers
+    // before their first lend), else the hot set's view (a resident in a slot that keeps its VRAM is not streamed)
+    const bool trust_res = n_vram > 0;
+    for (size_t li = 0; li < layers.size(); ++li) {
+        fn_pin::layer_in & in = layers[li];
+        const fn_layer_view & v = views[li];
+        const int n_exp = (int) v.cls.size();
+        in.ok.assign(n_exp, 0);
+        bool streamed = true;
+        double cpu = 0.0;
+        for (int e = 0; e < n_exp; ++e) {
+            bool can = v.cls[e] == LLAMA_FN_RES_RAM || v.cls[e] == LLAMA_FN_RES_PIN;
+            if (trust_res) {
+                streamed = streamed && v.cls[e] != LLAMA_FN_RES_VRAM;
+            } else if (v.tv == 1 && v.slot[e] >= 0 && !v.vol[e]) {
+                can      = false;
+                streamed = false;
+            }
+            if (v.tv == 1 && v.slot[e] < 0) {
+                cpu += v.cnt[e];
+            }
+            in.ok[e] = can ? 1 : 0;
+        }
+        in.fully_streamed = trust_res ? streamed : (v.tv == -1 || (v.tv == 1 && streamed));
+        in.cpu_use        = cpu;
+        if (st->unit == 1 && in.fully_streamed) {
+            const uint8_t * lo = nullptr;
+            const uint8_t * hi = nullptr;
+            for (int k = 0; k < 3; ++k) {
+                const uint8_t * s = in.t[k].data;
+                const uint8_t * e = in.t[k].data + (size_t) n_exp*in.t[k].stride;
+                lo = lo ? std::min(lo, s) : s;
+                hi = hi ? std::max(hi, e) : e;
+            }
+            in.span_ok = fn_one_view(lo, hi);
+        }
+    }
+    if (layers.empty()) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] no layer with host-mapped routed experts: no pins\n", __func__);
+        return;
+    }
+    const size_t max_range = (size_t) fn_mib_switch(*model, "LLAMA_FN_L22_PIN_RANGE_MIB", 256);
+    st->plan = fn_pin::build_plan(layers, page, st->unit == 1, max_range);
+
+    // the budget now (before any registration)
+    st->reserve_need = fn_reserve_need(*model);
+    fn_pin::budget_in b = fn_read_budget(st.get());
+#if defined(_WIN32)
+    if (!b.have_nl || !b.have_l) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] DXGI budgets not readable (NON_LOCAL %d, LOCAL %d): no pins\n", __func__, b.have_nl, b.have_l);
+        return;
+    }
+#endif
+    st->nl_base = b.nl_usage;
+    st->l_base  = b.l_usage;
+    st->base_ok = true;
+    // LOCAL: keep reserve_need + margin, but never less than today's headroom allows (the hot set takes the free VRAM,
+    // so today's headroom is what every later allocation already runs with): at most the ready headroom - 256 MiB
+    const int64_t l_head = b.have_l ? (int64_t) b.l_budget - (int64_t) b.l_usage : 0;
+    st->l_ready    = l_head > 0 ? (uint64_t) l_head : 0;
+    st->l_ready_ok = b.have_l;
+    const uint64_t tol = 256*FN_MIB;
+    st->cfg.l_keep = std::min<uint64_t>(st->reserve_need + st->cfg.l_margin, st->l_ready > tol ? st->l_ready - tol : 0);
+    const uint64_t test_local = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_TEST_LOCAL_MIB", 0);
+    st->watch_local = test_local > 0 ? test_local
+                                     : std::min<uint64_t>(st->reserve_need, st->l_ready > 2*tol ? st->l_ready - 2*tol : 0);
+    const uint64_t allow = fn_pin::plan_bytes(b, st->cfg);
+    st->n_take = fn_pin::plan_take(st->plan, st->unit == 2 ? std::min(allow, st->arena_max) : allow);
+    st->gst.assign(st->plan.groups.size(), {});
+    uint64_t planned = 0;
+    for (int g = 0; g < st->n_take; ++g) {
+        planned += st->plan.groups[g].bytes;
+    }
+
+    // the registry: mapped mode = one unit per planned range; the arena packs its chunks
+    if (st->unit == 2) {
+        st->arena = true;
+        planned = fn_arena_plan(st.get());
+    } else {
+        std::vector<fn_pin::registry::in_range> rs;
+        int n_rng = 0;
+        for (int g = 0; g < st->n_take; ++g) {
+            n_rng += st->plan.groups[g].n_rng;
+        }
+        st->unit_group.assign(n_rng, -1);
+        for (int i = 0; i < n_rng; ++i) {
+            const fn_pin::range & r = st->plan.ranges[i];
+            fn_pin::registry::in_range x;
+            x.p    = r.p;
+            x.n    = r.n;
+            x.unit = i;
+            x.src  = i;
+            rs.push_back(x);
+            st->unit_group[i] = r.group;
+        }
+        if (!st->reg.build(rs, n_rng)) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] overlapping ranges in the plan were dropped\n", __func__);
+        }
+        for (int i = 0; i < n_rng; ++i) {
+            st->reg.set_unit(i, (void *) st->plan.ranges[i].p, st->plan.ranges[i].n);
+        }
+        // the marks before the warm pass starts (it re-reads them per layer)
+        for (int g = 0; g < st->n_take; ++g) {
+            fn_mark_group(st.get(), g, true);
+        }
+    }
+    size_t n_whole = 0;
+    for (int g = 0; g < st->n_take; ++g) {
+        n_whole += st->plan.groups[g].whole ? 1 : 0;
+    }
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] plan: %zu layers, %.2f GiB of host experts, %zu ranges in %zu groups; taking %d groups "
+            "(%zu whole-layer) = %.2f GiB (%s, %s); NON_LOCAL %.2f / %.2f GiB, LOCAL %.2f / %.2f GiB (keep %.2f, reserve_need %.2f, "
+            "watcher %.2f), RAM available %.2f GiB (floor %.2f), tier view busy on %d layers, %.1f ms\n", __func__, layers.size(),
+            fn_gib(host_bytes), st->plan.ranges.size(), st->plan.groups.size(), st->n_take, n_whole, fn_gib(planned),
+            st->unit == 2 ? "arena" : st->unit == 1 ? "spans" : "ranges", st->mode == 2 ? "touched" : "before touch",
+            fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(st->cfg.l_keep),
+            fn_gib(st->reserve_need), fn_gib(st->watch_local), fn_gib(b.avail), fn_gib(st->cfg.floor), n_busy, (fn_now_us() - t0)/1e3);
+    fn_log("event=plan classes=%s layers=%zu host_gib=%.2f ranges=%zu groups=%zu take=%d whole=%zu planned_gib=%.2f unit=%d mode=%d "
+            "nl_gib=%.2f/%.2f l_gib=%.2f/%.2f l_keep_gib=%.2f reserve_need_gib=%.2f avail_gib=%.2f", trust_res ? "table" : "hotset",
+            layers.size(), fn_gib(host_bytes), st->plan.ranges.size(), st->plan.groups.size(), st->n_take, n_whole, fn_gib(planned),
+            st->unit, st->mode,
+            fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(st->cfg.l_keep),
+            fn_gib(st->reserve_need), fn_gib(b.avail));
+    if (st->n_take == 0) {
+        const uint64_t g0 = st->plan.groups.empty() ? 0 : st->plan.groups[0].bytes;
+        const int rule = fn_pin::check(b, st->cfg, g0, g0);
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] nothing to pin (the rule that stops the first group: %s)\n", __func__, fn_pin::rule_name(rule));
+        fn_log("event=nothing rule=%s", fn_pin::rule_name(rule));
+        return;
+    }
+    fn_pin_state * raw = st.release();
+    g_pin.store(raw, std::memory_order_release);
+    raw->th = std::thread(fn_thread, raw);
 }
 
 bool llama_fn_pin_query(const void * p, size_t n, llama_fn_pin_seg * seg) {
@@ -15,41 +1310,152 @@ bool llama_fn_pin_query(const void * p, size_t n, llama_fn_pin_seg * seg) {
     seg->len    = n;
     seg->pinned = false;
     seg->ticket = -1;
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (st != nullptr && n > 0) {
+        if (g_query_stamp.load(std::memory_order_relaxed)) {
+            g_query_us.store(fn_now_us(), std::memory_order_relaxed);
+        }
+        fn_pin::seg s;
+        st->reg.query(p, n, &s);
+        seg->src    = s.src;
+        seg->len    = s.len;
+        seg->pinned = s.pinned;
+        seg->ticket = s.ticket;
+        if (s.pinned) {
+            return true;
+        }
+        n = s.len;
+    }
+    // [TAG_FN_L14_ARENA] the round-14 arena's registered chunks (LLAMA_FN_L14_ARENA_PIN_MIB): pinned without a ticket
+    if (n > 0 && llama_fn_arena_pinned_any()) {
+        bool in = false;
+        const size_t a = llama_fn_arena_pinned_span(p, n, &in);
+        seg->src    = p;
+        seg->len    = a;
+        seg->pinned = in;
+        seg->ticket = -1;
+    }
+    return true;
+}
+
+bool llama_fn_pin_query_dev(const void * p, size_t n, llama_fn_pin_seg * seg, uint64_t * dev) {
+    if (dev) {
+        *dev = 0;
+    }
+    if (!llama_fn_pin_query(p, n, seg)) {
+        return false;
+    }
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (dev && st != nullptr && seg->pinned && seg->ticket >= 0) {
+        fn_pin::seg s;
+        s.src    = seg->src;
+        s.len    = seg->len;
+        s.pinned = true;
+        s.ticket = seg->ticket;
+        *dev = st->reg.seg_dev(s);
+    }
     return true;
 }
 
 void llama_fn_pin_release(int32_t ticket) {
-    (void) ticket;
-}
-
-bool llama_fn_pin_on_oom(size_t need_bytes) {
-    (void) need_bytes;
-    return false;
+    if (ticket < 0) {
+        return;
+    }
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (st != nullptr) {
+        st->reg.release(ticket);
+    }
 }
 
 bool llama_fn_pin_active(void) {
-    return false;
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    return (st != nullptr && st->reg.any_active()) || llama_fn_arena_pinned_any();
 }
 
-bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budget, uint64_t * usage) {
-    (void) luid; (void) non_local;
-    if (budget) {
-        *budget = 0;
+bool llama_fn_pin_on_oom(size_t need_bytes) {
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (st == nullptr || !st->reg.any_active()) {
+        return false;
     }
-    if (usage) {
-        *usage = 0;
-    }
-    return false;
+    st->frozen.store(true);
+    std::lock_guard<std::mutex> op(st->op_mtx);
+    st->n_oom.fetch_add(1);
+    const uint64_t want = (uint64_t) need_bytes + 512*FN_MIB;
+    bool lok = false;
+    const int64_t head0 = fn_local_headroom(st, &lok);
+    // DXGI shows the room already (the charge is not visible there, or another reason): free that many bytes instead
+    const bool by_bytes = !lok || head0 >= (int64_t) want;
+    const int64_t t_end = fn_now_us() + 3000000;
+    int n = 0;
+    const uint64_t freed = fn_unpin(st, [&](uint64_t f) {
+        if (fn_now_us() > t_end) {
+            return true;
+        }
+        if (by_bytes) {
+            return f >= want;
+        }
+        bool ok2 = false;
+        const int64_t h = fn_local_headroom(st, &ok2);
+        return !ok2 || h >= (int64_t) want;
+    }, 50000, true, &n);
+    bool ok3 = false;
+    const int64_t head1 = fn_local_headroom(st, &ok3);
+    LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] OOM hook (need %.1f MiB): %d range(s), %.2f GiB unpinned, LOCAL headroom %.2f -> %.2f GiB\n",
+            __func__, need_bytes/1048576.0, n, fn_gib(freed), head0/(double) FN_GIB, head1/(double) FN_GIB);
+    fn_log("event=oom need_mib=%.1f unpinned_gib=%.2f units=%d by_bytes=%d headroom_gib=%.2f->%.2f pinned_gib=%.2f", need_bytes/1048576.0,
+            fn_gib(freed), n, by_bytes ? 1 : 0, head0/(double) FN_GIB, head1/(double) FN_GIB, fn_gib(st->reg.active_bytes()));
+    return freed > 0;
 }
 
-void llama_fn_pin_decode_mark(bool in_decode) {
-    (void) in_decode;
+void llama_fn_pin_decode_mark(bool begin) {
+    if (begin) {
+        g_dec_running.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_dec_end_us.store(fn_now_us(), std::memory_order_relaxed);
+        g_dec_running.fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 void llama_fn_pin_note_need(const llama_model * model, int kind, size_t bytes) {
-    (void) model; (void) kind; (void) bytes;
+    (void) model;
+    if (kind < 0 || kind >= FN_NEED_N) {
+        return;
+    }
+    uint64_t cur = g_need[kind].load(std::memory_order_relaxed);
+    while ((uint64_t) bytes > cur && !g_need[kind].compare_exchange_weak(cur, (uint64_t) bytes, std::memory_order_relaxed)) {
+    }
 }
 
 void llama_fn_pin_shutdown(const llama_model * model) {
-    (void) model;
+    std::lock_guard<std::mutex> lk(g_pin_mtx);
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (st == nullptr || (model != nullptr && st->model != model)) {
+        return;
+    }
+    st->stop.store(true);
+    {
+        std::lock_guard<std::mutex> wk(st->wake_mtx);
+        st->wake_cv.notify_all();
+    }
+    if (st->th.joinable()) {
+        st->th.join();
+    }
+    std::lock_guard<std::mutex> op(st->op_mtx);
+    int n = 0;
+    // the contexts are gone: tickets still held after 3 s in all are leaks, those units go anyway
+    const int64_t t_end = fn_now_us() + 3000000;
+    const uint64_t b = fn_unpin(st, [&](uint64_t) { return fn_now_us() > t_end; }, 200000, false, &n);
+    int left = 0;
+    for (int u = 0; u < st->reg.n_units(); ++u) {
+        const fn_pin::reg_unit & U = st->reg.unit_at(u);
+        if (U.state.load() == fn_pin::ST_ACTIVE || U.state.load() == fn_pin::ST_DRAINING) {
+            fn_unreg_unit(st, U, false);
+            left++;
+        }
+    }
+    fn_unhook_oom(st);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s) (%.2f GiB) unregistered before the model's mapping closes (%d forced)\n", __func__,
+            n + left, fn_gib(b), left);
+    // the state stays allocated (a late release or query sees no active range)
+    g_pin.store(nullptr, std::memory_order_release);
 }
