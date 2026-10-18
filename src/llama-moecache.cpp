@@ -2478,6 +2478,7 @@ size_t g_kv_keep    = 0;
 int    g_kv_n_trunk = 0;
 // [TAG_FN_L21_BIGUB] the bytes the next hot set init puts in the borrow group of the slot lend (0: none)
 size_t g_kv_borrow  = 0;
+bool   g_kv_borrow_1seq = false; // [TAG_FN_L22_BIGUB2] the borrow is the 1-sequence big reserve's extra
 
 // [TAG_FN_L10_SLOTLEND] a usable slot keeps this many bytes after it mapped (a kernel that reads a little past a slot's end
 // never reaches a segment the KV cache holds)
@@ -2649,8 +2650,8 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
             }
             if (bsum < g_kv_borrow) {
                 // the borrow never costs the KV lend: none this time (the 16K prompt ubatches stay off)
-                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB: no borrow\n",
-                        bsum/1048576.0, g_kv_borrow/1048576.0);
+                LLAMA_LOG_WARN("moe-hot: [TAG_FN_L21_BIGUB] the borrow segments come to %.0f of %.0f MiB%s: no borrow\n",
+                        bsum/1048576.0, g_kv_borrow/1048576.0, g_kv_borrow_1seq ? " (1-seq reserve) [TAG_FN_L22_BIGUB2]" : "");
                 g_kv_borrow = 0;
             } else {
                 sl_grp.push_back(sb_grp);
@@ -2813,9 +2814,9 @@ ggml_backend_buffer_t hot_vmm_place(moe_cache * mc, ggml_context * ctx_d, ggml_b
                     break;
                 }
             }
-            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] the same layers' %d slots below those (%.0f MiB, %.0f MiB wanted) give their "
+            LLAMA_LOG_INFO("moe-hot: [TAG_FN_L21_BIGUB] the same layers' %d slots below those (%.0f MiB, %.0f MiB wanted%s) give their "
                     "VRAM to a 16K prompt ubatch's compute reserve while it runs; the slots per layer are as without it\n", n_b,
-                    mc->sb_bytes/1048576.0, g_kv_borrow/1048576.0);
+                    mc->sb_bytes/1048576.0, g_kv_borrow/1048576.0, g_kv_borrow_1seq ? ", 1-seq reserve [TAG_FN_L22_BIGUB2]" : "");
         }
     }
     ggml_tensor * raw = ggml_new_tensor_1d(cctx, GGML_TYPE_I8, (int64_t) (total - lo));
@@ -5381,6 +5382,39 @@ void llama_moe_hot_set_kv_lend(size_t want, size_t keep, int n_trunk) {
 
 void llama_moe_hot_set_cb_borrow(size_t bytes) { // [TAG_FN_L21_BIGUB]
     g_kv_borrow = bytes;
+}
+
+// [TAG_FN_L22_BIGUB2] see llama-moecache.h
+void llama_moe_hot_l22_borrow_1seq(bool on) {
+    g_kv_borrow_1seq = on;
+}
+
+// [TAG_FN_L22_UBPLAN] P10 R2, see llama-moecache.h
+bool llama_moe_hot_borrow_range(const ggml_tensor * up_exps, int32_t * lo, int32_t * hi) {
+    std::unique_lock<std::mutex> ilk(g_init_mtx, std::try_to_lock);
+    if (!ilk.owns_lock()) {
+        return false;
+    }
+    moe_cache * mc = g_cache;
+    ilk.unlock();
+    if (!mc || !mc->hot || !mc->sl_on || mc->sb_bytes == 0) {
+        return false;
+    }
+    const auto it = mc->by_up_src.find(up_exps);
+    if (it == mc->by_up_src.end()) {
+        return false;
+    }
+    const layer_state & ls = mc->layers[it->second];
+    if (ls.sl_bbase < 0 || ls.sl_base <= ls.sl_bbase) {
+        return false;
+    }
+    if (lo) {
+        *lo = ls.sl_bbase;
+    }
+    if (hi) {
+        *hi = ls.sl_base;
+    }
+    return true;
 }
 
 size_t llama_moe_hot_cb_borrow_bytes() {

@@ -276,6 +276,13 @@ struct llama_moe_hot_l22_stats {
 };
 llama_moe_hot_l22_stats llama_moe_hot_l22_take();
 
+// [TAG_FN_L22_BIGUB2] the borrow wanted next comes from the big FULL reserve for one prompt sequence (the logs say so)
+void llama_moe_hot_l22_borrow_1seq(bool on);
+
+// [TAG_FN_L22_UBPLAN] P10 R2 (for P5's residency classes): the borrow slots [*lo, *hi) of the layer of up_exps (the 16K FULL
+// reserve's borrow, out only while such a period runs); false: none (no borrow, another layer, no hot set)
+bool llama_moe_hot_borrow_range(const ggml_tensor * up_exps, int32_t * lo, int32_t * hi);
+
 // [TAG_FN_L3_POLICY_SEED] LLAMA_MOE_HOT_SEED_NODE=1 (qwen4exp, decayed adaptive set, LLAMA_MOE_HOT_SEED > 0): a prompt
 // ubatch (more than LLAMA_MOE_HOT_MAX_T tokens) reports its routing through a CPU graph node after the layer's experts,
 // wherever they ran. Without it the prompt seed sees only prompts the CPU computes: the CPU MUL_MAT_ID observer never runs
