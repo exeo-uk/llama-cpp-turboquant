@@ -294,11 +294,15 @@ void fn_dxgi_enum_locked() {
 }
 #endif
 
-// the LUID of a device: the CUDA proc (P7), else the NVIDIA adapter whose dedicated memory is closest to its total
+// the LUID of a device (nullptr: CUDA device 0): the CUDA proc (P7), else the NVIDIA adapter whose dedicated memory is
+// closest to its total. 0: no such device (no CUDA device visible)
 uint64_t fn_dev_luid(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
     if (dev == nullptr && reg != nullptr && ggml_backend_reg_dev_count(reg) > 0) {
         dev = ggml_backend_reg_dev_get(reg, 0);
+    }
+    if (dev == nullptr) {
+        return 0;
     }
     auto fn = reg ? (fn_luid_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fn_device_luid") : nullptr;
     uint64_t l = 0;
@@ -1026,6 +1030,9 @@ bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budget, uint64
         if (luid == 0) {
             luid = fn_dev_luid(nullptr);
             g_default_luid.store(luid, std::memory_order_relaxed);
+        }
+        if (luid == 0) {
+            return false; // no CUDA device
         }
     }
     std::lock_guard<std::mutex> lk(g_dxgi_mtx);
