@@ -1288,7 +1288,7 @@ struct ggml_cpu_moe_pool * ggml_cpu_moe_pool_new(const struct ggml_cpu_moe_pool_
         GGML_LOG_INFO("%s: [TAG_FN_L22_PRETOUCH] a helper thread (CPU %d) reads one byte per page of the cold experts the next "
                 "jobs compute that no job of their layer read within the last %d jobs\n", __func__, c1, GGML_MOE_POOL_L22_FRESH);
     }
-    if (p->stagger > 0) {
+    if (p->stagger > 0 && p->split >= GGML_CPU_MOE_SPLIT_STABLE) {
         GGML_LOG_INFO("%s: [TAG_FN_L22_POOL_STAGGER] split %d jobs: thread i walks its experts from position (i %% %d)*n/%d on\n",
                 __func__, p->split, p->stagger, p->stagger);
     }
