@@ -6134,6 +6134,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // [TAG_FN_L22_X_PRIOR] R-P12-1: the route prior's pattern (a marked MUL between the router's RESHAPE and ARGSORT) goes to
+    // the bridge code: the prior / resident top-k, with the bridge post behind it in the same launch (moe-bridge.cu)
+    if (node->op == GGML_OP_SOFT_MAX && i + 2 < cgraph->n_nodes && ggml_fn_l3_get(cgraph->nodes[i + 2]) == GGML_FN_L22_PRIOR) {
+        const int n = ggml_cuda_fn_l22_try_prior(*cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
@@ -7653,6 +7662,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
                 }
                 i += match.node_count - 1;
+            }
+
+            // [TAG_FN_L22_X_PRIOR] R-P12-1: the route prior's pattern keeps its nodes allocated until its weights, as topk-moe's
+            if (cgraph->nodes[i]->op == GGML_OP_SOFT_MAX && i + 2 < cgraph->n_nodes &&
+                    ggml_fn_l3_get(cgraph->nodes[i + 2]) == GGML_FN_L22_PRIOR) {
+                const int n = ggml_cuda_fn_l22_prior_nodes(cgraph, i);
+                if (n > 0 && i + n < cgraph->n_nodes) {
+                    add_alloc_deps(i, i + n);
+                    i += n - 1;
+                    continue;
+                }
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

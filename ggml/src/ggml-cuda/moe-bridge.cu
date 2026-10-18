@@ -140,6 +140,7 @@ struct mb_dev {
     size_t          off_out;
     size_t          off_plan;  // [TAG_FN_R4_BRIDGE_DMA] the channel's plan area (0 without fetches)
     size_t          off_hint;  // [TAG_FN_L3_CPU_DEVPRED] the channel's hint area (0 without hints)
+    size_t          off_raw;   // [TAG_FN_L22_X_PRIOR] the channel's raw-id area: the unbiased top-k (0: none)
     int             hint_k;    // [TAG_FN_L3_CPU_DEVPRED] the largest k of a hint (0: no hints)
     mb_fetch_dev  * fetch;     // [TAG_FN_R4_BRIDGE_DMA] device memory, one per channel (nullptr without fetches)
     const char    * dma_ring;  // [TAG_FN_R4_BRIDGE_DMA] the registered DMA ring, device view (nullptr: none)
@@ -1196,6 +1197,326 @@ static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l4_topk_pos
     }
 }
 
+// ---- [TAG_FN_L22_X_PRIOR] the route prior and the resident swap (ggml-fn-l22-prior.h; qwen4exp, opt-in) ------------------
+// One warp routes one row of 512 experts with the code of k_fn_l4_topk_post (the same softmax, NaN rule, argmax tie rule:
+// the larger value, then the lower expert; the same sum order), on sel = p * scale instead of p. A row whose scale is 1
+// everywhere (no hot expert, or lambda 0) picks the stock ids and weights bit for bit. The resident swap: for ranks
+// r0..k-1 in order, a cold pick is replaced by the most probable hot expert not yet picked when p_hot >= p_cold * expnm.
+// On return lane k < n_used holds entry k: its expert, its final weight and (raw) entry k of the unbiased top-k.
+template <int EPT>
+static __device__ __forceinline__ void fn_l22_route_row(float (&wt)[EPT], const float * scale, const float * mask,
+        const int n_used, const int pflags, const float expnm, const int r0, const bool with_norm, const float clamp_val,
+        const float scale_val, const int lane, int & o_id, float & o_w, int & o_raw) {
+    fn_l4_softmax_warp_inplace<EPT, false>(wt, EPT*WARP_SIZE, lane);
+#pragma unroll
+    for (int i = 0; i < EPT; i++) {
+        if (__isnanf(wt[i])) {
+            wt[i] = -FLT_MAX;
+        }
+    }
+
+    float    sel[EPT];
+    uint32_t hot = 0;
+#pragma unroll
+    for (int i = 0; i < EPT; i++) {
+        const int   e = lane + i*WARP_SIZE;
+        const float s = wt[i]*scale[e];
+        sel[i] = s < -FLT_MAX ? -FLT_MAX : s;
+        hot |= (mask[e] != 0.0f ? 1u : 0u) << i;
+    }
+
+    // the unbiased top-k, for the hot-set observer
+    o_raw = -1;
+    if (pflags & GGML_FN_L22_PRIOR_F_RAW) {
+        float rv[EPT];
+#pragma unroll
+        for (int i = 0; i < EPT; i++) {
+            rv[i] = wt[i];
+        }
+        for (int k = 0; k < n_used; k++) {
+            float mv = rv[0];
+            int   me = lane;
+#pragma unroll
+            for (int i = 1; i < EPT; i++) {
+                if (rv[i] > mv) {
+                    mv = rv[i];
+                    me = lane + i*WARP_SIZE;
+                }
+            }
+#pragma unroll
+            for (int m = WARP_SIZE/2; m > 0; m /= 2) {
+                const float vv = __shfl_xor_sync(0xFFFFFFFF, mv, m, WARP_SIZE);
+                const int   ee = __shfl_xor_sync(0xFFFFFFFF, me, m, WARP_SIZE);
+                if (vv > mv || (vv == mv && ee < me)) {
+                    mv = vv;
+                    me = ee;
+                }
+            }
+            if ((me & (WARP_SIZE - 1)) == lane) {
+#pragma unroll
+                for (int i = 0; i < EPT; i++) {
+                    if (i == me/WARP_SIZE) {
+                        rv[i] = -INFINITY;
+                    }
+                }
+            }
+            if ((k & (WARP_SIZE - 1)) == lane) {
+                o_raw = me;
+            }
+        }
+    }
+
+    // the top-k on sel, carrying the unscaled p of each pick
+    int      my_id  = 0;
+    float    my_p   = 0.0f;
+    uint32_t picked = 0;
+    for (int k = 0; k < n_used; k++) {
+        float mv = sel[0];
+        int   me = lane;
+        float mp = wt[0];
+#pragma unroll
+        for (int i = 1; i < EPT; i++) {
+            if (sel[i] > mv) {
+                mv = sel[i];
+                me = lane + i*WARP_SIZE;
+                mp = wt[i];
+            }
+        }
+#pragma unroll
+        for (int m = WARP_SIZE/2; m > 0; m /= 2) {
+            const float vv = __shfl_xor_sync(0xFFFFFFFF, mv, m, WARP_SIZE);
+            const int   ee = __shfl_xor_sync(0xFFFFFFFF, me, m, WARP_SIZE);
+            const float pp = __shfl_xor_sync(0xFFFFFFFF, mp, m, WARP_SIZE);
+            if (vv > mv || (vv == mv && ee < me)) {
+                mv = vv;
+                me = ee;
+                mp = pp;
+            }
+        }
+        if ((me & (WARP_SIZE - 1)) == lane) {
+#pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                if (i == me/WARP_SIZE) {
+                    sel[i]  = -INFINITY;
+                    picked |= 1u << i;
+                }
+            }
+        }
+        if ((k & (WARP_SIZE - 1)) == lane) {
+            my_id = me;
+            my_p  = mp;
+        }
+    }
+
+    // the resident swap (sequential, rank r0 first)
+    if (pflags & GGML_FN_L22_PRIOR_F_RESIDENT) {
+        for (int r = r0 > 0 ? r0 : 0; r < n_used; r++) {
+            const int   id_r = __shfl_sync(0xFFFFFFFF, my_id, r, WARP_SIZE);
+            const float p_r  = __shfl_sync(0xFFFFFFFF, my_p,  r, WARP_SIZE);
+            if (mask[id_r] != 0.0f) {
+                continue; // a hot pick stays (warp-uniform)
+            }
+            float bv = -INFINITY;
+            int   be = 0x7fffffff;
+            const uint32_t cand = hot & ~picked;
+#pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                if (((cand >> i) & 1u) && wt[i] > bv) {
+                    bv = wt[i];
+                    be = lane + i*WARP_SIZE;
+                }
+            }
+#pragma unroll
+            for (int m = WARP_SIZE/2; m > 0; m /= 2) {
+                const float vv = __shfl_xor_sync(0xFFFFFFFF, bv, m, WARP_SIZE);
+                const int   ee = __shfl_xor_sync(0xFFFFFFFF, be, m, WARP_SIZE);
+                if (vv > bv || (vv == bv && ee < be)) {
+                    bv = vv;
+                    be = ee;
+                }
+            }
+            if (be != 0x7fffffff && bv >= p_r*expnm) {
+                if ((be & (WARP_SIZE - 1)) == lane) {
+#pragma unroll
+                    for (int i = 0; i < EPT; i++) {
+                        if (i == be/WARP_SIZE) {
+                            picked |= 1u << i;
+                        }
+                    }
+                }
+                if (lane == r) {
+                    my_id = be;
+                    my_p  = bv;
+                }
+            }
+        }
+    }
+
+    // the weights: lane (id & 31) sums its picks in rank order, then the warp sum (k_fn_l4_topk_post's order)
+    float inv = 1.0f;
+    if (with_norm) {
+        float part = 0.0f;
+        for (int k = 0; k < n_used; k++) {
+            const int   id = __shfl_sync(0xFFFFFFFF, my_id, k, WARP_SIZE);
+            const float pk = __shfl_sync(0xFFFFFFFF, my_p,  k, WARP_SIZE);
+            if ((id & (WARP_SIZE - 1)) == lane) {
+                part += pk;
+            }
+        }
+        part = warp_reduce_sum(part);
+        part = max(part, clamp_val);
+        inv  = 1.0f / part;
+    }
+    o_id = my_id;
+    o_w  = (with_norm ? my_p*inv : my_p) * scale_val;
+}
+
+// [TAG_FN_L22_X_PRIOR] k_fn_l4_topk_post with the prior's routing in block 0: the same x blocks, sequence number, header,
+// fences and publish; the header's flags carry GGML_MOE_BRIDGE_JOB_PRIOR (and _RAW when the unbiased ids are written)
+template <int n_experts>
+static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l22_topk_post_prior(const mb_dev v, const int chan,
+        const float * logits, float * weights, int32_t * ids, const int n_rows, const int n_expert_used,
+        const float clamp_val, const float scale_val, const bool with_norm, const float * scale_row, const float * mask_row,
+        const int pflags, const float expnm, const int r0,
+        const char * x, const int64_t x_nb1, const int n_embd, const int flags, int32_t * ticket) {
+    uint32_t * sy = v.l4sync + 4*chan; // [0] blocks done, [1] seq, [2] stamp
+
+    char    * p    = v.data + (size_t) chan*v.chan_bytes;
+    float   * hx   = (float   *) p;
+    int32_t * hids = (int32_t *) (p + v.off_ids);
+    float   * hw   = (float   *) (p + v.off_w);
+    int32_t * hraw = (pflags & GGML_FN_L22_PRIOR_F_RAW) && v.off_raw ? (int32_t *) (p + v.off_raw) : nullptr;
+
+    ggml_cuda_pdl_sync();
+
+    if (blockIdx.x > 0) {
+        ggml_cuda_pdl_lc();
+        fn_l4_copy_x_part(hx, x, x_nb1, n_embd, n_rows, blockIdx.x - 1, gridDim.x - 1);
+    } else {
+        __shared__ uint32_t s_seq;
+        __shared__ uint32_t s_g;
+        const int  lane   = threadIdx.x % WARP_SIZE;
+        const int  row    = threadIdx.x / WARP_SIZE;
+        const bool is_row = row < n_rows;
+        const int  ctl    = fn_l4_ctl();
+
+        constexpr int EPT = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+
+        float wt[EPT];
+#pragma unroll
+        for (int i = 0; i < EPT; i++) {
+            wt[i] = -INFINITY;
+        }
+        if (is_row) {
+            const float * lg = logits + n_experts * row;
+#pragma unroll
+            for (int i = 0; i < n_experts; i += WARP_SIZE) {
+                wt[i / WARP_SIZE] = lg[i + lane];
+            }
+        }
+        if (threadIdx.x == ctl) {
+            uint32_t seq;
+            uint32_t g;
+            fn_l4_take_seq(v, chan, seq, g);
+            s_seq = seq;
+            s_g   = g;
+        }
+
+        // weights and ids can alias logits: every row reads its logits before any thread writes
+        __syncthreads();
+        ggml_cuda_pdl_lc();
+
+        const uint32_t seq = s_seq;
+
+        if (is_row) {
+            int   o_id  = 0;
+            float o_w   = 0.0f;
+            int   o_raw = -1;
+            fn_l22_route_row<EPT>(wt, scale_row, mask_row, n_expert_used, pflags, expnm, r0, with_norm, clamp_val, scale_val,
+                    lane, o_id, o_w, o_raw);
+            if (lane < n_expert_used) {
+                ids[n_experts*row + lane]         = o_id;
+                weights[n_expert_used*row + lane] = o_w;
+                if (seq != 0) {
+                    hids[n_expert_used*row + lane] = o_id;
+                    hw[n_expert_used*row + lane]   = o_w;
+                    if (hraw) {
+                        hraw[n_expert_used*row + lane] = o_raw;
+                    }
+                }
+            }
+        }
+
+        if (threadIdx.x == ctl) {
+            if (seq != 0) {
+                fn_l4_post_head(v, chan, seq, s_g, n_rows, n_expert_used, flags);
+            }
+            *(volatile uint32_t *) &sy[1] = seq;
+            *(volatile uint32_t *) &sy[2] = s_g;
+        }
+    }
+
+    // each block: its writes, then it counts itself done; the last one publishes
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t n_done = atomicAdd(&sy[0], 1u) + 1u;
+        if (n_done == gridDim.x) {
+            __threadfence();
+            const uint32_t seq = *(volatile uint32_t *) &sy[1];
+            const uint32_t g   = *(volatile uint32_t *) &sy[2];
+            *(volatile uint32_t *) &sy[0] = 0;
+            fn_l4_post_publish(v, chan, seq, g, ticket);
+        }
+    }
+}
+
+// [TAG_FN_L22_X_PRIOR] the prior's routing alone (no post behind it, e.g. the sync retry graph): one warp per row, <= 8 rows;
+// the same routing function, so a retried ubatch picks the ids and weights of its bridged run
+template <int n_experts>
+static __global__ void __launch_bounds__(FN_L4_TOPK_THREADS, 1) k_fn_l22_topk_route(const float * logits, float * weights,
+        int32_t * ids, const int n_rows, const int n_expert_used, const float clamp_val, const float scale_val,
+        const bool with_norm, const float * scale_row, const float * mask_row, const int pflags, const float expnm,
+        const int r0) {
+    const int  lane   = threadIdx.x % WARP_SIZE;
+    const int  row    = threadIdx.x / WARP_SIZE;
+    const bool is_row = row < n_rows;
+
+    constexpr int EPT = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+
+    ggml_cuda_pdl_sync();
+
+    float wt[EPT];
+#pragma unroll
+    for (int i = 0; i < EPT; i++) {
+        wt[i] = -INFINITY;
+    }
+    if (is_row) {
+        const float * lg = logits + n_experts * row;
+#pragma unroll
+        for (int i = 0; i < n_experts; i += WARP_SIZE) {
+            wt[i / WARP_SIZE] = lg[i + lane];
+        }
+    }
+
+    // weights and ids can alias logits: every row reads its logits before any thread writes
+    __syncthreads();
+    ggml_cuda_pdl_lc();
+
+    if (!is_row) {
+        return;
+    }
+    int   o_id  = 0;
+    float o_w   = 0.0f;
+    int   o_raw = -1;
+    fn_l22_route_row<EPT>(wt, scale_row, mask_row, n_expert_used, pflags & ~GGML_FN_L22_PRIOR_F_RAW, expnm, r0, with_norm,
+            clamp_val, scale_val, lane, o_id, o_w, o_raw);
+    if (lane < n_expert_used) {
+        ids[n_experts*row + lane]         = o_id;
+        weights[n_expert_used*row + lane] = o_w;
+    }
+}
+
 // hostfunc mode, after a post on stream: fork, the host job runs on the aux stream while this stream continues with the
 // device work of the layer
 static void mb_post_fork(ggml_moe_bridge * b, const int32_t chan, cudaStream_t stream);
@@ -1216,6 +1537,8 @@ static void mb_make_job(const ggml_moe_bridge * b, int32_t chan, uint32_t seq, g
     // [TAG_FN_R4_BRIDGE_DMA] the plan area of a job the graph fetches for
     job->plan     = b->params.max_fetch > 0 && (job->flags & GGML_MOE_BRIDGE_JOB_DMA) ?
                     (ggml_moe_bridge_plan *) (p + b->dev.off_plan) : nullptr;
+    // [TAG_FN_L22_X_PRIOR] the unbiased top-k a prior job's post wrote
+    job->raw_ids  = b->dev.off_raw > 0 && (job->flags & GGML_MOE_BRIDGE_JOB_RAW) ? (const int32_t *) (p + b->dev.off_raw) : nullptr;
 }
 
 // the host has started this job: its wait now allows job_max_ns
@@ -1309,7 +1632,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     if (p == nullptr || p->device < 0 || p->device >= ggml_backend_cuda_get_device_count() ||
         p->n_chan < 1 || p->n_chan > 4096 || p->n_embd < 1 || p->n_embd > (1 << 20) || p->n_used < 1 || p->n_used > 256 ||
         p->max_tokens < 1 || p->max_tokens > 64 || p->max_fetch < 0 || p->max_fetch > GGML_MOE_BRIDGE_MAX_FETCH ||
-        p->hint_k < 0 || p->hint_k > GGML_MOE_BRIDGE_MAX_HINT_K ||
+        p->hint_k < 0 || p->hint_k > GGML_MOE_BRIDGE_MAX_HINT_K || p->raw_ids < 0 || p->raw_ids > 1 ||
         (p->wait_mode != GGML_MOE_BRIDGE_WAIT_SPIN && p->wait_mode != GGML_MOE_BRIDGE_WAIT_HOSTFUNC)) {
         GGML_LOG_ERROR("%s: invalid parameters\n", __func__);
         return nullptr;
@@ -1339,7 +1662,9 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
         mb_pad(offsetof(ggml_moe_bridge_plan, slot_ids) + (size_t) p->n_used*max_t*sizeof(int32_t)) : 0;
     // [TAG_FN_L3_CPU_DEVPRED] the hint area: its head and the ids of [hint_k, max_t]
     const size_t  sh = p->hint_k > 0 ? mb_pad(sizeof(mb_hint_hdr) + (size_t) p->hint_k*max_t*sizeof(int32_t)) : 0;
-    const size_t  chan_bytes = sx + si + si + sx + sp + sh;
+    // [TAG_FN_L22_X_PRIOR] the raw-id area: the unbiased top-k of [n_used, max_t] (0 without the prior's raw ids)
+    const size_t  sr = p->raw_ids ? si : 0;
+    const size_t  chan_bytes = sx + si + si + sx + sp + sh + sr;
 
     const size_t off_ring = mb_pad(sizeof(mb_glob));
     const size_t off_hdr  = off_ring + (size_t) MB_RING*sizeof(mb_ring_entry);
@@ -1421,6 +1746,7 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
     b->dev.off_out    = sx + si + si;
     b->dev.off_plan   = sx + si + si + sx; // [TAG_FN_R4_BRIDGE_DMA]
     b->dev.off_hint   = sh > 0 ? sx + si + si + sx + sp : 0; // [TAG_FN_L3_CPU_DEVPRED]
+    b->dev.off_raw    = sr > 0 ? sx + si + si + sx + sp + sh : 0; // [TAG_FN_L22_X_PRIOR]
     b->dev.hint_k     = p->hint_k;
     b->dev.fetch      = b->fetch;
     b->dev.dma_ring      = nullptr;
@@ -1456,6 +1782,10 @@ ggml_moe_bridge * ggml_backend_cuda_moe_bridge_new(const ggml_moe_bridge_params 
             __func__, b->id, p->device, p->n_chan, n_embd, p->n_used, max_t,
             p->wait_mode == GGML_MOE_BRIDGE_WAIT_SPIN ? "spin" : "hostfunc", b->params.timeout_ms, b->params.job_max_ms, total/1024.0/1024.0,
             p->max_fetch, p->hint_k);
+    if (sr > 0) {
+        GGML_LOG_INFO("%s: [TAG_FN_L22_X_PRIOR] bridge %d: every channel carries the unbiased top-k of a prior post (%zu bytes)\n",
+                __func__, b->id, sr);
+    }
     return b;
 #endif
 }
@@ -1901,6 +2231,14 @@ bool ggml_cuda_moe_bridge_fetch_view(int32_t bridge_id, int device, int32_t chan
 
 // ---- ops ------------------------------------------------------------------------------------------------------------
 
+#ifndef GGML_MOE_BRIDGE_DISABLED
+// [TAG_FN_L22_X_PRIOR] the post's ids come from a top-k view of an ARGSORT over the prior's marked MUL (graph metadata only)
+static bool fn_l22_prior_ids(const ggml_tensor * ids) {
+    const ggml_tensor * a = ids ? ids->view_src : nullptr;
+    return a != nullptr && a->op == GGML_OP_ARGSORT && ggml_fn_l22_prior_get(a->src[0], nullptr, nullptr, nullptr, nullptr);
+}
+#endif
+
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
 #ifdef GGML_MOE_BRIDGE_DISABLED
     GGML_UNUSED(device);
@@ -1988,15 +2326,18 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * ids = dst->src[1];
     const ggml_tensor * w   = dst->src[2];
 
+    // [TAG_FN_L22_X_PRIOR] ids that an unfused (or post-less fused) prior top-k picked: tell the host (no unbiased ids)
+    const int32_t flags_p = flags | (fn_l22_prior_ids(ids) ? GGML_MOE_BRIDGE_JOB_PRIOR : 0);
+
     cudaStream_t stream = ctx.stream();
     if (ggml_fn_l3_get(dst) == GGML_FN_L4_POST) { // [TAG_FN_L4_POST]
         k_fn_l4_mb_post<<<1, FN_L4_POST_THREADS, 0, stream>>>(b->dev, chan,
                 (const char *) x->data, x->nb[1], (const char *) ids->data, ids->nb[1], (const float *) w->data,
-                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags, (int32_t *) dst->data);
+                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags_p, (int32_t *) dst->data);
     } else {
         k_mb_post<<<1, MB_POST_THREADS, 0, stream>>>(b->dev, chan,
                 (const char *) x->data, x->nb[1], (const char *) ids->data, ids->nb[1], (const float *) w->data,
-                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags, (int32_t *) dst->data);
+                (int) x->ne[0], (int) ids->ne[0], (int) x->ne[1], flags_p, (int32_t *) dst->data);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -2075,6 +2416,230 @@ bool ggml_cuda_fn_l4_topk_post(ggml_backend_cuda_context & ctx, const ggml_tenso
         GGML_LOG_INFO("%s: [TAG_FN_L4_POST] the router's top-k and the bridge post run in one launch\n", __func__);
     }
     return true;
+#endif
+}
+
+// ---- [TAG_FN_L22_X_PRIOR] R-P12-1: the route prior's pattern, matched and launched for ggml-cuda.cu ---------------------
+
+#ifndef GGML_MOE_BRIDGE_DISABLED
+namespace {
+
+struct fn_l22_prior_match {
+    int                 n       = 0;       // nodes from i, the last one = the weights
+    const ggml_tensor * logits  = nullptr; // the SOFT_MAX's input [512, T]
+    const ggml_tensor * mul     = nullptr; // the marked MUL; src[1] = row 0 of layer il of the table
+    ggml_tensor *       ids     = nullptr; // the top-k VIEW of the ARGSORT
+    ggml_tensor *       weights = nullptr;
+    const ggml_tensor * clamp   = nullptr; // the norm's CLAMP (nullptr: no norm)
+    const ggml_tensor * scale   = nullptr; // the SCALE (nullptr: none)
+    int32_t             pflags  = 0;
+    float               expnm   = 1.0f;
+    int32_t             r0      = 0;
+};
+
+// graph metadata only (graph_optimize calls it before the allocation)
+int fn_l22_prior_match_at(const ggml_cgraph * cg, const int i, fn_l22_prior_match & m) {
+    m = fn_l22_prior_match();
+    const int n_nodes = cg->n_nodes;
+    if (i < 0 || i + 6 > n_nodes) {
+        return 0;
+    }
+    ggml_tensor ** nd = cg->nodes;
+    const ggml_tensor * sm = nd[i];
+    if (sm->op != GGML_OP_SOFT_MAX || sm->src[1] != nullptr || sm->src[2] != nullptr) {
+        return 0;
+    }
+    float sm_scale = 1.0f;
+    float sm_bias  = 0.0f;
+    memcpy(&sm_scale, (const float *) sm->op_params + 0, sizeof(float));
+    memcpy(&sm_bias,  (const float *) sm->op_params + 1, sizeof(float));
+    const ggml_tensor * logits = sm->src[0];
+    if (sm_scale != 1.0f || sm_bias != 0.0f || logits == nullptr || logits->type != GGML_TYPE_F32 || logits->ne[0] != 512 ||
+        !ggml_is_contiguous(logits) || logits->ne[1] < 1 || logits->ne[1] > TOPK_MOE_ROWS_PER_BLOCK ||
+        ggml_nrows(logits) != logits->ne[1]) {
+        return 0;
+    }
+    const ggml_tensor * rs = nd[i + 1];
+    if (rs->op != GGML_OP_RESHAPE || rs->src[0] != sm) {
+        return 0;
+    }
+    const ggml_tensor * mul = nd[i + 2];
+    int32_t pflags = 0;
+    float   expnm  = 1.0f;
+    int32_t r0     = 0;
+    int32_t il     = 0;
+    if (!ggml_fn_l22_prior_get(mul, &pflags, &expnm, &r0, &il) || mul->src[0] != sm) {
+        return 0;
+    }
+    const ggml_tensor * row = mul->src[1];
+    const ggml_tensor * tab = row ? row->view_src : nullptr;
+    if (row == nullptr || tab == nullptr || row->type != GGML_TYPE_F32 || row->ne[0] != 512 || ggml_nelements(row) != 512 ||
+        !ggml_is_contiguous(row) || tab->type != GGML_TYPE_F32 || tab->ne[0] != 512 || tab->ne[1] < 2 ||
+        !ggml_is_contiguous(tab) || row->view_offs % tab->nb[2] != 0 || row->view_offs + 2*tab->nb[1] > ggml_nbytes(tab)) {
+        return 0;
+    }
+    const ggml_tensor * as = nd[i + 3];
+    if (as->op != GGML_OP_ARGSORT || as->src[0] != mul || ggml_get_op_params_i32(as, 0) != GGML_SORT_ORDER_DESC) {
+        return 0;
+    }
+    ggml_tensor * vw = nd[i + 4];
+    if (vw->op != GGML_OP_VIEW || vw->src[0] != as) {
+        return 0;
+    }
+    const ggml_tensor * gr = nd[i + 5];
+    if (gr->op != GGML_OP_GET_ROWS || gr->src[0] != rs || gr->src[1] != vw) {
+        return 0;
+    }
+
+    ggml_op ops[16] = { GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS };
+    int n_ops = 6;
+    int j     = i + 6;
+    const ggml_tensor * clamp = nullptr;
+    const ggml_tensor * scale = nullptr;
+    // RESHAPE -> SUM_ROWS -> CLAMP -> DIV (of the RESHAPE by the CLAMP) -> RESHAPE: the norm
+    if (j + 4 < n_nodes && nd[j]->op == GGML_OP_RESHAPE && nd[j]->src[0] == gr &&
+        nd[j + 1]->op == GGML_OP_SUM_ROWS && nd[j + 1]->src[0] == nd[j] &&
+        nd[j + 2]->op == GGML_OP_CLAMP && nd[j + 2]->src[0] == nd[j + 1] &&
+        nd[j + 3]->op == GGML_OP_DIV && nd[j + 3]->src[0] == nd[j] && nd[j + 3]->src[1] == nd[j + 2] &&
+        nd[j + 4]->op == GGML_OP_RESHAPE && nd[j + 4]->src[0] == nd[j + 3]) {
+        clamp = nd[j + 2];
+        const ggml_op norm_ops[5] = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE };
+        for (const ggml_op o : norm_ops) {
+            ops[n_ops++] = o;
+        }
+        j += 5;
+    }
+    if (j < n_nodes && nd[j]->op == GGML_OP_SCALE && nd[j]->src[0] == nd[j - 1] && ggml_get_op_params_f32(nd[j], 1) == 0.0f) {
+        scale = nd[j];
+        ops[n_ops++] = GGML_OP_SCALE;
+        j++;
+    }
+    ggml_tensor * weights = nd[j - 1];
+    const int out_nodes[2] = { i + 4, j - 1 };
+    if (!ggml_can_fuse_subgraph(cg, i, n_ops, ops, out_nodes, 2) || !ggml_cuda_should_use_topk_moe(sm, logits, weights, vw)) {
+        return 0;
+    }
+    const int64_t k = vw->ne[0];
+    if (k < 1 || k > WARP_SIZE || vw->ne[1] != logits->ne[1] || vw->nb[0] != sizeof(int32_t) ||
+        vw->nb[1] != 512*sizeof(int32_t) || vw->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(weights) || ggml_nelements(weights) != k*logits->ne[1]) {
+        return 0;
+    }
+    m.n       = n_ops;
+    m.logits  = logits;
+    m.mul     = mul;
+    m.ids     = vw;
+    m.weights = weights;
+    m.clamp   = clamp;
+    m.scale   = scale;
+    m.pflags  = pflags;
+    m.expnm   = expnm;
+    m.r0      = r0;
+    return n_ops;
+}
+
+bool fn_l22_is_view_or_noop(const ggml_tensor * t) { // ggml_cuda_is_view_or_noop (static in ggml-cuda.cu)
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_VIEW ||
+           t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
+} // namespace
+#endif // GGML_MOE_BRIDGE_DISABLED
+
+int ggml_cuda_fn_l22_prior_nodes(const ggml_cgraph * cgraph, int i) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(i);
+    return 0;
+#else
+    fn_l22_prior_match m;
+    return fn_l22_prior_match_at(cgraph, i, m);
+#endif
+}
+
+int ggml_cuda_fn_l22_try_prior(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(i);
+    return 0;
+#else
+    fn_l22_prior_match m;
+    if (fn_l22_prior_match_at(cgraph, i, m) == 0) {
+        int32_t pflags = 0;
+        if (i + 2 < cgraph->n_nodes && ggml_fn_l22_prior_get(cgraph->nodes[i + 2], &pflags, nullptr, nullptr, nullptr) &&
+            (pflags & GGML_FN_L22_PRIOR_F_RESIDENT)) {
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true)) {
+                GGML_LOG_WARN("%s: [TAG_FN_L22_X_PRIOR] a prior top-k does not fit the fused path (%lld rows): it runs unfused, "
+                        "with the prior but without the resident swap\n", __func__, cgraph->nodes[i]->src[0] ? (long long) cgraph->nodes[i]->src[0]->ne[1] : 0LL);
+            }
+        }
+        return 0;
+    }
+    const ggml_tensor * row = m.mul->src[1];
+    if (row->data == nullptr || m.logits->data == nullptr || m.ids->data == nullptr || m.weights->data == nullptr) {
+        return 0;
+    }
+    const float * scale_row = (const float *) row->data;
+    const float * mask_row  = (const float *) ((const char *) row->data + row->view_src->nb[1]);
+    const int     n_rows    = (int) m.logits->ne[1];
+    const int     n_used    = (int) m.ids->ne[0];
+    const bool    with_norm = m.clamp != nullptr;
+    const float   clamp_val = m.clamp ? ggml_get_op_params_f32(m.clamp, 0) : -INFINITY;
+    const float   scale_val = m.scale ? ggml_get_op_params_f32(m.scale, 0) : 1.0f;
+    cudaStream_t  stream    = ctx.stream();
+
+    // the bridge post right behind it (only views between): one launch for both, as k_fn_l4_topk_post
+    int j = i + m.n;
+    while (j < cgraph->n_nodes && fn_l22_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    ggml_tensor * post = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+    if (post != nullptr && post->op == GGML_OP_MOE_HOST_POST && ggml_fn_l3_get(post) == GGML_FN_L4_POST &&
+        (post->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_get_op_params_i32(post, 3) == 0) {
+        ggml_moe_bridge * b = mb_get(ggml_get_op_params_i32(post, 0));
+        const int32_t chan  = ggml_get_op_params_i32(post, 1);
+        const int32_t flags = ggml_get_op_params_i32(post, 2);
+        const ggml_tensor * x    = post->src[0];
+        const ggml_tensor * pids = post->src[1];
+        const ggml_tensor * pw   = post->src[2];
+        if (b != nullptr && b->params.device == ctx.device && chan >= 0 && chan < b->params.n_chan &&
+            n_rows <= b->params.max_tokens && n_used <= b->params.n_used &&
+            pids->data == m.ids->data && pids->nb[1] == m.ids->nb[1] && pids->ne[0] == n_used && pids->ne[1] == n_rows &&
+            pw->data == m.weights->data && ggml_nelements(pw) == (int64_t) n_used*n_rows &&
+            x->type == GGML_TYPE_F32 && x->ne[0] == b->params.n_embd && x->ne[1] == n_rows && x->nb[0] == sizeof(float)) {
+            const bool raw = (m.pflags & GGML_FN_L22_PRIOR_F_RAW) && b->dev.off_raw > 0;
+            const int  hdr_flags = flags | GGML_MOE_BRIDGE_JOB_PRIOR | (raw ? GGML_MOE_BRIDGE_JOB_RAW : 0);
+            const int  pflags    = raw ? m.pflags : (m.pflags & ~GGML_FN_L22_PRIOR_F_RAW);
+            const int64_t x_words = (int64_t) n_rows*x->ne[0]/4;
+            const int     n_xblk  = (int) std::min<int64_t>(FN_L4_XBLK_MAX,
+                    std::max<int64_t>(1, (x_words + FN_L4_TOPK_THREADS - 1)/FN_L4_TOPK_THREADS));
+            const ggml_cuda_kernel_launch_params lp(dim3(1 + n_xblk, 1, 1), dim3(FN_L4_TOPK_THREADS, 1, 1), 0, stream);
+            ggml_cuda_kernel_launch(k_fn_l22_topk_post_prior<512>, lp, b->dev, (int) chan,
+                    (const float *) m.logits->data, (float *) m.weights->data, (int32_t *) m.ids->data, n_rows, n_used,
+                    clamp_val, scale_val, with_norm, scale_row, mask_row, pflags, m.expnm, (int) m.r0,
+                    (const char *) x->data, (int64_t) x->nb[1], (int) x->ne[0], hdr_flags, (int32_t *) post->data);
+            mb_post_fork(b, chan, stream);
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true)) {
+                GGML_LOG_INFO("%s: [TAG_FN_L22_X_PRIOR] the prior top-k (flags %d) and the bridge post run in one launch\n",
+                        __func__, (int) pflags);
+            }
+            return j - i;
+        }
+    }
+
+    const ggml_cuda_kernel_launch_params lp(dim3(1, 1, 1), dim3(FN_L4_TOPK_THREADS, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(k_fn_l22_topk_route<512>, lp, (const float *) m.logits->data, (float *) m.weights->data,
+            (int32_t *) m.ids->data, n_rows, n_used, clamp_val, scale_val, with_norm, scale_row, mask_row, (int) m.pflags,
+            m.expnm, (int) m.r0);
+    static std::atomic<bool> noted{false};
+    if (!noted.exchange(true)) {
+        GGML_LOG_INFO("%s: [TAG_FN_L22_X_PRIOR] the prior top-k (flags %d) runs in one launch (no fused post behind it)\n",
+                __func__, (int) m.pflags);
+    }
+    return m.n - 1;
 #endif
 }
 
