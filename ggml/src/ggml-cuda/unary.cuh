@@ -125,3 +125,19 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// [TAG_UPSTREAM_29948] GLU of one up/gate pair, for the fused gate/up/GLU MMQ write-back.
+__device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            return up * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:
+            return up * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_cuda_op_swiglu_oai_single(gate, up);
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            return ggml_cuda_op_swiglu_clamp_single(gate, up, limit);
+        default:
+            return up * gate;
+    }
+}

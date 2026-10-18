@@ -26,6 +26,11 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// [TAG_FN_L22_GLUQ8] (#30489) GLU fused into the Q8_1 quantization for the MMQ path
+void quantize_glu_mmq_q8_1_cuda(
+        const ggml_tensor * glu, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 // [TAG_MMSB] [TAG_SMALLB] quantize_mmq_q8_1_cuda launched with PDL (the kernel triggers the dependent launch first
 // thing); used by the small-batch matmul (mmsb.cu) only. MMQ keeps quantize_mmq_q8_1_cuda.
 void quantize_mmq_q8_1_pdl_cuda(

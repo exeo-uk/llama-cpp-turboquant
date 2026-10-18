@@ -1207,6 +1207,11 @@ struct ggml_cuda_pool {
     virtual size_t used_hwm() const { return 0; }
     virtual void   reset_hwm() {}
     virtual size_t trim(size_t keep) { GGML_UNUSED(keep); return 0; }
+
+    // [TAG_FN_L22_GRAPHKEEP] capture footprint: cap_begin() at a capture start, cap_hwm() the highest pool offset handed
+    // out since then ((size_t) -1 = this pool does not track it: its graphs cannot survive a trim)
+    virtual void   cap_begin() {}
+    virtual size_t cap_hwm() const { return (size_t) -1; }
 };
 
 template<typename T>
@@ -1275,6 +1280,9 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        for (fn_l22_variant & v : fn_l22_alt) {
+            v.destroy();
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
@@ -1285,6 +1293,12 @@ struct ggml_cuda_graph {
     bool replayed_since_capture = false; // [TAG_FN_L21_RECAP] the last call replayed the instance unchanged (#29768)
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // [TAG_FN_L22_GRAPHKEEP] replays of this object (decode graphs reach >= 2), replays since its last capture, and the
+    // pool offsets its captured kernels use per stream (known only when every pool tracked the capture)
+    uint64_t n_replay       = 0;
+    uint32_t n_replay_cap   = 0;
+    bool     pool_top_known = false;
+    size_t   pool_top[GGML_CUDA_MAX_STREAMS] = {};
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1292,6 +1306,45 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+
+    // [TAG_FN_L22_GRAPH2] an instance kept for another buffer layout of the same key (GGML_CUDA_FN_L22_GRAPH2)
+    struct fn_l22_variant {
+        cudaGraph_t                  graph    = nullptr;
+        cudaGraphExec_t              instance = nullptr;
+        std::vector<node_properties> node_props;
+        bool                         pool_top_known = false;
+        size_t                       pool_top[GGML_CUDA_MAX_STREAMS] = {};
+        uint64_t                     n_replay  = 0;
+        int64_t                      last_used = 0;
+
+        void destroy() {
+            if (instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(instance));
+                instance = nullptr;
+            }
+            if (graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graph));
+                graph = nullptr;
+            }
+        }
+    };
+    std::vector<fn_l22_variant> fn_l22_alt;
+
+    // [TAG_FN_L22_GRAPHKEEP] give the instance back (instance cap, trim); node_props and the warm-up state stay, so the
+    // next call with unchanged properties captures again at once
+    void fn_l22_drop_instance() {
+        if (instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
+        }
+        if (graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            graph = nullptr;
+        }
+        replayed_since_capture = false;
+        n_replay_cap           = 0;
+        pool_top_known         = false;
+    }
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1498,6 +1551,34 @@ struct ggml_cuda_graph_key_memo {
     int                 n_nodes = 0;
     const void *        key     = nullptr;
     int                 compat  = -1; // ggml_cuda_graph_check_compability of this split, -1 = not known yet
+    int32_t             rows    = 0;  // [TAG_FN_L22_GRAPHKEEP] token rows of the split (ggml_cuda_graph_get_key_hash)
+};
+
+// [TAG_FN_L22_GRAPHKEEP] graph map policy (ggml-cuda.cu): the key of graphs that run eagerly and get no map entry, the
+// switches, and the eviction / instance cap helpers
+#define GGML_CUDA_FN_L22_EAGER_KEY ((const void *) (uintptr_t) 2)
+struct ggml_backend_cuda_context;
+int  ggml_cuda_fn_l22_graph_keep(void);
+void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void * key);
+
+// [TAG_FN_L22_GRAPHKEEP] per-context counters (index = ggml_backend_cuda_graph_counters order)
+enum ggml_cuda_fn_l22_cnt {
+    GGML_CUDA_FN_L22_CNT_CALLS = 0,
+    GGML_CUDA_FN_L22_CNT_REPLAY,
+    GGML_CUDA_FN_L22_CNT_RECAP,
+    GGML_CUDA_FN_L22_CNT_CAPTURE,
+    GGML_CUDA_FN_L22_CNT_WARMUP,
+    GGML_CUDA_FN_L22_CNT_EAGER_ROWS,
+    GGML_CUDA_FN_L22_CNT_OBJECTS,
+    GGML_CUDA_FN_L22_CNT_INSTANCES,
+    GGML_CUDA_FN_L22_CNT_EVICT_LRU,
+    GGML_CUDA_FN_L22_CNT_EVICT_INST_COLD,
+    GGML_CUDA_FN_L22_CNT_EVICT_INST_HOT,
+    GGML_CUDA_FN_L22_CNT_TRIM_KEPT,
+    GGML_CUDA_FN_L22_CNT_TRIM_DROPPED,
+    GGML_CUDA_FN_L22_CNT_VARIANT_SWAP,
+    GGML_CUDA_FN_L22_CNT_HOST_US,
+    GGML_CUDA_FN_L22_CNT_COUNT,
 };
 
 // [TAG_GRAPH_HOST_PROBE] host time of graph_compute calls, per context (ggml-cuda.cu)
@@ -1563,11 +1644,29 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // [TAG_FN_L22_GRAPHKEEP] graphs wider than GGML_CUDA_FN_L22_GRAPH_MAXROWS rows run eagerly on this object (never mapped)
+    ggml_cuda_graph fn_l22_eager;
+    uint32_t        fn_l22_key_big = 0;                           // [TAG_FN_L22_GRAPHKEY] 0 = every dimension hashed as is
+    size_t          fn_l22_keep_mark[GGML_CUDA_MAX_STREAMS] = {}; // ggml_backend_pool_mark: bytes the next trim keeps
+    bool            fn_l22_mark_valid = false;
+    uint64_t        fn_l22_cnt[GGML_CUDA_FN_L22_CNT_COUNT] = {};
+    int             fn_l22_win_left = 0;                          // calls left in the current log window
+    int             fn_l22_win_len  = 0;
+    uint64_t        fn_l22_win_base[GGML_CUDA_FN_L22_CNT_COUNT] = {};
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
+        if (first_node_ptr == GGML_CUDA_FN_L22_EAGER_KEY) {
+            fn_l22_eager.last_used_time = time_now;
+            return &fn_l22_eager;
+        }
+
+        // [TAG_FN_L22_GRAPHKEEP] with GGML_CUDA_FN_L22_GRAPHKEEP >= 1 an LRU cap replaces the time sweep
+        const bool keep = ggml_cuda_fn_l22_graph_keep() >= 1;
+
         // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+        if (!keep && time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
@@ -1580,6 +1679,9 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
+            if (keep) {
+                ggml_cuda_fn_l22_evict_for_new(this, first_node_ptr);
+            }
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;

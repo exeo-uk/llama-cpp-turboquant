@@ -422,11 +422,11 @@ static __device__ __forceinline__ void mmqsn_unpack(
         mmqsn_load_tiles_q6_K_staged<J>(slot, tile_x, row_lo, row_step);
     } else if constexpr (type == GGML_TYPE_Q5_K) {
         GGML_UNUSED(x); GGML_UNUSED(tk); GGML_UNUSED(row_bytes);
-        ggml_cuda_mmq_load_tiles_q5_K<type, J, false, false>(slot, tile_x, 0, MMQSN_I - 1, 1);
+        ggml_cuda_mmq_load_tiles_q5_K<type, J, false, false>(slot, nullptr, tile_x, 0, MMQSN_I - 1, 1);
     } else {
         static_assert(type == GGML_TYPE_Q4_K, "mmqsn: unsupported type");
         GGML_UNUSED(x); GGML_UNUSED(tk); GGML_UNUSED(row_bytes);
-        ggml_cuda_mmq_load_tiles_q4_K<type, J, false, false>(slot, tile_x, 0, MMQSN_I - 1, 1);
+        ggml_cuda_mmq_load_tiles_q4_K<type, J, false, false>(slot, nullptr, tile_x, 0, MMQSN_I - 1, 1);
     }
 }
 
@@ -536,7 +536,7 @@ static __global__ void mul_mat_qsn(
                 mmqsn_prefetch<type>(x, s, g + pf_dist, 0, pf_run, row_bytes, tid);
             }
             const int2 tk = mmqsn_step(s, g);
-            load_tiles(x, tile_x, tk.x*I*stride_row_x + tk.y, I - 1, stride_row_x);
+            load_tiles(x, nullptr, tile_x, tk.x*I*stride_row_x + tk.y, I - 1, stride_row_x); // [TAG_UPSTREAM_29948] no gate weight
             mmqsn_store_y<J>(tile_y, yr, tid);
 
             __syncthreads();

@@ -2,6 +2,7 @@
 
 #include <cstdio>   // probe writes to stderr: GGML_LOG_INFO is filtered out by llama-server
 #include "chunk_gated_delta_net.cuh"
+#include "gated-delta-net-mma.cuh" // [TAG_UPSTREAM_29353]
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -320,7 +321,7 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
 // device. Whether a prefill runs on it or on the chunked kernel is the single largest
 // question about GDN cost, and it currently has to be inferred by reading source. One
 // log line settles it. Set TURBO_PATH_PROBE=0 to silence.
-static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
+static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked, bool mma = false) {
     // Report once per BATCH CLASS, not once per process. The first GDN op in a run is a
     // 2-token warm-up from memory fitting, which is trivially sequential (n_tokens < 128)
     // and says nothing about prefill - the earlier version of this probe reported exactly
@@ -349,16 +350,18 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
     const ggml_tensor * st = dst->src[5];
     const int64_t S_v = v->ne[0];
 
+    // [TAG_UPSTREAM_29353] mma: the one-kernel MMA chunked GDN ran (with a sequential tail for K > 1)
     if (n_min_pf > 0) {
         fprintf(stderr, "turbo-probe: GDN path = %s [TAG_GDN_CHUNKED_PF] (prefix n_tokens=%d n_seqs=%d S_v=%d, then REPLAY tail)\n",
-                      chunked ? "CHUNKED-PF (fast)" : "SEQUENTIAL-PF (slow)",
+                      mma ? "CHUNKED-PF MMA (fast) [TAG_UPSTREAM_29353]" : (chunked ? "CHUNKED-PF (fast)" : "SEQUENTIAL-PF (slow)"),
                       (int) v->ne[2], (int) v->ne[3], (int) S_v);
     } else {
         fprintf(stderr, "turbo-probe: GDN path = %s  (n_tokens=%d S_v=%d neq0=%d)\n",
-                      chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)",
+                      mma ? (chunked ? "CHUNKED MMA (fast) [TAG_UPSTREAM_29353]" : "MMA + SEQUENTIAL SNAPSHOT TAIL (fast) [TAG_UPSTREAM_29353]") :
+                      (chunked ? "CHUNKED (fast)" : "SEQUENTIAL (slow)"),
                       (int) v->ne[2], (int) S_v, (int) q->ne[0]);
     }
-    if (!chunked) {
+    if (!chunked && !mma) {
         const int  n_min  = n_min_pf > 0 ? n_min_pf : 128;
         const int  cc_dev = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const char * dis  = getenv("GGML_CUDA_DISABLE_GDN_CHUNK");
@@ -377,6 +380,68 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked) {
                       (int) (v->nb[1] == (size_t) S_v * ggml_type_size(v->type)));
     }
     fflush(stderr);
+}
+
+// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_CHUNK=1 runs chunk-eligible K == 1 ops (27B prefill prefix) on the one-kernel MMA
+// chunked GDN (gated-delta-net-mma.cu); unset or 0 keeps the #26001 chunked kernels (the old path, 27B bit-identical).
+// [TAG_FN_L22_GDNMMA] off unless set (round 22): numbers move (kld class), so only a profile or the test turns it on.
+static bool ggml_cuda_gdn_mma_chunk_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA_CHUNK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_SNAP=1 runs long K > 1 snapshot ops (Flash-Next prefill) as the MMA kernel over all
+// tokens but the last K - 1 and the sequential kernel over the rest; unset or 0 keeps the sequential kernel (old path).
+// The qwen4exp profile exports 1. Upstream (merged dde6a4d93) only guarantees slot 0 when n_tokens > K; this split
+// writes slot K - 1 from the MMA state and slots K - 2 .. 0 from the tail, so the snapshot rollback keeps all K slots.
+static bool ggml_cuda_gdn_mma_snap_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA_SNAP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// [TAG_UPSTREAM_29353] state_out is left null: the caller sets it
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) == 1 && S_v == 128 && q->ne[0] == 128,
+    };
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
@@ -447,12 +512,20 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // Route to the chunked prefill kernel when eligible.
     if (cache == nullptr && ggml_cuda_gdn_op_is_chunked(dst)) {
+        // [TAG_UPSTREAM_29353] the one-kernel MMA chunked GDN first; the #26001 kernels take the shapes it does not take
+        if (ggml_cuda_gdn_mma_chunk_enabled()) {
+            ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+            args.state_out = dst_d + S_v * H * n_tokens * n_seqs;
+            if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+                turbo_probe_gdn(dst, true, true);
+                return;
+            }
+        }
         turbo_probe_gdn(dst, true);
         ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
         return;
     }
 
-    turbo_probe_gdn(dst, false);
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
@@ -460,6 +533,28 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+
+    // [TAG_UPSTREAM_29353] long K > 1 snapshot op (Flash-Next prefill, one sequence): the MMA kernel runs tokens
+    // [0, n_pre) and writes the state after them into slot K - 1, then the sequential snapshot kernel runs the last
+    // K - 1 tokens from that state and writes slots K - 2 .. 0. n_seqs == 1 because both kernels take the dst
+    // sequence stride from their own token count.
+    if (!kda && keep_rs && n_seqs == 1 && n_tokens - (K - 1) >= 64 && ggml_cuda_gdn_mma_snap_enabled()) {
+        const int64_t n_pre = n_tokens - (K - 1);
+        ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+        args.n_tokens  = n_pre;
+        args.state_out = state_d + (K - 1) * state_slot_stride;
+        args.eligible  = S_v == 128 && neq0 == 128; // from_tensor asks for K == 1, here K > 1 is handled by the split
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            turbo_probe_gdn(dst, false, true);
+            launch_gated_delta_net<false, true>(q_d + n_pre * sq2, k_d + n_pre * sq2, v_d + n_pre * sv2,
+                g_d + n_pre * sb2, b_d + n_pre * sb2, args.state_out, dst_d + n_pre * S_v * H, state_d,
+                S_v, H, K - 1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            return;
+        }
+    }
+
+    turbo_probe_gdn(dst, false);
 
     if (kda) {
         if (keep_rs) {
