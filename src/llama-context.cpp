@@ -6423,19 +6423,23 @@ size_t llama_fn_vision_take(const llama_model * model, size_t bytes) {
     for (const auto & c : llama_fn_ctx_list(*model)) {
         c.first->synchronize(); // no graph of the model reads a slot while its VRAM goes
     }
-    // [TAG_FN_L22_OOMHOOK] with pins: the projector's buffers come next; DXGI LOCAL headroom first (plan 3.6)
-    if (llama_fn_pin_active()) {
+    const size_t got = llama_moe_hot_vis_take(bytes);
+    // [TAG_FN_L22_OOMHOOK] with pins: the projector's buffers come next; DXGI LOCAL headroom first (plan 3.6). Checked after
+    // the take for the part the hot set did not give (its VRAM is free now): a check before it counted the given bytes
+    // twice and unpinned on every encode. mtmd's lend_take (P2) checks the same rest after this (no second unpin)
+    if (got < bytes && llama_fn_pin_active()) {
+        const size_t need = bytes - got;
         uint64_t budget = 0, usage = 0;
         if (llama_fn_dxgi_query(0, 0, &budget, &usage)) {
             const uint64_t head = budget > usage ? budget - usage : 0;
-            if (head < (uint64_t) bytes + ((uint64_t) 512 << 20)) {
-                const bool freed = llama_fn_pin_on_oom(bytes);
-                llama_fn_l22_log("pin", "what=oom_pre site=vision_take need_mib=%.0f headroom_mib=%.0f freed=%d", bytes/1048576.0,
+            if (head < (uint64_t) need + ((uint64_t) 512 << 20)) {
+                const bool freed = llama_fn_pin_on_oom(need);
+                llama_fn_l22_log("pin", "what=oom_pre site=vision_take need_mib=%.0f headroom_mib=%.0f freed=%d", need/1048576.0,
                         head/1048576.0, freed ? 1 : 0);
             }
         }
     }
-    return llama_moe_hot_vis_take(bytes);
+    return got;
 }
 
 void llama_fn_vision_give(const llama_model * model) {
