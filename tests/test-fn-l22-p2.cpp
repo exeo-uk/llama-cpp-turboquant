@@ -200,6 +200,30 @@ static void test_tokcache(const std::string & path) {
         CHECK(st.path == 3, "short text bypasses the cache (path %d)", st.path);
     }
 
+    // a long conversation (~100K+ tokens) re-sent with one more turn: equal ids, and the time of both paths
+    {
+        common_tokcache big(4, (size_t) 64 << 20, 4096);
+        std::string s = chat_turn("system", body(rng, 200));
+        while (s.size() < 450000) {
+            s += chat_turn("user", body(rng, 40));
+            s += chat_turn("assistant", "<think>\n" + body(rng, 20) + "</think>\n" + body(rng, 60));
+        }
+        const int64_t t0 = ggml_time_us();
+        const auto full0 = common_tokenize(vocab, s, false, true);
+        const int64_t t1 = ggml_time_us();
+        CHECK(common_tokcache_tokenize(big, vocab, s, false, true) == full0, "long text, first encode");
+        const std::string s2 = s + chat_turn("user", body(rng, 10)) + "<|im_start|>assistant\n";
+        const int64_t t2 = ggml_time_us();
+        common_tokcache_stats st;
+        const auto cached = common_tokcache_tokenize(big, vocab, s2, false, true, &st);
+        const int64_t t3 = ggml_time_us();
+        const auto full2 = common_tokenize(vocab, s2, false, true);
+        CHECK(cached == full2, "long text re-send with one more turn");
+        CHECK(st.path == 2, "long text re-send takes the prefix path (%d)", st.path);
+        printf("tokcache: %zu bytes, %zu ids: full encode %.1f ms, re-send with the cache %.1f ms (re-used %zu ids)\n",
+               s2.size(), full2.size(), (t1 - t0)/1000.0, (t3 - t2)/1000.0, st.reused_ids);
+    }
+
     // threads: lookups and inserts at the same time
     {
         common_tokcache mt(4, (size_t) 64 << 20, 64);
