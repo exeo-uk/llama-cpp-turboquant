@@ -4270,8 +4270,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // [TAG_FN_L21_MTP_VISION] LLAMA_FN_L21_MTP_VISION: image rows are decoded on the draft context too (upstream #30257 +
         // #30397), their embedding as the token input and the target's h in the state channel, so the draft KV holds the
         // image and the first text row after it pairs with the h of the image's last row. Off: image batches are skipped.
-        const bool img = mtp_vision && !batch_in.has_token() && batch_in.has_embd();
-        if (!img && (!batch_in.has_token() || batch_in.has_embd())) {
+        // [TAG_FN_L22_IMGPASS] a merged image turn: one embedding batch whose rows name their token in tok_aux (a text row its
+        // token, an image row the media token). Its text rows go to the draft as token rows, its image rows as image rows
+        // (MTP_VISION) or not at all, in runs of one kind; the h pairing stays by batch index. No tok_aux: as before.
+        bool merged = false;
+        if (!batch_in.has_token() && batch_in.has_embd()) {
+            for (const auto & t : batch_in.tokens) {
+                if (t.tok_aux != LLAMA_TOKEN_NULL) {
+                    merged = true;
+                    break;
+                }
+            }
+        }
+        const bool img = mtp_vision && !batch_in.has_token() && batch_in.has_embd() && !merged;
+        if (!img && !merged && (!batch_in.has_token() || batch_in.has_embd())) {
             return true;
         }
         if (img) {
@@ -4316,7 +4328,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
             // a verify batch: per sequence at most n_max + 1 rows at consecutive positions, no prompt still to come
-            fuse_defer = !img && n_tokens <= 16;
+            fuse_defer = !img && !merged && n_tokens <= 16;
             for (int32_t k = 0; k < n_tokens && fuse_defer; ++k) {
                 const llama_seq_id s = batch_in.tokens[k].seq_id;
                 fuse_defer = s >= 0 && s < (llama_seq_id) n_seq && i_batch_end[s] - i_batch_beg[s] + 1 <= this->params.n_max + 1 &&
@@ -4364,10 +4376,85 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             bool ok = true;
 
+            // [TAG_FN_L22_IMGPASS] a merged image turn: the rows (all, or the window's) in runs of one kind and chunks of at
+            // most n_b_max; a text row goes as its token (tok_aux) with h, an image row as its embedding with h in the state
+            // channel (MTP_VISION) or not at all, so the draft takes the same position jump as the target
+            if (merged) {
+                const llama_token media = llama_model_media_token(llama_get_model(ctx_tgt));
+                auto row_img = [&](int32_t k) {
+                    const llama_token ta = batch_in.tokens[k].tok_aux;
+                    return ta == LLAMA_TOKEN_NULL || ta == media;
+                };
+                std::vector<int32_t> rows;
+                const bool m_win = mtp_win > 0 && !chain_heads && mtp_win_rows(batch_in, mem_dft, rows);
+                if (!m_win) {
+                    rows.resize(n_tokens);
+                    for (int32_t k = 0; k < n_tokens; ++k) {
+                        rows[k] = k;
+                    }
+                }
+                int32_t n_img = 0;
+                for (const int32_t k : rows) {
+                    n_img += row_img(k) ? 1 : 0;
+                }
+                if (mtp_vision && n_img > 0) {
+                    vis_n_batches++;
+                    vis_n_rows += n_img;
+                }
+                LOG_INF("%s: [TAG_FN_L22_IMGPASS] merged batch to the draft: %d text rows, %d image rows %s (pos %d)\n", __func__,
+                        (int) rows.size() - n_img, n_img, mtp_vision ? "decoded" : "skipped", (int) batch_in.tokens[0].pos[0]);
+                for (int head = 0; head < (m_win ? 1 : n_mtp_layers) && ok; ++head) {
+                    if (chain_heads) {
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        }
+                        llama_set_nextn_layer_offset(ctx_dft, head);
+                    }
+                    size_t off = 0;
+                    while (off < rows.size() && ok) {
+                        const bool kind_img = row_img(rows[off]);
+                        size_t end = off;
+                        while (end < rows.size() && row_img(rows[end]) == kind_img) {
+                            ++end;
+                        }
+                        if (kind_img && !mtp_vision) {
+                            off = end;
+                            continue;
+                        }
+                        for (size_t c = off; c < end && ok; c += (size_t) n_b_max) {
+                            const size_t n_chunk = std::min<size_t>((size_t) n_b_max, end - c);
+                            batch.clear();
+                            for (size_t l = c; l < c + n_chunk; ++l) {
+                                const int32_t k = rows[l];
+                                const auto &  t = batch_in.tokens[k];
+                                const float * h = k == i_batch_beg[t.seq_id] ? pending_h[t.seq_id].data() : h_tgt + (size_t) (k - 1)*n_embd;
+                                if (kind_img) {
+                                    const int32_t idx = batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                                    batch.set_embd_state(idx, { h, 1, (size_t) n_embd });
+                                } else {
+                                    const int32_t idx = batch.add(t.tok_aux, t.pos[0], t.seq_id, false);
+                                    batch.set_embd(idx, { h, 1, (size_t) n_embd });
+                                }
+                            }
+                            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                            if (rc != 0) {
+                                SPC_ERR("llama_process(ctx_dft) merged %s run failed rc=%d (pos=%d n=%d)\n", kind_img ? "image" : "text",
+                                        (int) rc, (int) batch_in.tokens[rows[c]].pos[0], (int) n_chunk);
+                                ok = false;
+                            }
+                        }
+                        off = end;
+                    }
+                }
+            }
+
             // [TAG_FN_MTP_ATTN_WINDOW] with a draft attention window, prompt rows that end up outside it before any draft
             // reads them are not decoded; the rest go through the same chunks as below
             std::vector<int32_t> win_rows;
-            const bool win_done = mtp_win > 0 && !chain_heads && mtp_win_rows(batch_in, mem_dft, win_rows);
+            const bool win_done = !merged && mtp_win > 0 && !chain_heads && mtp_win_rows(batch_in, mem_dft, win_rows);
             for (size_t off = 0; win_done && off < win_rows.size() && ok; off += (size_t) n_b_max) {
                 const int32_t n_chunk = (int32_t) std::min<size_t>((size_t) n_b_max, win_rows.size() - off);
 
@@ -4388,7 +4475,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            for (int head = 0; head < n_mtp_layers && ok && !win_done; ++head) {
+            for (int head = 0; head < n_mtp_layers && ok && !win_done && !merged; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

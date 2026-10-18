@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -3576,18 +3577,69 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     return (uint32_t) nelements;
 }
 
-// [TAG_FN_L22_IMGPASS] round 22 P1 (src/llama-ext.h). P0 stubs: no host embedding rows, no media token, explicit masks.
+// [TAG_FN_L22_IMGPASS] round 22 P1 (src/llama-ext.h): the input embedding rows of n tokens, n x n_embd_inp floats. Each
+// row is what the trunk's host gather writes (qwen4exp_rows_to_float: a copy for F32, else the type's to_float, which is
+// also what the CPU GET_ROWS runs), so the floats are bit for bit the same; a wider n_embd_inp is zero padded like
+// build_inp_embd's ggml_pad. No scale is applied (qwen4exp has none). false: no table or a token out of range.
 bool llama_model_token_embd_rows(const llama_model * model, const llama_token * toks, int32_t n, float * out) {
-    GGML_UNUSED(model); GGML_UNUSED(toks); GGML_UNUSED(n); GGML_UNUSED(out);
-    return false;
+    if (model == nullptr || toks == nullptr || out == nullptr || n < 0) {
+        return false;
+    }
+    const ggml_tensor * table = model->tok_embd;
+    if (table == nullptr || table->data == nullptr || table->buffer == nullptr || table->ne[0] <= 0) {
+        return false;
+    }
+    const int64_t ne0   = table->ne[0];
+    const int64_t width = std::max<int64_t>(ne0, (int64_t) model->hparams.n_embd_inp());
+    const ggml_to_float_t to_float = ggml_get_type_traits(table->type)->to_float;
+    if (table->type != GGML_TYPE_F32 && to_float == nullptr) {
+        return false;
+    }
+    for (int32_t r = 0; r < n; ++r) {
+        if (toks[r] < 0 || toks[r] >= table->ne[1]) {
+            return false;
+        }
+    }
+    const bool host = ggml_backend_buffer_is_host(table->buffer);
+    std::vector<uint8_t> raw(host ? 0 : table->nb[1]);
+    for (int32_t r = 0; r < n; ++r) {
+        const size_t off = (size_t) toks[r]*table->nb[1];
+        const char * src = (const char *) table->data + off;
+        if (!host) {
+            ggml_backend_tensor_get(table, raw.data(), off, table->nb[1]);
+            src = (const char *) raw.data();
+        }
+        float * dst = out + (size_t) r*width;
+        if (table->type == GGML_TYPE_F32) {
+            memcpy(dst, src, ne0*sizeof(float));
+        } else {
+            to_float(src, dst, ne0);
+        }
+        for (int64_t c = ne0; c < width; ++c) {
+            dst[c] = 0.0f;
+        }
+    }
+    return true;
 }
 
+// the token an image row stands for in the PLE hash and the KV ext.tok (qwen4exp: ple_image_token_id); NULL without one
 llama_token llama_model_media_token(const llama_model * model) {
-    GGML_UNUSED(model);
-    return LLAMA_TOKEN_NULL;
+    if (model == nullptr || model->hparams.ple_image_token_id == 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return (llama_token) model->hparams.ple_image_token_id;
 }
 
+// [TAG_FN_L22_IMGPASS_MASK] 0: image ubatches take keyed positional masks (qwen4exp with LLAMA_FN_L22_IMGPASS_MASK=auto|keys
+// and LLAMA_QSA_POS_MASK on, as the context reads it); 1: explicit masks (the caller caps the merged rows by
+// LLAMA_FN_L22_IMGPASS_MASK_MIB). A ubatch the keys cannot describe still falls back to the explicit mask (logged).
 int32_t llama_fn_imgpass_mask_mode(const llama_model * model) {
-    GGML_UNUSED(model);
-    return 1;
+    if (model == nullptr || model->arch != LLM_ARCH_QWEN4EXP) {
+        return 1;
+    }
+    std::string m = llama_fn_env(*model, "LLAMA_FN_L22_IMGPASS_MASK") ? llama_fn_env(*model, "LLAMA_FN_L22_IMGPASS_MASK") : "";
+    std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char) tolower(c); });
+    const char * qsa = getenv("LLAMA_QSA_POS_MASK");
+    const bool keys = (m == "auto" || m == "keys" || m == "1") && qsa != nullptr && atoi(qsa) != 0;
+    return keys ? 0 : 1;
 }

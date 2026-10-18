@@ -40,6 +40,16 @@
 #include <string>
 #include <unordered_set>
 
+// [TAG_FN_L22_IMGPASS_MASK] a qwen4exp embedding ubatch with 2-D positions (an image, or a merged image turn) whose
+// positional vectors can carry keys (pos * 4096 + raster rank, llama-fn-l22-img.h), so it needs no explicit mask: the
+// switch is on, the QSA positional path applies (build_inp_mem_hybrid) and the cache accepts the ubatch
+static bool llm_fn_l22_imgkeys_want(llm_arch arch, const llama_cparams & cparams, const llama_ubatch & ubatch,
+        const llama_kv_cache_context * attn) {
+    return arch == LLM_ARCH_QWEN4EXP && ubatch.token == nullptr && ubatch.is_pos_2d() && ubatch.n_seqs_unq == 1 &&
+        cparams.qsa_pos_mask && cparams.flash_attn && cparams.causal_attn && attn != nullptr && attn->get_swa_window() == 0 &&
+        attn->fn_imgkeys_ok(ubatch);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -613,8 +623,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
     if (self_kv_pos && self_kv_pos->buffer) {   // [TAG_FA_POS_MASK]
-        mctx->set_input_kv_pos(self_kv_pos, ubatch);
-        mctx->set_input_q_pos (self_q_pos,  ubatch);   // [TAG_4C_POSMASK_MS] positions, plus sequence bits for two rows
+        mctx->set_input_kv_pos(self_kv_pos, ubatch, fn_imgkeys);   // [TAG_FN_L22_IMGPASS_MASK] keys for an image ubatch
+        mctx->set_input_q_pos (self_q_pos,  ubatch, fn_imgkeys);   // [TAG_4C_POSMASK_MS] positions, plus sequence bits for two rows
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1258,8 +1268,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
     if (inp_attn->self_kv_pos) {   // [TAG_FA_POS_MASK]
-        mctx->get_attn()->set_input_kv_pos(inp_attn->self_kv_pos, ubatch);
-        mctx->get_attn()->set_input_q_pos (inp_attn->self_q_pos,  ubatch);   // [TAG_4C_POSMASK_MS]
+        mctx->get_attn()->set_input_kv_pos(inp_attn->self_kv_pos, ubatch, inp_attn->fn_imgkeys);   // [TAG_FN_L22_IMGPASS_MASK]
+        mctx->get_attn()->set_input_q_pos (inp_attn->self_q_pos,  ubatch, inp_attn->fn_imgkeys);   // [TAG_4C_POSMASK_MS]
     }
 
     if (inp_attn->self_k_rot) {
@@ -1307,6 +1317,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= inp_attn->self_q_pos->ne[0]  == params.ubatch.n_tokens;
         res &= inp_attn->self_kv_pos->ne[1] == (params.ubatch.n_seqs_unq > 1 ? 2 : 1);   // [TAG_4C_POSMASK_MS]
     }
+    // [TAG_FN_L22_IMGPASS_MASK] keyed vectors only for a ubatch the keys can describe, and the reverse
+    res &= inp_attn->fn_imgkeys == llm_fn_l22_imgkeys_want(params.arch, params.cparams, params.ubatch, mctx->get_attn());
 
     // [TAG_TURBOT] this check re-implements the attention input's instead of delegating, so the turbot conditions go
     // here as well: a reused graph without the fill tensor would never run a queued fill
@@ -4978,11 +4990,16 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     // without QSA) would let every image token see the whole image. Such a ubatch keeps the explicit mask, as it did
     // before this switch; text batches never reach that rule (a text token shares its temporal position with no other
     // cell of its sequence).
+    // [TAG_FN_L22_IMGPASS_MASK] with keys (pos * 4096 + raster rank) the positional test applies the same raster rule, so
+    // such an image ubatch takes the vectors too (LLAMA_FN_L22_IMGPASS_MASK=auto|keys; a ubatch the keys cannot describe
+    // keeps the explicit mask)
+    const bool img_keys = llm_fn_l22_imgkeys_want(arch, cparams, ubatch, mctx_cur->get_attn());
     const bool indexer_pos = arch == LLM_ARCH_QWEN4EXP && cparams.qsa_pos_mask && mctx_cur->get_attn()->get_swa_window() == 0 &&
-        (ubatch.token != nullptr || !ubatch.is_pos_2d());
+        (ubatch.token != nullptr || !ubatch.is_pos_2d() || img_keys);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), indexer_pos);
+    inp_attn->fn_imgkeys = img_keys && inp_attn->self_kv_pos != nullptr;
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -5197,16 +5214,26 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> dummy_row = { 0 };
 
+    // [TAG_FN_L22_SAMPSTATIC] #30223: every sampler builds n_outputs_max_per_seq chains, the real rows first; the others
+    // view row 0 and are not selected (not computed, not recorded), so the topology does not follow the rows of a step
+    const uint32_t n_chain_min = (fn_hooks & LLAMA_FN_L22_HOOK_SAMPSTATIC) ? std::max<uint32_t>(1, cparams.n_outputs_max_per_seq) : 0;
+
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
 
         // inactive samplers always work on the first row
         const bool active = it != sampling_rows.end();
         const auto & rows = active ? it->second : dummy_row;
-        const int i_out   = active ? 1          : 0;
+        const int i_out_real = active ? 1   : 0;
+        const uint32_t n_chain = std::max<uint32_t>((uint32_t) rows.size(), n_chain_min);
 
-        for (uint32_t i = 0; i < rows.size(); ++i) {
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
+        for (uint32_t i = 0; i < n_chain; ++i) {
+            const bool real   = i < rows.size();
+            const uint32_t row = real ? rows[i] : 0;
+            const int  i_out  = real ? i_out_real : 0;
+            const bool record = active && real;
+
+            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
@@ -5220,32 +5247,32 @@ void llm_graph_context::build_sampling() const {
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
             if (data.sampled != nullptr) {
-                if (active) {
-                    res->t_sampled[rows[i]] = data.sampled;
+                if (record) {
+                    res->t_sampled[row] = data.sampled;
                 }
                 outs[1] = data.sampled;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
             if (data.probs != nullptr) {
-                if (active) {
-                    res->t_sampled_probs[rows[i]] = data.probs;
+                if (record) {
+                    res->t_sampled_probs[row] = data.probs;
                 }
                 outs[1] = data.probs;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
             if (data.logits != nullptr) {
-                if (active) {
-                    res->t_sampled_logits[rows[i]] = data.logits;
+                if (record) {
+                    res->t_sampled_logits[row] = data.logits;
                 }
                 outs[1] = data.logits;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
             if (data.candidates != nullptr) {
-                if (active) {
-                    res->t_candidates[rows[i]] = data.candidates;
+                if (record) {
+                    res->t_candidates[row] = data.candidates;
                 }
                 outs[1] = data.candidates;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
