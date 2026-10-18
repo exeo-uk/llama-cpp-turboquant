@@ -2204,6 +2204,18 @@ void llama_context::sched_reserve() {
         n_nodes_tg         = ggml_graph_n_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
+
+        // [TAG_FN_L22_PHASE] R-REV-5: with n_seq_max >= 2 the tg graph holds n_seq_max sequences, which builds no one-sequence
+        // lever node (DEFER): a one-sequence GEN graph too. The buffers keep the larger size, the node budget the larger count
+        if (fn_l22_x.any() && n_seqs > 1) {
+            fn_phase = LLAMA_FN_PHASE_GEN;
+            auto * gf1 = graph_reserve(1, 1, 1, mctx.get(), model.hparams.no_alloc);
+            fn_phase = phase0;
+            if (!gf1) {
+                throw std::runtime_error("failed to allocate compute tg buffers (one sequence)");
+            }
+            n_nodes_tg = std::max(n_nodes_tg, ggml_graph_n_nodes(gf1));
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -4033,8 +4045,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
         }
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
-        // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch
-        const uint32_t tailfull_n = l22.endoverlap ? UINT32_MAX : l19_tailfull;
+        // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch. One sequence only
+        // (R-REV-13): with more, the prompt's end keeps the eager switch, so the tail keeps today's placement too
+        const bool     endovl     = l22.endoverlap && cparams.n_seq_max == 1;
+        const uint32_t tailfull_n = endovl ? UINT32_MAX : l19_tailfull;
         const bool tail_full = !wide && llama_fn_cbuf_tail_full(tailfull_n, cbuf_state == CBUF_FULL, cbuf_short, n_tokens_all,
                 n_outputs_all, cbuf_prev_n, cbuf_prev_out, cbuf_small_t);
         if (tail_full) {
@@ -4043,7 +4057,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         "FULL: the answer's first step returns to SMALL\n", __func__, (int) n_tokens_all, cbuf_prev_n);
             }
         }
-        l22_tail = tail_full && l22.endoverlap; // [TAG_FN_L22_ENDOVERLAP] its narrow ubatch keeps the stream's banks too
+        l22_tail = tail_full && endovl; // [TAG_FN_L22_ENDOVERLAP] its narrow ubatch keeps the stream's banks too
         cbuf_prev_n   = n_tokens_all;
         cbuf_prev_out = n_outputs_all > 0;
         // [TAG_FN_L20_BIGPROMPT_UB] the FULL width by this batch and the rest of its prompt; a narrow part of a prompt that
@@ -7501,7 +7515,9 @@ void llama_context::l22_init() {
     }
     if (l22.lendclass || l22.keeplend || l22.endoverlap || l22.refill || l22.schedbuf || l22.sampstatic) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L22_P4] round 22:%s%s%s%s%s%s%s\n", __func__, l22.lendclass ? " LENDCLASS" : "",
-                l22.keeplend ? " KEEPLEND" : "", l22.endoverlap ? " ENDOVERLAP" : "", l22.refill ? " REFILL" : "",
+                l22.keeplend ? " KEEPLEND" : "",
+                l22.endoverlap ? (cparams.n_seq_max == 1 ? " ENDOVERLAP" : " ENDOVERLAP(off: one slot only)") : "",
+                l22.refill ? " REFILL" : "",
                 l22.schedbuf ? " SCHEDBUF" : "", l22.sampstatic ? " SAMPSTATIC" : "", l22.graphkeep ? " GRAPHKEEP-marks" : "");
     }
     l22p_init(); // [TAG_FN_L22_P10]
@@ -7762,6 +7778,12 @@ void llama_context::l22p_init() {
     l22p.ubplan    = lvl("LLAMA_FN_L22_UBPLAN") > 0;
     l22p.bigub2    = lvl("LLAMA_FN_L22_BIGUB2");
     l22p.smallkeep = std::min(2, lvl("LLAMA_FN_L22_SMALLKEEP"));
+    if (l22p.bigub2 >= 2) {
+        // R-REV-8: D3's fallback form (a partial borrow and 12K ubatches) is not built: 2 runs as 1, said once
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_BIGUB2] LLAMA_FN_L22_BIGUB2=%d: the partial-borrow 12K form is not built, runs as BIGUB2=1 "
+                "(the 1-sequence 16K reserve, else the base width)\n", __func__, l22p.bigub2);
+        l22p.bigub2 = 1;
+    }
     if (l22p.stagers != 0) {
         llama_prefill_stream_set_stagers(this, l22p.stagers);
     }
