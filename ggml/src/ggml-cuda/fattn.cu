@@ -191,6 +191,44 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// [TAG_UPSTREAM_29510] The query-tile width of the sparse turbot FA in rows mode for dst (a turbot FA with a cell list
+// in src[9], ggml_flash_attn_ext_set_kv_rows), or 0 for the dense turbot FA. Rows mode reads only the listed cells under
+// the positional mask: D 256, GQA > 4 (ncols2 8), no explicit mask, no ALiBi, no softcap and no n_kv_max. The list
+// changes which cells are read, not what a query sees, so the dense FA (which ignores the list) gives the same result.
+// GGML_CUDA_KV_ROWS=0 keeps every such FA dense (A/B on one binary).
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static int ggml_cuda_fattn_turbot_rows_ncols1(const int cc, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_KV_ROWS");
+        return !(e && e[0] == '0');
+    }();
+
+    const ggml_tensor * Q       = dst->src[0];
+    const ggml_tensor * K       = dst->src[1];
+    const ggml_tensor * V       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * kv_pos  = dst->src[5];
+    const ggml_tensor * q_pos   = dst->src[6];
+    const ggml_tensor * kv_rows = dst->src[9];
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (!enabled || kv_rows == nullptr || !GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) || mask != nullptr ||
+            kv_pos == nullptr || q_pos == nullptr || kv_rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_rows) ||
+            ggml_nrows(kv_rows) != 1 || kv_rows->ne[0] <= 0 || !ggml_turbot_is_type(K->type) || !ggml_turbot_is_type(V->type) ||
+            max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(dst, 4) != 0 ||
+            Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || Q->ne[3] != 1 ||
+            Q->ne[2] % K->ne[2] != 0 || Q->ne[2]/K->ne[2] <= 4) {
+        return 0;
+    }
+
+    return Q->ne[1] <= 4 ? 4 : 8;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 // [TAG_FN_TURBOT_SPARSE] The query-tile width of the sparse turbot FA for dst, or 0 for the dense turbot FA. A turbot FA
 // goes sparse when the graph set n_kv_max (models/qwen4exp.cpp build_attn_qsa does, under TURBO_QSA_SPARSE) and the
 // gather beats a dense walk: D 256, GQA > 4 (ncols2 8), an explicit mask, no ALiBi and no softcap, and at least twice
@@ -210,6 +248,11 @@ static int ggml_cuda_fattn_turbot_sparse_ncols1(const int cc, const ggml_tensor 
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // [TAG_UPSTREAM_29510] a cell list (src[9]) takes the rows mode of the same kernel, or the dense FA
+    if (dst->src[9] != nullptr) {
+        return ggml_cuda_fattn_turbot_rows_ncols1(cc, dst);
+    }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
     if (!enabled || n_kv_max <= 0 || !ggml_turbot_is_type(K->type) || !ggml_turbot_is_type(V->type)) {

@@ -858,6 +858,39 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_load_tile_sparse(
     ggml_cuda_unroll<6>{}(load);
 }
 
+// [TAG_UPSTREAM_29510] Mask tile of a cell-list tile (rows mode of the sparse turbot FA): the positional mask of
+// flash_attn_ext_f16_gen_mask, read at the listed cells. Row i is cell idx[i]; at or past i_sup, or at a -1 entry, it
+// is -INF. The sequence sets stay in the test, so a listed cell of another sequence is hidden all the same.
+template<int ncols1, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_turbot_gen_mask_rows(
+        const int32_t * const __restrict__ kv_pos, const int32_t * const __restrict__ q_pos,
+        const int32_t * const __restrict__ kv_seq, const int32_t * const __restrict__ q_seq,
+        const int32_t * const __restrict__ idx, half * const __restrict__ tile_mask,
+        const int i_sup, const int j0, const uint3 ne01) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+#pragma unroll
+    for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+        const int j_sram = j1 + threadIdx.y;
+        const int j_vram = fastmodulo(j0 + j_sram, ne01);
+        if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
+            break;
+        }
+        const int      qp = q_pos[j_vram];
+        const uint32_t qs = kv_seq ? (uint32_t) q_seq[j_vram] : 0u;
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
+            const int     i    = i0 + threadIdx.x;
+            const int32_t cell = i < i_sup ? idx[i] : -1;
+            float v = -INFINITY;
+            if (cell >= 0) {
+                const int kp = kv_pos[cell];
+                v = (kp < 0 || kp > qp || (kv_seq && ((uint32_t) kv_seq[cell] & qs) == 0)) ? -INFINITY : 0.0f;
+            }
+            tile_mask[j_sram*(nbatch_fa + 8) + i] = __float2half(v);
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Copy of flash_attn_ext_f16_iter for turbot: nstages = 0, V_is_K_view = false, Q in registers.
 
@@ -943,9 +976,15 @@ static __device__ __forceinline__ void flash_attn_ext_turbot_iter(
     {
         constexpr bool use_cp_async = false;
         if constexpr (use_sparse) {
+            if (kv_pos) {
+                // [TAG_UPSTREAM_29510] rows mode: the positional mask at the listed cells
+                flash_attn_ext_turbot_gen_mask_rows<ncols1, nwarps, nbatch_fa>
+                    (kv_pos, q_pos, kv_seq, q_seq, indices + k_VKQ_0, tile_mask, k_VKQ_sup, jt*ncols1, ne01);
+            } else {
             // [TAG_FN_TURBOT_SPARSE] mask entries of the listed cells, -inf past the list (never a positional mask)
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, true>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+            }
         } else {
         if (kv_pos) {   // [TAG_FA_POS_MASK]
             flash_attn_ext_f16_gen_mask<ncols1, nwarps, nbatch_fa, oob_check>
@@ -2168,10 +2207,13 @@ static __global__ void flash_attn_ext_turbot(
         const bool block_owns_tile_start = kb0_start == 0;
 
         // [TAG_FN_TURBOT_SPARSE] the query tile's list; its tiles past the live count are all -1 (zero contribution)
-        const int32_t * indices = use_sparse ? sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+        // [TAG_UPSTREAM_29510] with kv_pos (rows mode) one list of ne11 cells for every query tile and no live count
+        const int32_t * indices = use_sparse ? (kv_pos ? sparse_lists : sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11) : nullptr;
 
         if constexpr (use_sparse) {
-            kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+            if (!kv_pos) {
+                kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+            }
             if (stripe > 0 && kb0_start >= kb0_stop) {
                 // [TAG_TURBOT_FA_STRIPE] no live tile left on this stripe: one zero-contribution tile of it
                 kb0_start = kbc % iter_k;
@@ -2250,11 +2292,13 @@ static __global__ void flash_attn_ext_turbot(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-    // [TAG_FN_TURBOT_SPARSE] as in the loop above
-    const int32_t * indices = use_sparse ? sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+    // [TAG_FN_TURBOT_SPARSE] as in the loop above, [TAG_UPSTREAM_29510] rows mode too
+    const int32_t * indices = use_sparse ? (kv_pos ? sparse_lists : sparse_lists + (int64_t(sequence % ne33)*iter_j + jt)*ne11) : nullptr;
 
     if constexpr (use_sparse) {
-        kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+        if (!kv_pos) {
+            kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
+        }
         if (stripe > 0 && kb0_start >= kb0_stop) {
             kb0_start = kbc % iter_k;
             kb0_stop  = kb0_start + 1;
@@ -3125,6 +3169,7 @@ static void launch_fattn_turbot(
     const ggml_tensor * q_pos_t  = dst->src[6];
     const ggml_tensor * pool_t   = dst->src[7];   // [TAG_TURBOT]
     const ggml_tensor * gtab_t   = dst->src[8];
+    const ggml_tensor * kv_rows_t = dst->src[9];   // [TAG_UPSTREAM_29510] cell list, read only by the sparse kernel
 
     ggml_tensor * KQV = dst;
 
@@ -3184,7 +3229,15 @@ static void launch_fattn_turbot(
 
     // [TAG_FN_TURBOT_SPARSE] the index lists and their counts live where KV_max lives
     int64_t n_kv_list = K->ne[1];
-    if (use_sparse) {
+    if (use_sparse && kv_rows_t != nullptr) {
+        // [TAG_UPSTREAM_29510] rows mode: the graph's own list (one sequence's cells, -1 padded), read in place by every
+        // query tile, no count; the positional mask hides any listed cell the query must not see
+        GGML_ASSERT(mask == nullptr && kv_pos_t != nullptr && q_pos_t != nullptr);
+        GGML_ASSERT(kv_rows_t->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_rows_t) && ggml_nrows(kv_rows_t) == 1);
+        n_kv_list = kv_rows_t->ne[0];
+        GGML_ASSERT(n_kv_list > 0 && n_kv_list <= INT32_MAX);
+        KV_max_lists = (const int *) kv_rows_t->data;
+    } else if (use_sparse) {
         GGML_ASSERT(mask != nullptr && kv_pos_t == nullptr && mask->ne[2] == 1);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
@@ -3210,7 +3263,7 @@ static void launch_fattn_turbot(
 
     // [TAG_FN_L4_QSA_LIST] a QSA_MASK that wrote lists for this FA wrote its mask only at their cells: only the sparse walk reads it
     GGML_ASSERT(use_sparse || !(ggml_fn_l4_qsa_get(KQV) & GGML_FN_L4_QSA_FA_LISTOK));
-    const char * kv_scan = use_sparse ? "sparse" : "none";   // [TAG_TURBOT_FA_DEBUG]
+    const char * kv_scan = use_sparse ? (kv_rows_t != nullptr ? "rows" : "sparse") : "none";   // [TAG_TURBOT_FA_DEBUG] [TAG_UPSTREAM_29510]
     if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kvmax_worth_it)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
