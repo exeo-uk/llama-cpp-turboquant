@@ -5503,6 +5503,11 @@ private:
         if (retry) {
             slot.nf_retry_task = slot.task->id;
             slot.state = SLOT_STATE_STARTED;
+            // the re-read starts the prompt timing again (update_prompt_start asserts t_start == 0: the retry aborted the
+            // server with GGML_ASSERT(t_start == 0) at the first NaN event, r22 end test T2)
+            slot.stats.t_start       = 0;
+            slot.stats.t_prompt_last = 0;
+            slot.stats.t_gen_last    = 0;
             return;
         }
         send_error(slot, "non-finite logits (NaN): the slot's cache was dropped, please retry", ERROR_TYPE_SERVER);
