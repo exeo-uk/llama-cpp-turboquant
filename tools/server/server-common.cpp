@@ -864,6 +864,11 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
     return result;
 }
 
+// L22-REQUEST R-P3-1 (steward stub, owner P2): no-op until P2's server_fn_l22_init is merged (delete this stub then)
+void server_fn_l22_init(const llama_model * model) {
+    (void) model;
+}
+
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
     // or the first element of the json_prompt array is a string.

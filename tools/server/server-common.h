@@ -265,6 +265,11 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
  */
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
 
+// L22-REQUEST R-P3-1 (steward stub, owner P2): reads the server text-tool switches of the model before the chat templates
+// are initialised. Stub in server-common.cpp until P2 is merged; the P2 merge replaces this declaration and the stub with
+// P2's (same place, so the merge conflicts here; keeping both is a redefinition error).
+void server_fn_l22_init(const llama_model * model);
+
 // return the last index of character that can form a valid string
 // if the last character is potentially cut in half, return the index before the cut
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8

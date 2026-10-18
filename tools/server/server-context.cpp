@@ -53,10 +53,6 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// L22-REQUEST R-P3-1 (P2): server_fn_l22_init lives in server-common.cpp on P2's branch (P2 merges before P3). Delete this
-// stub at the merge: next to P2's declaration it does not compile, so it cannot stay by mistake.
-static void server_fn_l22_init(const llama_model *) {}
-
 // [TAG_FN_L22_PASSLOG] the request's arrival, set by the HTTP handler before the chat template, read by
 // handle_completions_impl on the same thread
 static thread_local int64_t g_l22_t_req_us = 0;
@@ -3433,7 +3429,7 @@ private:
                 return llama_fn_pin_on_oom_ext((const llama_model *) ud, bytes);
             }, (void *) model_tgt);
         }
-        // L22-REQUEST R-P3-1: P2's server_fn_l22_init (server-common) reads the jinja / tokenizer switches from the profile
+        // [TAG_FN_L22] P2's server_fn_l22_init (server-common) reads the jinja / tokenizer switches from the profile
         server_fn_l22_init(model_tgt);
 
         if (l22.vlend_hold || l22.mtp_keep || l22.anchor || l22.ckpt_keep || l22.ckpt_split || l22.keeplend) {
