@@ -1820,7 +1820,33 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     const uint32_t err = br->fn_error(br->gb);
     llama_fn_stall_mark("bridge graph ends (err)", err); // [TAG_FN_L18_FIRSTANS_STALL]
     if (br->l22_dmashare) {
-        llama_fn_dmashare_graph_end(br, err, -1.0); // [TAG_FN_L22_DMASHARE] R-P14-3 (b): the graph synced
+        // [TAG_FN_L22_DMASHARE] R-P14-7: mean device wait of this graph's fetching layers (no gen5 state; -1 when none)
+        double wait_us = -1.0;
+        if (br->fn_chan_times) {
+            double sum = 0.0;
+            int    n   = 0;
+            for (int ch = 0; ch < (int) br->chans.size(); ++ch) {
+                auto & c = br->chans[ch];
+                const uint32_t seq = c.job_seq;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (c.dma || seq == 0 || !c.job_fetch) {
+                    continue;
+                }
+                c.job_seq = 0; // counted once (the gen5 loop below skips channels without c.dma)
+                if (err != GGML_MOE_BRIDGE_ERR_NONE) {
+                    continue;
+                }
+                ggml_moe_bridge_chan_times t;
+                br->fn_chan_times(br->gb, ch, &t);
+                if (t.seq != seq) {
+                    continue;
+                }
+                sum += t.wait_ns/1e3;
+                n++;
+            }
+            wait_us = n > 0 ? sum/n : -1.0;
+        }
+        llama_fn_dmashare_graph_end(br, err, wait_us); // R-P14-3 (b): the graph synced
     }
     if (br->trk_on) {
         std::lock_guard<std::mutex> lk(br->graph_mtx);

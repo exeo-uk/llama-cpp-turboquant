@@ -572,7 +572,9 @@ void llama_fn_dmashare_graph_end(const llama_moe_bridge * br, uint32_t err, doub
     s->st.graphs++;
     s->graphs_total++;
     s->st.errs += err != GGML_MOE_BRIDGE_ERR_NONE ? 1 : 0;
-    s->rates.g = fn_dma::guard_step(s->rates.g, dev_wait_us_per_layer);
+    if (dev_wait_us_per_layer >= 0.0) { // < 0: no fetching layer in this graph, keep the guard (starts at 1)
+        s->rates.g = fn_dma::guard_step(s->rates.g, dev_wait_us_per_layer);
+    }
     const fn_dma::release_fn rel = [](int32_t t) { llama_fn_pin_release(t); };
     for (int li : s->pend_layers) {
         dma_layer & L = s->layers[li];
