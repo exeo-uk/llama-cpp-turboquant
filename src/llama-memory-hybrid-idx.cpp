@@ -11,10 +11,12 @@
 
 #include "ggml-turbot.h"   // [TAG_FN_TURBOT_IDX] ggml_turbot_is_type
 #include "llama-fn-auto.h"  // [TAG_FN_L3_HOST_DIAG] llama_fn_l3_flag
+#include "llama-fn-l22.h"   // [TAG_FN_L22_QSA_SEQPOOLS] PASSLOG
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -113,6 +115,28 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {
     kpool_probe = llama_fn_l3_flag(model, "LLAMA_FN_HOST_KPOOL_PROBE"); // [TAG_FN_L3_HOST_DIAG]
     kpool_inc   = llama_fn_l3_int(model, "LLAMA_FN_L10_KPOOLINC", 1) != 0; // [TAG_FN_L10_KPOOLINC] qwen4exp only
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] [TAG_FN_L22_QSA_SHAREPFX] qwen4exp only (llama_fn_l3_int), off when unset
+    seqpools = std::min(std::max(llama_fn_l3_int(model, "LLAMA_FN_L22_QSA_SEQPOOLS", 0), 0), 2);
+    sharepfx = llama_fn_l3_int(model, "LLAMA_FN_L22_QSA_SHAREPFX", 0) != 0;
+    if (mem_idx && model.hparams.indexer_kpool > 0 && (seqpools != 0 || sharepfx)) {
+        n_top_pool = model.hparams.indexer_top_k / model.hparams.indexer_kpool;
+        // the picked set of a shorter list is the same only with the unordered radix select (qwen4exp reads the same
+        // switch; TURBO_TOPK_ORDERED forces CUDA's sort) and with every layer's indexer on a CUDA device
+        const char * tu = getenv("TURBO_QSA_TOPK_UNORDERED");
+        const bool unordered = tu != nullptr && tu[0] == '1' && getenv("TURBO_TOPK_ORDERED") == nullptr;
+        const uint32_t n_layer = model.hparams.n_layer();
+        bool cuda = n_layer > 0;
+        for (uint32_t il = 0; il < n_layer && cuda; ++il) {
+            ggml_backend_dev_t dev = model.dev_layer((int) il);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            cuda = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        }
+        seqpools_ok = seqpools != 0 && unordered && cuda && n_top_pool > 0;
+        llama_fn_l22_log("switch", "[TAG_FN_L22_QSA_SEQPOOLS] seqpools=%d%s sharepfx=%d n_top=%u topk_unordered=%d "
+                "indexer_on_cuda=%d%s", seqpools, seqpools == 2 ? " (check)" : "", (int) sharepfx, n_top_pool,
+                (int) unordered, (int) cuda, seqpools != 0 && !seqpools_ok ? " -> no per-sequence lists" : "");
+    }
 
     // [TAG_FN_L16_SEQRM] qwen4exp (the trunk and the MTP draft context): seq_rm of one sequence walks only its own cells
     if (llama_fn_l3_flag(model, "LLAMA_FN_L16_SEQRM")) {
@@ -243,12 +267,15 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
     if (mem_idx) {
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
+        // [TAG_FN_L22_QSA_SHAREPFX] a removal that takes no shared cell changes no other sequence's cells: the sharing
+        // stays as it is (the speculative rollback past a shared prefix, every step)
+        const bool rm_shared = !sharepfx || !kpool_layout_shared() || kpool_rm_takes_shared(seq_id, p0, p1);
         mem_idx->seq_rm(seq_id, p0, p1);
         mem_idx_stale_set(seq_id, stale);
 
         // removing a sequence can free cells another sequence shared, but only this one is marked stale, so the
         // survivor would keep shared = true and pin cache_safe off forever; stale every sequence to re-derive it
-        if (kpool_layout_shared()) {
+        if (kpool_layout_shared() && rm_shared) {
             mem_idx_stale_set(-1, 0);
         }
     }
@@ -264,6 +291,11 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
         // the copy shares cells, which cannot hold two groupings, so both sides drop their cached keys
         mem_idx_stale_set(seq_id_src, 0);
         mem_idx_stale_set(seq_id_dst, 0);
+        // [TAG_FN_L22_QSA_SHAREPFX] the copy also adds a holder to cells a third sequence may share with the source:
+        // re-derive every sequence's shared run
+        if (sharepfx && kpool_layout_shared()) {
+            mem_idx_stale_set(-1, 0);
+        }
     }
 }
 
@@ -285,6 +317,10 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
         const llama_pos stale = mem_idx_stale_pos(seq_id, shift < 0 ? p0 + shift : p0);
         mem_idx->seq_add(seq_id, p0, p1, shift);
         mem_idx_stale_set(seq_id, stale);
+        // [TAG_FN_L22_QSA_SHAREPFX] a shared cell's position is the cell's: a shift moves it for every holder
+        if (sharepfx && kpool_layout_shared()) {
+            mem_idx_stale_set(-1, 0);
+        }
     }
 }
 
@@ -294,6 +330,10 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
         mem_idx_stale_set(seq_id, 0);
+        // [TAG_FN_L22_QSA_SHAREPFX] as seq_add
+        if (sharepfx && kpool_layout_shared()) {
+            mem_idx_stale_set(-1, 0);
+        }
     }
 }
 
@@ -417,6 +457,9 @@ struct llama_memory_hybrid_idx::kpool_layout_seq {
     // [TAG_FN_L10_KPOOLINC] how many leading pools are unchanged (same start, same cells) since set_input_kpool last
     // brought the input cache below up to date; only ever lowered here, raised by the consumer
     mutable size_t pools_keep = 0;
+
+    // [TAG_FN_L22_QSA_SHAREPFX] the shared-cell shape (leading run of shared cells), kept with LLAMA_FN_L22_QSA_SHAREPFX
+    llama_fn_qsa_pfx pfx;
 };
 
 struct llama_memory_hybrid_idx::kpool_layout {
@@ -426,6 +469,8 @@ struct llama_memory_hybrid_idx::kpool_layout {
 
     uint32_t n_pool_real = 0;
     bool cache_safe      = true;
+    bool has_shared      = false; // [TAG_FN_L22_QSA_SHAREPFX] some sequence holds a shared cell
+    bool pfx_safe        = false; // [TAG_FN_L22_QSA_SHAREPFX] cache_safe despite shared cells (aligned prefix)
 
     // [TAG_FN_L10_KPOOLINC] the input values of each sequence's pools (one stream: the cell is the K row), valid for the
     // first pools_keep pools, and how many of those pools use each cell as their rep (the pad search's "is a rep")
@@ -448,6 +493,12 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
     bool     cache_safe  = true;
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] the graph's pool count (get_n_kpool): kpool_pad(n_pool_real), or the width of the one
+    // sequence a single-sequence ubatch lists (seq_only >= 0, its n_pool_list pools first)
+    uint32_t     n_pool_g    = 0;
+    llama_seq_id seq_only    = -1;
+    uint32_t     n_pool_list = 0;
 };
 
 namespace {
@@ -458,7 +509,7 @@ namespace {
 // again (one uncaptured run of ~8500 nodes + a capture): at 64 pools x kpool 4 that was every 256 tokens, ~5 % of the
 // target graphs (TURBO_GRAPH_DIFF, l8/diag). The padded pools point at a dummy cell and are masked. The qwen4exp profile
 // sets 512 (2048 tokens) together with LLAMA_KV_PAD_INDEXER=2048.
-uint32_t kpool_pad(uint32_t n_pool) {
+uint32_t kpool_pad_g() {
     static const uint32_t g = [] {
         const char * e = getenv("LLAMA_KPOOL_PAD");
         const int    v = e ? atoi(e) : 64;
@@ -468,7 +519,11 @@ uint32_t kpool_pad(uint32_t n_pool) {
         }
         return p;
     }();
-    return std::max<uint32_t>(g, GGML_PAD(n_pool + 1, g));
+    return g;
+}
+
+uint32_t kpool_pad(uint32_t n_pool) {
+    return llama_fn_qsa_kpool_pad(n_pool, kpool_pad_g());
 }
 
 // [TAG_FN_L3_HOST_DIAG] LLAMA_FN_HOST_KPOOL_PROBE=1 (qwen4exp): host time of the k-pool work per ubatch (the layout
@@ -523,7 +578,29 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 }
 
 bool llama_memory_hybrid_idx::kpool_layout_shared() const {
-    return kpool_lay && !kpool_lay->cache_safe;
+    // [TAG_FN_L22_QSA_SHAREPFX] with an aligned shared prefix the cache stays safe while cells are shared
+    return kpool_lay && (sharepfx ? kpool_lay->has_shared : !kpool_lay->cache_safe);
+}
+
+// [TAG_FN_L22_QSA_SHAREPFX]
+bool llama_memory_hybrid_idx::kpool_rm_takes_shared(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (mem_idx == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) LLAMA_MAX_SEQ) {
+        return true;
+    }
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+    const auto & cells = mem_idx->get_cells(seq_id);
+    const auto & sp    = cells.seq_pos_get(seq_id);
+    for (auto it = sp.lower_bound(std::make_pair(p0, (uint32_t) 0)); it != sp.end() && it->first < p1; ++it) {
+        if (cells.seq_count(it->second) > 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // [TAG_FN_R1_KPOOL_TAIL] the pool scan from sq.j_next over sq.cells (pools start at the first valid token); the update
@@ -597,6 +674,8 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
     lay.n_pool_real = 0;
     lay.cache_safe  = true;
+    lay.has_shared  = false;
+    lay.pfx_safe    = false;
 
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         auto & sq = lay.seqs[s];
@@ -621,8 +700,10 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
-        } else if ((kpool_tail_mode() & 1) && p_st != POS_CLEAN && p_st > sq.pos_min && !sq.shared && !sq.cells.empty() &&
-                !sp.empty() && sq.pos_min == sp.begin()->first) {
+        } else if ((kpool_tail_mode() & 1) && p_st != POS_CLEAN && p_st > sq.pos_min &&
+                (!sq.shared || (sharepfx && unified && !sq.pfx.irr && sq.pfx.pfx_n > 0 && sq.pfx.pfx_n <= sq.cells.size() &&
+                                p_st > sq.cells[sq.pfx.pfx_n - 1].first)) &&   // [TAG_FN_L22_QSA_SHAREPFX] a cut past the shared run
+                !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first) {
             // [TAG_FN_R1_KPOOL_TAIL]
             const size_t n_cut = (size_t) (std::lower_bound(sq.cells.begin(), sq.cells.end(),
                     std::make_pair(p_st, (uint32_t) 0)) - sq.cells.begin());
@@ -649,13 +730,22 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             sq.j_next  = 0;
             sq.shared  = false;
             sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
+            sq.pfx     = llama_fn_qsa_pfx(); // [TAG_FN_L22_QSA_SHAREPFX]
             n_kept     = 0;
         }
 
         // sharing starts with a seq_cp; it ends with an edit, or a seq_rm/state_drop/state_read that frees the
         // shared cells - each stales every sequence so the rebuild above re-derives it, so once set it holds
         // until then and the rescan can be skipped
-        if (unified && !sq.shared) {
+        if (unified && sharepfx) {
+            // [TAG_FN_L22_QSA_SHAREPFX] the appended cells extend the leading shared run or end the regular shape; a
+            // removal that takes a shared cell, a copy, a shift or a restore while cells are shared stales every
+            // sequence (seq_rm / seq_cp / seq_add / seq_div / state_read), so the kept cells' counts still hold
+            for (size_t j = n_kept; j < sq.cells.size() && !sq.pfx.irr; ++j) {
+                llama_fn_qsa_pfx_step(sq.pfx, j, cells.seq_count(sq.cells[j].second));
+            }
+            sq.shared = sq.pfx.shared;
+        } else if (unified && !sq.shared) {
             for (size_t j = n_kept; j < sq.cells.size(); ++j) {
                 if (cells.seq_count(sq.cells[j].second) > 1) {
                     sq.shared = true;
@@ -682,6 +772,29 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
         lay.cache_safe   = lay.cache_safe && !sq.shared;
+        lay.has_shared   = lay.has_shared || sq.shared;
+    }
+
+    // [TAG_FN_L22_QSA_SHAREPFX] shared cells that form one aligned prefix of every sharing sequence keep the pooled-key
+    // cache exact: every pool lies inside the prefix (same members and rep in each sequence) or ends in the sequence's
+    // own cells (its own rep), see llama_fn_qsa_sharepfx_safe
+    if (sharepfx && unified && lay.has_shared) {
+        llama_fn_qsa_pfx shapes[LLAMA_MAX_SEQ];
+        int32_t          pmin[LLAMA_MAX_SEQ];
+        int n = 0;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & sq = lay.seqs[s];
+            if (sq.cells.empty()) {
+                continue;
+            }
+            shapes[n] = sq.pfx;
+            pmin[n]   = sq.cells.front().first;
+            ++n;
+        }
+        if (llama_fn_qsa_sharepfx_safe(shapes, pmin, n)) {
+            lay.cache_safe = true;
+            lay.pfx_safe   = true;
+        }
     }
 
     return lay;
@@ -708,6 +821,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
+        st.n_pool_g = kpool_pad(st.n_pool_real); // [TAG_FN_L22_QSA_SEQPOOLS] the reserve keeps the worst case
         kpool_st = std::make_unique<kpool_state>(std::move(st));
         i_kpool  = 0;
     }
@@ -846,6 +960,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
     st.cache_safe  = lay.cache_safe;
+    st.n_pool_g    = kpool_pad(st.n_pool_real); // [TAG_FN_L22_QSA_SEQPOOLS]
 
     return st;
 }
@@ -867,6 +982,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     st.cache_safe  = lay.cache_safe;
     st.n_new       = 0;
     st.new_list.clear(); // [TAG_FN_L10_KPOOLINC]
+    // [TAG_FN_L22_QSA_SEQPOOLS] every sequence's pools unless the end of this function lists one
+    st.n_pool_g    = kpool_pad(st.n_pool_real);
+    st.seq_only    = -1;
+    st.n_pool_list = 0;
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(), st.is_new.end(), 0);
         st.generation = 1;
@@ -945,12 +1064,74 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         }
     }
 
+    // [TAG_FN_L22_QSA_SHAREPFX] a shared prefix pool sits in the layout of every sharing sequence (same members, same
+    // rep): re-pool it once, from its first place in the layout's order (both fills follow is_new / new_list)
+    if (lay.pfx_safe && st.n_new > 1) {
+        std::vector<std::pair<uint32_t, uint32_t>> reps; // (rep cell, pool)
+        reps.reserve(st.n_new);
+        for (const uint32_t ipn : st.new_list) {
+            const llama_seq_id s = (llama_seq_id) (std::upper_bound(pool_start.begin(), pool_start.end(), ipn) - pool_start.begin()) - 1;
+            GGML_ASSERT(s >= 0 && s < (llama_seq_id) LLAMA_MAX_SEQ);
+            const auto &   sq = lay.seqs[s];
+            const uint32_t j  = sq.pools[ipn - pool_start[s]];
+            reps.emplace_back(sq.cells[j + kpool - 1].second, ipn);
+        }
+        std::sort(reps.begin(), reps.end());
+        bool dup = false;
+        for (size_t i = 1; i < reps.size(); ++i) {
+            if (reps[i].first == reps[i - 1].first) {
+                st.is_new[reps[i].second] = 0;   // generations start at 1
+                dup = true;
+            }
+        }
+        if (dup) {
+            st.new_list.erase(std::remove_if(st.new_list.begin(), st.new_list.end(),
+                    [&](uint32_t ipn) { return st.is_new[ipn] != st.generation; }), st.new_list.end());
+            st.n_new = (uint32_t) st.new_list.size();
+        }
+    }
+
     // a ubatch touches at most t_s/kpool + 1 pools per sequence, pad to that bound so the graph keeps its shape
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const auto *   idx        = mem->get_mem_idx();
     const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] a single-sequence ubatch lists only its sequence's pools (D12): the other sequences'
+    // pools score -INF for its tokens, so the indexer and the top-k skip them; the new-pool list and the pad cells stay
+    // global (set_input_kpool). Not for a non-unified cache, a shared layout or a top-k that is not index-stable.
+    auto & qs = mem->qsa_stats_mut();
+    ++qs.ubatches;
+    qs.pfx_kept += lay.pfx_safe ? 1 : 0;
+    if (mem->qsa_seqpools() != 0 && mem->qsa_seqpools_ok() && idx->get_n_stream() == 1 && ubatch.n_seqs_unq == 1 &&
+            ubatch.n_tokens > 0) {
+        const llama_seq_id s0 = ubatch.seq_id[0][0];
+        bool one = s0 >= 0 && s0 < (llama_seq_id) LLAMA_MAX_SEQ;
+        for (uint32_t i = 0; i < ubatch.n_tokens && one; ++i) {
+            one = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == s0;
+        }
+        if (one) {
+            ++qs.eligible;
+            const uint32_t n_s = (uint32_t) lay.seqs[s0].pools.size();
+            const uint32_t w   = llama_fn_qsa_seqpools_width(st.n_pool_real, n_s, mem->qsa_n_top(), kpool_pad_g());
+            if (w > 0) {
+                st.n_pool_g    = w;
+                st.seq_only    = s0;
+                st.n_pool_list = n_s;
+                ++qs.filtered;
+                qs.pools_lst += w;
+                qs.pools_all += kpool_pad(st.n_pool_real);
+            }
+        }
+    }
+    if (qs.ubatches % 4096 == 0 && (mem->qsa_seqpools() != 0 || mem->qsa_sharepfx()) && llama_fn_l22_passlog_level() >= 2) {
+        llama_fn_l22_log("graph", "[TAG_FN_L22_QSA_SEQPOOLS] %llu k-pool states: %llu eligible, %llu listed one sequence "
+                "(mean %.0f of %.0f pools), %llu kept the cache through a shared prefix, %llu checked",
+                (unsigned long long) qs.ubatches, (unsigned long long) qs.eligible, (unsigned long long) qs.filtered,
+                qs.filtered ? (double) qs.pools_lst / qs.filtered : 0.0, qs.filtered ? (double) qs.pools_all / qs.filtered : 0.0,
+                (unsigned long long) qs.pfx_kept, (unsigned long long) qs.checked);
+    }
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -960,7 +1141,7 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    return kpool_cur().n_pool_g; // [TAG_FN_L22_QSA_SEQPOOLS] kpool_pad(n_pool_real) unless one sequence is listed
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -1005,7 +1186,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == st.n_pool_g); // [TAG_FN_L22_QSA_SEQPOOLS] kpool_pad(n_pool_real) unless one sequence is listed
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
@@ -1024,6 +1205,17 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const uint32_t kv_size = mem->get_mem_idx()->get_size();
     const uint32_t n_stream_kv = mem->get_mem_idx()->get_n_stream();
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] a listed sequence (kpool_build_state): its pools first, then padding; the new-pool list,
+    // the pad cells and the per-sequence input cache stay global
+    const llama_seq_id s_list = st.seq_only;
+    if (s_list >= 0) {
+        GGML_ASSERT(!gather && n_stream_kv == 1 && st.cache_safe);
+        GGML_ASSERT(st.n_pool_list == (uint32_t) lay.seqs[s_list].pools.size() && st.n_pool_list < n_pool);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            GGML_ASSERT(ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s_list && "QSA_SEQPOOLS: a listed ubatch holds one sequence");
+        }
+    }
 
     auto gcell = [&](const llama_memory_hybrid_idx::kpool_layout::seq & sq, uint32_t cell) {
         return (int64_t) sq.strm*kv_size + cell;
@@ -1087,6 +1279,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
     int32_t * npos  = new_pool_pos != nullptr ? (int32_t *) new_pool_pos->data : nullptr;
 
+    // [TAG_FN_L22_QSA_SEQPOOLS] what the fills write: the graph's tensors, or the full lists of the check below
+    uint32_t     n_pool_w = n_pool;
+    llama_seq_id s_list_w = s_list;
+    void *       mask_w   = pool_mask->data;
+
     if (npos != nullptr) {
         std::fill(npos, npos + 4*n_new_g, 0);
     }
@@ -1098,24 +1295,35 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     pool_end.reserve(n_pool);
 
     uint32_t i_new = 0;
+    const bool listed = s_list_w >= 0;   // [TAG_FN_L22_QSA_SEQPOOLS]
+    uint32_t   lp     = 0;               // listed entries written
+    std::vector<int64_t> reps_all;       // every pool's rep (the pad search) when the arrays hold one sequence
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
         seq_pool_start[s] = (uint32_t) pool_end.size();
 
         const bool inert = !gather && n_stream_kv > 1 && !seq_in_ub[s];
+        const bool write = !listed || s == s_list_w;
 
         for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
             const uint32_t ip = (uint32_t) pool_end.size();
-            GGML_ASSERT(ip + 1 < n_pool);
+            const uint32_t wp = listed ? lp : ip;   // [TAG_FN_L22_QSA_SEQPOOLS] where its entries go
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            pcell[ip] = (int32_t) gcell(sq, rep);
+            if (listed) {
+                reps_all.push_back(gcell(sq, rep));
+            }
+            if (write) {
+                GGML_ASSERT(wp + 1 < n_pool_w);
+                pcell[wp] = (int32_t) gcell(sq, rep);
 
-            for (uint32_t k = 0; k < kpool; ++k) {
-                pidx[(size_t) ip*kpool + k] = inert ? sentinel :
-                    (int32_t) (gather ? gcell(sq, sq.cells[j + k].second) : (int64_t) sq.cells[j + k].second);
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    pidx[(size_t) wp*kpool + k] = inert ? sentinel :
+                        (int32_t) (gather ? gcell(sq, sq.cells[j + k].second) : (int64_t) sq.cells[j + k].second);
+                }
+                lp += listed ? 1 : 0;
             }
 
             if (st.is_new[ip] == st.generation) {
@@ -1151,8 +1359,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         // whenever no pool completes; 61K pools at 246K). The same cells as the sorted search.
         const int64_t n_cells = (int64_t) kv_size*n_stream_kv;
         std::vector<uint64_t> rep_bits((size_t) (n_cells + 63)/64, 0);
-        for (size_t ip = 0; ip < pool_end.size(); ++ip) {
-            const int64_t c = pcell[ip];
+        const size_t n_reps = listed ? reps_all.size() : pool_end.size();
+        for (size_t ip = 0; ip < n_reps; ++ip) {
+            const int64_t c = listed ? reps_all[ip] : pcell[ip];
             if (c >= 0 && c < n_cells) {
                 rep_bits[(size_t) c >> 6] |= 1ull << (c & 63);
             }
@@ -1176,8 +1385,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    const uint32_t n_pool_real = (uint32_t) pool_end.size();
-    for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {
+    const uint32_t n_pool_real = listed ? lp : (uint32_t) pool_end.size();
+    for (uint32_t ip = n_pool_real; ip < n_pool_w; ++ip) {
         pcell[ip] = (int32_t) dummy_cell; // pool_cells always addresses the K storage
         for (uint32_t k = 0; k < kpool; ++k) {
             pidx[(size_t) ip*kpool + k] = sentinel;
@@ -1194,14 +1403,15 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
+            T * row = data + (size_t) i*n_pool_w;
+            std::fill(row, row + n_pool_w, drop);
 
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+            const uint32_t r0 = listed ? 0 : p0;   // [TAG_FN_L22_QSA_SEQPOOLS] the listed sequence's pools come first
+            std::fill(row + r0, row + r0 + nv, keep);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
@@ -1213,9 +1423,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     };
     if (pool_mask->type == GGML_TYPE_F16) {
-        fill_mask((ggml_fp16_t *) pool_mask->data);
+        fill_mask((ggml_fp16_t *) mask_w);
     } else {
-        fill_mask((float *) pool_mask->data);
+        fill_mask((float *) mask_w);
     }
     };
 
@@ -1225,6 +1435,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // rep counts. The same values as the full rebuild (LLAMA_KPOOL_VERIFY=1 compares them on every fill); the full
     // rebuild cost ~6 ns per pool each ubatch (0.05 ms at 32K, 0.35 ms at 245K with 62K pools)
     auto fill_inc = [&]() {
+        const bool listed = s_list_w >= 0;   // [TAG_FN_L22_QSA_SEQPOOLS]
         const int64_t n_cells = (int64_t) kv_size;
         if ((int64_t) lay.inc_rep_cnt.size() != n_cells) {
             lay.inc_rep_cnt.assign((size_t) n_cells, 0);
@@ -1265,10 +1476,12 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
             const uint32_t n = (uint32_t) c.end.size();
             seq_pool_start[s] = ip0;
-            if (n > 0) {
-                GGML_ASSERT(ip0 + n < n_pool);
-                memcpy(pcell + ip0,                c.pcell.data(), (size_t) n*sizeof(int32_t));
-                memcpy(pidx + (size_t) ip0*kpool, c.pidx.data(),  (size_t) n*kpool*sizeof(int32_t));
+            // [TAG_FN_L22_QSA_SEQPOOLS] a listed ubatch copies only its sequence, to the front
+            if (n > 0 && (!listed || s == s_list_w)) {
+                const uint32_t wp0 = listed ? 0 : ip0;
+                GGML_ASSERT(wp0 + n < n_pool_w);
+                memcpy(pcell + wp0,                c.pcell.data(), (size_t) n*sizeof(int32_t));
+                memcpy(pidx + (size_t) wp0*kpool, c.pidx.data(),  (size_t) n*kpool*sizeof(int32_t));
             }
             ip0 += n;
         }
@@ -1318,10 +1531,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
 
-        for (uint32_t ip = ip0; ip < n_pool; ++ip) {
+        const uint32_t ipw = listed ? st.n_pool_list : ip0;
+        for (uint32_t ip = ipw; ip < n_pool_w; ++ip) {
             pcell[ip] = (int32_t) dummy_cell;
         }
-        std::fill(pidx + (size_t) ip0*kpool, pidx + (size_t) n_pool*kpool, sentinel);
+        std::fill(pidx + (size_t) ipw*kpool, pidx + (size_t) n_pool_w*kpool, sentinel);
 
         // the masks: each row written once (dropped, the visible pools of the token's sequence, dropped)
         auto fill_mask_inc = [&](auto * data) {
@@ -1334,14 +1548,14 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 const llama_pos    p  = ubatch->pos[i];
                 const auto &       ce = lay.inc[si].end;
 
-                const uint32_t p0 = seq_pool_start[si];
+                const uint32_t p0 = listed ? 0 : seq_pool_start[si];   // [TAG_FN_L22_QSA_SEQPOOLS]
                 const uint32_t nv = by_order ? std::min((uint32_t) ce.size(), (uint32_t) ((rank[i] + 1)/kpool)) :
                     (uint32_t) (std::upper_bound(ce.begin(), ce.end(), p) - ce.begin());
 
-                T * row = data + (size_t) i*n_pool;
+                T * row = data + (size_t) i*n_pool_w;
                 std::fill(row,           row + p0,     drop);
                 std::fill(row + p0,      row + p0 + nv, keep);
-                std::fill(row + p0 + nv, row + n_pool, drop);
+                std::fill(row + p0 + nv, row + n_pool_w, drop);
 
                 if (gm != nullptr) {
                     const uint32_t nvc = std::min(nv, n_top);
@@ -1352,9 +1566,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         };
         if (pool_mask->type == GGML_TYPE_F16) {
-            fill_mask_inc((ggml_fp16_t *) pool_mask->data);
+            fill_mask_inc((ggml_fp16_t *) mask_w);
         } else {
-            fill_mask_inc((float *) pool_mask->data);
+            fill_mask_inc((float *) mask_w);
         }
     };
 
@@ -1384,6 +1598,96 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     } else {
         fill_full();
+    }
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] LLAMA_FN_L22_QSA_SEQPOOLS=2: the listed inputs against the full lists of the same ubatch
+    // (a full rebuild without the listing into scratch arrays), and with a shared prefix kept safe, every rep against one
+    // member set. Aborts at the first difference.
+    if (mem->qsa_seqpools() == 2 && (s_list >= 0 || lay.pfx_safe)) {
+        const uint32_t n_full = kpool_pad(st.n_pool_real);
+        const size_t   esz    = ggml_type_size(pool_mask->type);
+        std::vector<int32_t> f_pcell(n_full), f_pidx((size_t) n_full*kpool), f_nidx((size_t) kpool*n_new_g);
+        std::vector<int64_t> f_nrep(n_new_g);
+        std::vector<int32_t> f_npos((size_t) 4*n_new_g, 0);
+        std::vector<uint8_t> f_mask((size_t) n_full*n_tokens*esz);
+
+        int32_t * t_pcell = pcell;
+        int32_t * t_pidx  = pidx;
+        int32_t * t_nidx  = nidx;
+        int64_t * t_nrep  = nrep;
+        int32_t * t_npos  = npos;
+        float   * t_gm    = gm;
+        pcell = f_pcell.data();
+        pidx  = f_pidx.data();
+        nidx  = f_nidx.data();
+        nrep  = nrep != nullptr ? f_nrep.data() : nullptr;
+        npos  = npos != nullptr ? f_npos.data() : nullptr;
+        gm    = nullptr;
+        n_pool_w = n_full;
+        s_list_w = -1;
+        mask_w   = f_mask.data();
+        fill_full();
+        pcell = t_pcell;
+        pidx  = t_pidx;
+        nidx  = t_nidx;
+        nrep  = t_nrep;
+        npos  = t_npos;
+        gm    = t_gm;
+        n_pool_w = n_pool;
+        s_list_w = s_list;
+        mask_w   = pool_mask->data;
+
+        std::string err;
+        if (s_list >= 0) {
+            auto to_f32 = [&](const void * src, size_t n) {
+                std::vector<float> v(n);
+                if (pool_mask->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * h = (const ggml_fp16_t *) src;
+                    for (size_t i = 0; i < n; ++i) {
+                        v[i] = ggml_fp16_to_fp32(h[i]);
+                    }
+                } else {
+                    memcpy(v.data(), src, n*sizeof(float));
+                }
+                return v;
+            };
+            const std::vector<float> m_l = to_f32(pool_mask->data, (size_t) n_pool*n_tokens);
+            const std::vector<float> m_f = to_f32(f_mask.data(),   (size_t) n_full*n_tokens);
+
+            llama_fn_qsa_lists lst;
+            lst.pcell  = pcell;
+            lst.pidx   = pidx;
+            lst.mask   = m_l.data();
+            lst.n_pool = n_pool;
+            llama_fn_qsa_lists full;
+            full.pcell  = f_pcell.data();
+            full.pidx   = f_pidx.data();
+            full.mask   = m_f.data();
+            full.n_pool = n_full;
+            err = llama_fn_qsa_seqpools_check(lst, st.n_pool_list, full, seq_pool_start[s_list], kpool, n_tokens,
+                                              (int32_t) dummy_cell, sentinel);
+            if (err.empty() && memcmp(nidx, f_nidx.data(), f_nidx.size()*sizeof(int32_t)) != 0) {
+                err = "the new-pool members differ";
+            }
+            if (err.empty() && nrep != nullptr && memcmp(nrep, f_nrep.data(), f_nrep.size()*sizeof(int64_t)) != 0) {
+                err = "the new-pool reps differ";
+            }
+            if (err.empty() && npos != nullptr && memcmp(npos, f_npos.data(), f_npos.size()*sizeof(int32_t)) != 0) {
+                err = "the new-pool positions differ";
+            }
+        }
+        if (err.empty() && lay.pfx_safe) {
+            err = llama_fn_qsa_rep_members_check(f_pcell.data(), f_pidx.data(), st.n_pool_real, kpool);
+        }
+        if (!err.empty()) {
+            GGML_ABORT("[TAG_FN_L22_QSA_SEQPOOLS] check failed: %s (seq %d, %u listed of %u pools, %u tokens, shared prefix %d)",
+                    err.c_str(), (int) s_list, st.n_pool_list, st.n_pool_real, n_tokens, (int) lay.pfx_safe);
+        }
+        auto & qs = mem->qsa_stats_mut();
+        if (++qs.checked % 4096 == 1) {
+            llama_fn_l22_log("graph", "[TAG_FN_L22_QSA_SEQPOOLS] check: %llu ubatches agree with the full lists",
+                    (unsigned long long) qs.checked);
+        }
     }
 
     int32_t * tidx = (int32_t *) tail_idxs->data;
@@ -1418,4 +1722,169 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     }
+}
+
+//
+// [TAG_FN_L22_QSA_SEQPOOLS] [TAG_FN_L22_QSA_SHAREPFX] round 22 P13: pure pieces (llama-memory-hybrid-idx.h)
+//
+
+uint32_t llama_fn_qsa_kpool_pad(uint32_t n_pool, uint32_t pad_g) {
+    return std::max<uint32_t>(pad_g, GGML_PAD(n_pool + 1, pad_g));
+}
+
+uint32_t llama_fn_qsa_seqpools_width(uint32_t n_all, uint32_t n_seq, uint32_t n_top, uint32_t pad_g) {
+    // the CUDA top-k keeps the lowest indices on ties only in its radix select, taken for ncols >= 2048
+    // (ggml-cuda/top-k.cu: [TAG_TOPK_SELECT], the [TAG_FN_L3_GPU_TOPK] two-stage form gives the same set)
+    constexpr uint32_t stable_cols = 2048;
+
+    if (n_top == 0 || pad_g == 0 || n_seq >= n_all) {
+        return 0;
+    }
+    const uint32_t full = llama_fn_qsa_kpool_pad(n_all, pad_g);
+    if (full < stable_cols) {
+        return 0;
+    }
+    // at least n_top columns, so the picks stay n_top (n_sel unchanged)
+    uint32_t cand = std::max(llama_fn_qsa_kpool_pad(n_seq, pad_g), llama_fn_qsa_kpool_pad(n_top - 1, pad_g));
+    if (cand != n_top && cand < stable_cols) {
+        cand = llama_fn_qsa_kpool_pad(stable_cols - 1, pad_g);
+    }
+    return cand < full ? cand : 0;
+}
+
+static bool qsa_same_bits(float a, float b) {
+    uint32_t ua;
+    uint32_t ub;
+    memcpy(&ua, &a, sizeof(ua));
+    memcpy(&ub, &b, sizeof(ub));
+    return ua == ub;
+}
+
+std::string llama_fn_qsa_seqpools_check(const llama_fn_qsa_lists & lst, uint32_t n_list, const llama_fn_qsa_lists & full,
+                                        uint32_t gstart, uint32_t kpool, uint32_t n_tokens, int32_t dummy, int32_t sentinel) {
+    char buf[256];
+    if (lst.pcell == nullptr || lst.pidx == nullptr || lst.mask == nullptr || full.pcell == nullptr || full.pidx == nullptr ||
+            full.mask == nullptr || kpool == 0 || n_list >= lst.n_pool || (uint64_t) gstart + n_list > full.n_pool) {
+        snprintf(buf, sizeof(buf), "shapes: %u listed of width %u, start %u of width %u", n_list, lst.n_pool, gstart, full.n_pool);
+        return buf;
+    }
+    for (uint32_t i = 0; i < n_list; ++i) {
+        if (lst.pcell[i] != full.pcell[gstart + i]) {
+            snprintf(buf, sizeof(buf), "pool %u: rep cell %d, full list %d", i, lst.pcell[i], full.pcell[gstart + i]);
+            return buf;
+        }
+        if (memcmp(lst.pidx + (size_t) i*kpool, full.pidx + (size_t) (gstart + i)*kpool, kpool*sizeof(int32_t)) != 0) {
+            snprintf(buf, sizeof(buf), "pool %u: members differ from the full list", i);
+            return buf;
+        }
+    }
+    for (uint32_t i = n_list; i < lst.n_pool; ++i) {
+        if (lst.pcell[i] != dummy) {
+            snprintf(buf, sizeof(buf), "padded pool %u: rep cell %d, not the dummy %d", i, lst.pcell[i], dummy);
+            return buf;
+        }
+        for (uint32_t k = 0; k < kpool; ++k) {
+            if (lst.pidx[(size_t) i*kpool + k] != sentinel) {
+                snprintf(buf, sizeof(buf), "padded pool %u: member %u is %d, not the sentinel %d", i, k,
+                         lst.pidx[(size_t) i*kpool + k], sentinel);
+                return buf;
+            }
+        }
+    }
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const float * ml = lst.mask  + (size_t) t*lst.n_pool;
+        const float * mf = full.mask + (size_t) t*full.n_pool;
+        for (uint32_t i = 0; i < n_list; ++i) {
+            if (!qsa_same_bits(ml[i], mf[gstart + i])) {
+                snprintf(buf, sizeof(buf), "token %u, pool %u: mask %g, full list %g", t, i, ml[i], mf[gstart + i]);
+                return buf;
+            }
+        }
+        for (uint32_t i = n_list; i < lst.n_pool; ++i) {
+            if (!(std::isinf(ml[i]) && ml[i] < 0.0f)) {
+                snprintf(buf, sizeof(buf), "token %u, padded pool %u: mask %g, not -inf", t, i, ml[i]);
+                return buf;
+            }
+        }
+        for (uint32_t j = 0; j < full.n_pool; ++j) {
+            if (j >= gstart && j < gstart + n_list) {
+                continue;
+            }
+            if (!(std::isinf(mf[j]) && mf[j] < 0.0f)) {
+                snprintf(buf, sizeof(buf), "token %u sees pool %u of the full list outside its sequence (%g)", t, j, mf[j]);
+                return buf;
+            }
+        }
+    }
+    return std::string();
+}
+
+std::string llama_fn_qsa_rep_members_check(const int32_t * pcell, const int32_t * pidx, uint32_t n, uint32_t kpool) {
+    if (n == 0) {
+        return std::string();
+    }
+    std::vector<uint32_t> ord(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        ord[i] = i;
+    }
+    std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+        return pcell[a] != pcell[b] ? pcell[a] < pcell[b] : a < b;
+    });
+    for (uint32_t i = 1; i < n; ++i) {
+        const uint32_t a = ord[i - 1];
+        const uint32_t b = ord[i];
+        if (pcell[a] == pcell[b] &&
+                memcmp(pidx + (size_t) a*kpool, pidx + (size_t) b*kpool, kpool*sizeof(int32_t)) != 0) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "pools %u and %u share rep cell %d with different members", a, b, pcell[a]);
+            return buf;
+        }
+    }
+    return std::string();
+}
+
+bool llama_fn_qsa_pfx_step(llama_fn_qsa_pfx & st, size_t j, int32_t cnt) {
+    if (st.irr) {
+        return false;
+    }
+    if (cnt > 1) {
+        st.shared = true;
+        if (j == st.pfx_n) {
+            st.cmin = st.pfx_n == 0 ? cnt : std::min(st.cmin, cnt);
+            st.cmax = st.pfx_n == 0 ? cnt : std::max(st.cmax, cnt);
+            ++st.pfx_n;
+        } else {
+            st.irr = true;   // a shared cell after an own cell
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_fn_qsa_sharepfx_safe(const llama_fn_qsa_pfx * seqs, const int32_t * pos_min, int n) {
+    int n_s   = 0;
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!seqs[i].shared) {
+            continue;
+        }
+        if (seqs[i].irr || seqs[i].pfx_n == 0) {
+            return false;
+        }
+        if (first < 0) {
+            first = i;
+        } else if (seqs[i].pfx_n != seqs[first].pfx_n || pos_min[i] != pos_min[first]) {
+            return false;
+        }
+        ++n_s;
+    }
+    if (n_s < 2) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (seqs[i].shared && (seqs[i].cmin != n_s || seqs[i].cmax != n_s)) {
+            return false;
+        }
+    }
+    return true;
 }

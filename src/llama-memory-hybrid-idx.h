@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -115,6 +116,28 @@ public:
     // updated at the layout's tail instead of rebuilt over every pool on each ubatch
     bool kpool_inc_on() const { return kpool_inc; }
 
+    // [TAG_FN_L22_QSA_SEQPOOLS] qwen4exp (LLAMA_FN_L22_QSA_SEQPOOLS, 0 off, 1 on, 2 on + check against the full lists): a
+    // single-sequence ubatch lists only its sequence's pools (see llama_fn_qsa_seqpools_width below)
+    int  qsa_seqpools() const { return seqpools; }
+    // the top-k picks the same set from a shorter list (unordered radix select on CUDA, ties keep the lowest index)
+    bool qsa_seqpools_ok() const { return seqpools_ok; }
+    // pools the indexer picks per query (indexer_top_k / kpool)
+    uint32_t qsa_n_top() const { return n_top_pool; }
+    // [TAG_FN_L22_QSA_SHAREPFX] qwen4exp (LLAMA_FN_L22_QSA_SHAREPFX): an aligned shared prefix keeps the pooled-key cache
+    bool qsa_sharepfx() const { return sharepfx; }
+
+    // [TAG_FN_L22_QSA_SEQPOOLS] PASSLOG level-2 counters (the inference thread)
+    struct qsa_stats {
+        uint64_t ubatches  = 0; // k-pool states built
+        uint64_t eligible  = 0; // single-sequence, cache-safe, one stream
+        uint64_t filtered  = 0; // listed one sequence
+        uint64_t pools_lst = 0; // sum of listed widths
+        uint64_t pools_all = 0; // sum of full widths of the filtered ubatches
+        uint64_t pfx_kept  = 0; // states whose cache stayed safe through SHAREPFX
+        uint64_t checked   = 0; // ubatches checked (QSA_SEQPOOLS=2)
+    };
+    qsa_stats & qsa_stats_mut() const { return qsa_st; }
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -132,8 +155,17 @@ private:
     bool kpool_probe = false; // [TAG_FN_L3_HOST_DIAG]
     bool kpool_inc   = false; // [TAG_FN_L10_KPOOLINC]
 
+    int      seqpools    = 0;     // [TAG_FN_L22_QSA_SEQPOOLS]
+    bool     seqpools_ok = false;
+    uint32_t n_top_pool  = 0;
+    bool     sharepfx    = false; // [TAG_FN_L22_QSA_SHAREPFX]
+    mutable qsa_stats qsa_st;
+
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;
+
+    // [TAG_FN_L22_QSA_SHAREPFX] whether seq_rm(seq_id, p0, p1) would take a shared cell away (before the removal)
+    bool kpool_rm_takes_shared(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
@@ -248,3 +280,57 @@ private:
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
 };
+
+//
+// [TAG_FN_L22_QSA_SEQPOOLS] [TAG_FN_L22_QSA_SHAREPFX] round 22 P13: pure pieces of the per-sequence pool lists, exported
+// for tests/test-fn-l22-kvrows.cpp
+//
+
+// the padded pool count of llama_memory_hybrid_idx (kpool_pad) for a step of pad_g pools: max(pad_g, PAD(n + 1, pad_g))
+LLAMA_API uint32_t llama_fn_qsa_kpool_pad(uint32_t n_pool, uint32_t pad_g);
+
+// The list width of a single-sequence ubatch that lists only its sequence's n_seq pools instead of every sequence's
+// n_all (the full width is kpool_pad(n_all)), or 0 to keep the full list. The picked set must stay the same:
+//   - the number of picks n_top_pool = min(width, n_top) stays n_top (so n_sel, the FA budget, is unchanged): width >= n_top
+//   - the top-k ties (many visible pools score exactly 0) resolve by index in the CUDA radix select only for ncols >= 2048
+//     (ggml-cuda/top-k.cu, [TAG_TOPK_SELECT] / [TAG_FN_L3_GPU_TOPK]); below that the CUB / bitonic sort resolves them by
+//     position. So the full width must be >= 2048, and the listed width >= 2048 or exactly n_top (k == ncols: all picked)
+//   - the sequence's pools keep their relative order (they are the same columns, shifted), foreign pools score -INF
+LLAMA_API uint32_t llama_fn_qsa_seqpools_width(uint32_t n_all, uint32_t n_seq, uint32_t n_top, uint32_t pad_g);
+
+// QSA_SEQPOOLS=2: the listed inputs against the full ones (the same ubatch, no listing). pcell / pidx / mask of the
+// listed width n_pool_l (n_list real entries) vs the full width n_pool_f where the sequence's pools start at gstart;
+// masks as float [n_pool, n_tokens]; the padded entries hold dummy / sentinel. "" when they agree, else the first
+// difference.
+struct llama_fn_qsa_lists {
+    const int32_t * pcell = nullptr; // [n_pool]
+    const int32_t * pidx  = nullptr; // [kpool, n_pool]
+    const float   * mask  = nullptr; // [n_pool, n_tokens]
+    uint32_t        n_pool = 0;
+};
+LLAMA_API std::string llama_fn_qsa_seqpools_check(const llama_fn_qsa_lists & lst, uint32_t n_list, const llama_fn_qsa_lists & full,
+                                                  uint32_t gstart, uint32_t kpool, uint32_t n_tokens, int32_t dummy, int32_t sentinel);
+
+// [TAG_FN_L22_QSA_SHAREPFX] every rep cell names one member set: pools that share a rep (a shared prefix pool, listed
+// once per sharing sequence) have the same members. "" when that holds for the n pools, else the first offender.
+LLAMA_API std::string llama_fn_qsa_rep_members_check(const int32_t * pcell, const int32_t * pidx, uint32_t n, uint32_t kpool);
+
+// [TAG_FN_L22_QSA_SHAREPFX] the shared-cell shape of one sequence, kept while its layout appends: the leading run of
+// shared cells (pfx_n cells, seq_count between cmin and cmax), and whether a shared cell sits after that run
+struct llama_fn_qsa_pfx {
+    bool     shared = false;
+    bool     irr    = false;
+    uint32_t pfx_n  = 0;
+    int32_t  cmin   = 0;
+    int32_t  cmax   = 0;
+};
+
+// cell j of the sequence (cells in position order, j counting from 0) has seq_count cnt; false once the shape is irregular
+LLAMA_API bool llama_fn_qsa_pfx_step(llama_fn_qsa_pfx & st, size_t j, int32_t cnt);
+
+// whether the pooled-key cache stays exact with the shared cells of these sequences (one entry per sequence that holds
+// cells; pos_min the first position of each): every sequence holding a shared cell has a regular shape, the same run
+// length, the same first position, and every cell of the run belongs to exactly the |S| sharing sequences. Then those
+// runs are the same cells in the same order (a shared cell's position is the cell's), so every pool lies inside the
+// prefix (the same members and rep in every sharing sequence) or ends in a sequence's own cells (its own rep).
+LLAMA_API bool llama_fn_qsa_sharepfx_safe(const llama_fn_qsa_pfx * seqs, const int32_t * pos_min, int n);
