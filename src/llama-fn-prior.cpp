@@ -282,7 +282,7 @@ ggml_tensor * llama_fn_route_prior(llm_graph_context * g, ggml_tensor * probs, i
     }
     const bool gen = (g->fn_x & (LLAMA_FN_L22_XB_PRIOR | LLAMA_FN_L22_XB_RESIDENT)) != 0;
     // plan 3.8: a lever acts only where fn_gen = 1, unless its own prompt rule (_X_PRIOR_PROMPT) says otherwise
-    if (!gen && (!st.cfg.prompt || g->fn_gen)) {
+    if (!llama_fn_l22_prior_acts(g->fn_x, g->fn_gen, st.cfg.prompt)) {
         return probs;
     }
     // only where the hot experts run on the device (the bridge takes the graph, or a hot chain serves it): elsewhere the CPU

@@ -9,6 +9,7 @@
 #include "llama-model.h"
 
 #include "ggml-backend.h"
+#include "ggml-moe-bridge.h"
 
 #include <algorithm>
 #include <atomic>
@@ -101,6 +102,19 @@ uint8_t llama_fn_l22_x_bits(const llama_fn_l22_x_cfg & cfg, uint8_t fn_gen, uint
     return b;
 }
 
+// R-REV-6: plan 3.8, the levers act only through fn_x (0 unless fn_gen)
+int32_t llama_fn_l22_job_flags(uint8_t fn_x) {
+    return (fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0;
+}
+
+bool llama_fn_l22_defer_acts(uint8_t fn_x, uint32_t n_seqs_unq, bool have_bridge, bool tbo) {
+    return (fn_x & LLAMA_FN_L22_XB_DEFER) != 0 && n_seqs_unq == 1 && have_bridge && !tbo;
+}
+
+bool llama_fn_l22_prior_acts(uint8_t fn_x, uint8_t fn_gen, bool prompt_rule) {
+    return (fn_x & (LLAMA_FN_L22_XB_PRIOR | LLAMA_FN_L22_XB_RESIDENT)) != 0 || (prompt_rule && !fn_gen);
+}
+
 //
 // expert ranges
 //
@@ -149,18 +163,33 @@ int llama_fn_l22_passlog_level() {
     return p >= 0 ? p : 0;
 }
 
+// R-REV-11: ggml-cuda's kind=graph lines follow the resolved level (ggml cannot read the profile): one call per change
+static void fn_l22_passlog_push() {
+    using set_fn_t = void (*)(int);
+    const int lvl = llama_fn_l22_passlog_level();
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto fn = reg ? (set_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_passlog_level") : nullptr;
+        if (fn) {
+            fn(lvl);
+        }
+    }
+}
+
 void llama_fn_l22_passlog_model(const llama_model * model, bool loaded) {
     if (model == nullptr) {
         return;
     }
     if (!loaded) {
         g_passlog_profile.store(-1, std::memory_order_relaxed);
+        fn_l22_passlog_push();
         return;
     }
     const int v = fn_l22_level_of(llama_fn_env(*model, "LLAMA_FN_L22_PASSLOG"));
     if (v >= 0) {
         g_passlog_profile.store(v, std::memory_order_relaxed);
     }
+    fn_l22_passlog_push();
 }
 
 #if defined(_WIN32)

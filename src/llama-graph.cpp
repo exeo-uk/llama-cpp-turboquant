@@ -2698,7 +2698,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const bool hint  = hint_k > 0 && hint_router->ne[0] == cur->ne[0] && hint_router->ne[1] >= hint_k;
             const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
                                      (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0) |
-                                     ((fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0) | // [TAG_FN_L22_X_TAILSKIP]
+                                     llama_fn_l22_job_flags(fn_x) | // [TAG_FN_L22_X_TAILSKIP] plan 3.8: from fn_x only
                                      (moe_tbo ? GGML_MOE_BRIDGE_JOB_NOPF : 0); // [TAG_FN_L22_TBO] no prefetch between chains
             br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan,
                     br_flags | (xd_chan >= 0 ? GGML_MOE_BRIDGE_JOB_DEFER : 0)); // [TAG_FN_L22_X_DEFER]
@@ -2730,8 +2730,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // the job's table: the hot set's, as the bridge's job takes it (GGML_MOE_BRIDGE_JOB_TABLE); no DMA share
             br_ticket = ggml_moe_host_sum(ctx0, cur, selected_experts, w2, up_exps, gate_exps, down_exps,
                     mcache ? mcache->host_table : nullptr, mcache ? mcache->n_slots : 0);
-            if (fn_x & LLAMA_FN_L22_XB_TAIL) {
-                ggml_moe_host_sum_set_flags(br_ticket, GGML_MOE_BRIDGE_JOB_TAIL); // [TAG_FN_L22_X_TAILSKIP] a retry: same rule
+            if (const int32_t xf = llama_fn_l22_job_flags(fn_x)) {
+                ggml_moe_host_sum_set_flags(br_ticket, xf); // [TAG_FN_L22_X_TAILSKIP] a retry: same rule
             }
             if (xd_chan >= 0) {
                 // [TAG_FN_L22_X_DEFER] a retry splits as the bridged job: the heavy part here, the light part as the next
@@ -3223,7 +3223,7 @@ ggml_tensor * llm_graph_context::build_moe_bridge_finish(ggml_tensor * cur, int 
 // [TAG_FN_L22_X_DEFER]
 int llm_graph_context::fn_x_defer_mode() const {
     const llama_moe_bridge * br_any = moe_bridge ? moe_bridge : moe_bridge_sync;
-    if (!(fn_x & LLAMA_FN_L22_XB_DEFER) || ubatch.n_seqs_unq != 1 || br_any == nullptr || moe_tbo) { // [TAG_FN_L22_TBO] never in a chain
+    if (!llama_fn_l22_defer_acts(fn_x, ubatch.n_seqs_unq, br_any != nullptr, moe_tbo)) { // [TAG_FN_L22_TBO] never in a chain
         return 0;
     }
     return llama_moe_bridge_defer_mode(br_any);
