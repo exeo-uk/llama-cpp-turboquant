@@ -19,6 +19,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <atomic> // [TAG_FN_L22_XOVER]
 
 namespace {
 
@@ -347,9 +348,16 @@ const fn_item k_items[] = {
 
 } // namespace
 
-// [TAG_FN_L22_XOVER] P10 R1 (src/llama-fn-l22.h). P0 stub: 0, the PHOT rule reads GGML_OP_OFFLOAD_MIN_BATCH as before
+// [TAG_FN_L22_XOVER] P10 R1 (src/llama-fn-l22.h): the crossover XOVER set (0: unset, the PHOT rule reads
+// GGML_OP_OFFLOAD_MIN_BATCH as before)
+static std::atomic<int32_t> g_l22_offload_min{0};
+
 int32_t llama_fn_l22_offload_min(void) {
-    return 0;
+    return g_l22_offload_min.load(std::memory_order_relaxed);
+}
+
+void llama_fn_l22_offload_min_set(int32_t v) {
+    g_l22_offload_min.store(v > 0 ? v : 0, std::memory_order_relaxed);
 }
 
 namespace {
@@ -966,6 +974,233 @@ uint32_t llama_fn_l22_next_width(uint32_t base_ub, uint32_t n_ubatch, bool l21_b
         }
     }
     return w;
+}
+
+// [TAG_FN_L22_P10] ---------------------------------------------------------------------------------------------------
+
+int llama_fn_l22_stagers_mode(const char * v) {
+    if (!v) {
+        return 0;
+    }
+    std::string s;
+    for (const char * p = v; *p; ++p) {
+        if (!isspace((unsigned char) *p)) {
+            s += (char) tolower((unsigned char) *p);
+        }
+    }
+    if (s.empty() || s == "off" || s == "false" || s == "no") {
+        return 0;
+    }
+    if (s == "auto" || s == "on" || s == "true" || s == "yes") {
+        return -1;
+    }
+    char * end = nullptr;
+    const long n = strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || *end != 0 || n <= 0) {
+        return 0;
+    }
+    return n == 1 ? -1 : (int) std::min<long>(n, 64);
+}
+
+int llama_fn_l22_stagers(uint64_t staged, uint64_t host, int n_max, int n_min) {
+    n_max = std::max(1, n_max);
+    n_min = std::max(1, std::min(n_min, n_max));
+    if (host == 0) {
+        return n_max;
+    }
+    staged = std::min(staged, host);
+    const int n = (int) std::lround((double) n_max * (double) staged / (double) host);
+    return std::max(n_min, std::min(n_max, n));
+}
+
+int llama_fn_l22_depth_bucket(int64_t n_kv) {
+    return n_kv < 16384 ? 0 : n_kv < 65536 ? 1 : n_kv < 163840 ? 2 : 3;
+}
+
+void llama_fn_l22_cost_init(llama_fn_l22_cost & c, bool pinned) {
+    c = llama_fn_l22_cost();
+    c.pinned = pinned;
+    for (int b = 0; b < 4; ++b) {
+        c.pass_ms[b]    = pinned ? 1700.0 : 3400.0; // EST: a round-20 8K pass 3.4-4 s, pinned about half
+        c.gpu_ms_row[b] = 0.42;                     // EST: a 16K pass ~7.0 s (round 20)
+        c.cpu_ms_row[b] = 4.55;                     // EST: the CPU path at 220 rows/s (A doc)
+    }
+    c.fix_ms = 240.0; // EST: the 10-08 refill
+    c.big_ms = 300.0; // EST: borrow + unborrow
+}
+
+void llama_fn_l22_cost_repin(llama_fn_l22_cost & c, bool pinned) {
+    if (c.pinned == pinned) {
+        return;
+    }
+    c.pinned = pinned;
+    for (int b = 0; b < 4; ++b) {
+        c.pass_ms[b] = pinned ? 1700.0 : 3400.0;
+        c.n_pass[b]  = 0;
+        c.n_obs[b]   = 0;
+    }
+}
+
+static void fn_l22_ewma(double & est, uint32_t & n, double x) {
+    if (!std::isfinite(x) || x < 0.0) {
+        return;
+    }
+    if (n == 0) {
+        est = x; // the first measurement replaces the prior
+    } else {
+        if (n >= 3) {
+            x = std::min(2.0*est, std::max(0.5*est, x)); // stalls of 2.5-14 s must not move it far
+        }
+        est += 0.25*(x - est);
+    }
+    n++;
+}
+
+static int fn_l22_bucket(int b) {
+    return std::max(0, std::min(3, b));
+}
+
+void llama_fn_l22_cost_pass(llama_fn_l22_cost & c, int b, uint32_t rows, double wall_ms, double wait_ms) {
+    if (b < 0 || b > 3 || rows == 0 || !(wall_ms > 0.0) || !std::isfinite(wall_ms)) {
+        return;
+    }
+    wait_ms = std::max(0.0, std::min(wall_ms, std::isfinite(wait_ms) ? wait_ms : 0.0));
+    c.n_obs[b]++;
+    if (wait_ms >= 0.1*wall_ms) {
+        fn_l22_ewma(c.pass_ms[b], c.n_pass[b], wall_ms);
+    } else if (c.pass_ms[b] > wall_ms) {
+        c.pass_ms[b] = wall_ms; // compute-bound: the copies took at most the wall
+    }
+    if (rows >= 2048) {
+        fn_l22_ewma(c.gpu_ms_row[b], c.n_gpu[b], (wall_ms - wait_ms) / rows);
+    }
+}
+
+void llama_fn_l22_cost_cpu(llama_fn_l22_cost & c, int b, uint32_t rows, double wall_ms) {
+    if (b < 0 || b > 3 || rows < 128 || !(wall_ms > 0.0)) {
+        return;
+    }
+    fn_l22_ewma(c.cpu_ms_row[b], c.n_cpu[b], wall_ms / rows);
+}
+
+void llama_fn_l22_cost_fix(llama_fn_l22_cost & c, double fix_ms, double big_ms) {
+    if (fix_ms >= 0.0) {
+        fn_l22_ewma(c.fix_ms, c.n_fix, fix_ms);
+    }
+    if (big_ms >= 0.0) {
+        fn_l22_ewma(c.big_ms, c.n_big, big_ms);
+    }
+}
+
+double llama_fn_l22_est_pass(const llama_fn_l22_cost & c, int b, uint32_t rows) {
+    b = fn_l22_bucket(b);
+    return std::max(c.pass_ms[b], (double) rows * c.gpu_ms_row[b]);
+}
+
+double llama_fn_l22_est_cpu(const llama_fn_l22_cost & c, int b, uint32_t rows) {
+    return (double) rows * c.cpu_ms_row[fn_l22_bucket(b)];
+}
+
+int32_t llama_fn_l22_xover(const llama_fn_l22_cost & c, int b, int32_t cur, int32_t lo, int32_t hi) {
+    if (b < 0 || b > 3 || lo <= 0 || hi < lo || c.n_obs[b] < 3 || c.n_cpu[b] < 3) {
+        return cur;
+    }
+    // f grows with the rows while the CPU path costs more per row than the stream
+    auto f = [&](int32_t r) {
+        return llama_fn_l22_est_cpu(c, b, (uint32_t) r) - llama_fn_l22_est_pass(c, b, (uint32_t) r) - c.fix_ms;
+    };
+    int32_t t;
+    if (f(lo) >= 0.0) {
+        t = lo;
+    } else if (f(hi) < 0.0) {
+        t = hi;
+    } else {
+        int32_t a = lo; // f(a) < 0 <= f(z)
+        int32_t z = hi;
+        while (z - a > 1) {
+            const int32_t m = a + (z - a)/2;
+            (f(m) >= 0.0 ? z : a) = m;
+        }
+        t = z;
+    }
+    if (cur > 0 && (int64_t) std::abs(t - cur)*10 <= (int64_t) cur) {
+        return cur; // hysteresis
+    }
+    return t;
+}
+
+uint32_t llama_fn_l22_ubplan(const llama_fn_l22_cost & c, int b, uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens,
+        int64_t after, int32_t xover, bool big_ok, double * est_base, double * est_big) {
+    if (est_base) {
+        *est_base = 0.0;
+    }
+    if (est_big) {
+        *est_big = 0.0;
+    }
+    if (base_ub == 0 || base_ub >= n_ubatch) {
+        return n_ubatch;
+    }
+    if (after < 0) {
+        return llama_fn_l21_full_width(base_ub, n_ubatch, n_tokens, after);
+    }
+    const int64_t r_all = (int64_t) n_tokens + after;
+    if (r_all <= (int64_t) base_ub || !big_ok) {
+        return base_ub;
+    }
+    auto est = [&](uint32_t w) {
+        double ms       = 0.0;
+        bool   streamed = false;
+        for (int64_t left = r_all; left > 0; ) {
+            const uint32_t rows = (uint32_t) std::min<int64_t>(left, w);
+            if (xover > 0 && rows < (uint32_t) xover) {
+                ms += llama_fn_l22_est_cpu(c, b, rows);
+            } else {
+                ms += llama_fn_l22_est_pass(c, b, rows);
+                streamed = true;
+            }
+            left -= rows;
+        }
+        return ms + (streamed ? c.fix_ms : 0.0) + (w > base_ub ? c.big_ms : 0.0);
+    };
+    const double e_base = est(base_ub);
+    const double e_big  = est(n_ubatch);
+    if (est_base) {
+        *est_base = e_base;
+    }
+    if (est_big) {
+        *est_big = e_big;
+    }
+    // today's rule (L21): the big ubatch only for a prompt wider than it; the other width only when clearly cheaper
+    if (r_all <= (int64_t) n_ubatch) {
+        return e_big < 0.97*e_base ? n_ubatch : base_ub;
+    }
+    return e_base < 0.97*e_big ? base_ub : n_ubatch;
+}
+
+bool llama_fn_l22_bigub2_ok(uint32_t n_seq_max, size_t full_big_1seq, size_t full_base_nseq) {
+    return n_seq_max >= 2 && full_big_1seq > 0 && full_big_1seq >= full_base_nseq;
+}
+
+uint32_t llama_fn_l22_prompt_seqs(const uint32_t * rows_per_seq, int n_seq, uint32_t small_t) {
+    uint32_t n = 0;
+    for (int s = 0; rows_per_seq && s < n_seq; ++s) {
+        n += rows_per_seq[s] > small_t ? 1 : 0;
+    }
+    return n;
+}
+
+bool llama_fn_l22_smallkeep_fits(size_t free_now, size_t expect_full, size_t pool, size_t margin) {
+    if (expect_full == 0) {
+        return false;
+    }
+    size_t need = expect_full;
+    for (size_t add : { pool, margin }) {
+        if (need > SIZE_MAX - add) {
+            return false;
+        }
+        need += add;
+    }
+    return free_now >= need;
 }
 
 // [TAG_FN_RAM_FIT] -------------------------------------------------------------------------------------------------

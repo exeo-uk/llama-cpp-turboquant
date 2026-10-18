@@ -25,6 +25,7 @@
 
 #include "llama.h"
 #include "llama-ext.h"
+#include "llama-fn-l22-p10.h" // [TAG_FN_L22_P10] llama_fn_l22_cost
 
 #include <cstddef>
 #include <cstdint>
@@ -176,6 +177,50 @@ LLAMA_API void     llama_fn_l22_io_merge(const std::vector<llama_fn_l22_io_range
 // the class
 LLAMA_API uint32_t llama_fn_l22_next_width(uint32_t base_ub, uint32_t n_ubatch, bool l21_bigub, bool l21_big_off, bool lendclass,
         int64_t after);
+
+// [TAG_FN_L22_P10] round 22, package P10 (stream tuning + G3); llama_fn_l22_cost is in llama-fn-l22-p10.h
+// [TAG_FN_L22_STAGERS] LLAMA_FN_L22_STAGERS: unset / "" / 0 / off -> 0 (pool untouched), "auto" / 1 -> -1 (the formula),
+// n >= 2 -> n (fixed)
+LLAMA_API int      llama_fn_l22_stagers_mode(const char * v);
+// copy threads of a pass whose host bytes are `host`, `staged` of them memcpy'd into the ring by the pool:
+// round(n_max x staged / host) in [n_min, n_max]; host 0 -> n_max
+LLAMA_API int      llama_fn_l22_stagers(uint64_t staged, uint64_t host, int n_max, int n_min);
+// [TAG_FN_L22_XOVER] the depth bucket of a prompt that starts at n_kv cells: < 16K, < 64K, < 160K, >= 160K
+LLAMA_API int      llama_fn_l22_depth_bucket(int64_t n_kv);
+// the priors (EST): pass 3400 ms (pinned 1700), 0.42 GPU ms per row, 4.55 CPU-path ms per row, fix 240 ms, 16K extra 300 ms
+LLAMA_API void     llama_fn_l22_cost_init(llama_fn_l22_cost & c, bool pinned);
+// the pins came or went: the copy cost of every bucket starts again from its prior (the row costs stay)
+LLAMA_API void     llama_fn_l22_cost_repin(llama_fn_l22_cost & c, bool pinned);
+// samples (EWMA alpha 0.25; from the 4th sample of a value on, a sample is clamped to [0.5x, 2x] of its estimate). A pass
+// bound by its copies (gate wait >= 10 % of the wall) gives its wall as the copy cost; a compute-bound pass only lowers a
+// larger copy estimate to its wall. Passes of >= 2048 rows give the GPU row cost (wall - wait) / rows
+LLAMA_API void     llama_fn_l22_cost_pass(llama_fn_l22_cost & c, int b, uint32_t rows, double wall_ms, double wait_ms);
+LLAMA_API void     llama_fn_l22_cost_cpu (llama_fn_l22_cost & c, int b, uint32_t rows, double wall_ms);
+// fix_ms < 0: no sample; big_ms < 0: no 16K period
+LLAMA_API void     llama_fn_l22_cost_fix (llama_fn_l22_cost & c, double fix_ms, double big_ms);
+// one stream pass of `rows`: max(copy cost, rows x GPU row cost); the CPU path: rows x CPU row cost
+LLAMA_API double   llama_fn_l22_est_pass(const llama_fn_l22_cost & c, int b, uint32_t rows);
+LLAMA_API double   llama_fn_l22_est_cpu (const llama_fn_l22_cost & c, int b, uint32_t rows);
+// the crossover: the fewest rows in [lo, hi] whose CPU-path cost reaches one stream pass + the fixed cost. cur until the
+// bucket has >= 3 stream passes and >= 3 CPU-path samples; cur when the new value is within 10 % of it
+LLAMA_API int32_t  llama_fn_l22_xover(const llama_fn_l22_cost & c, int b, int32_t cur, int32_t lo, int32_t hi);
+// [TAG_FN_L22_UBPLAN] the FULL width for a prompt of n_tokens + after rows (after < 0: unknown -> llama_fn_l21_full_width):
+// base_ub when the whole prompt fits it or !big_ok; else the cost of the ubatch split [w, w, .., rest] (rows below xover
+// on the CPU path, a 16K period adds its extra) for w = base_ub and n_ubatch, and the other width than today's rule only when
+// it is at least 3 % cheaper. est_base / est_big (may be null): the two costs (0 when not priced)
+LLAMA_API uint32_t llama_fn_l22_ubplan(const llama_fn_l22_cost & c, int b, uint32_t base_ub, uint32_t n_ubatch, uint32_t n_tokens,
+        int64_t after, int32_t xover, bool big_ok, double * est_base, double * est_big);
+// [TAG_FN_L22_BIGUB2] the 16K FULL reserve for one prompt sequence is used: two or more sequences and the 1-sequence 16K
+// device bytes are at least the n_seq_max-sequence base-width bytes (a 2-prompt batch then splits at the base width and
+// never grows the buffers)
+LLAMA_API bool     llama_fn_l22_bigub2_ok(uint32_t n_seq_max, size_t full_big_1seq, size_t full_base_nseq);
+// the sequences of a batch with more than small_t rows (prompt rows; decode / verify rows stay below)
+LLAMA_API uint32_t llama_fn_l22_prompt_seqs(const uint32_t * rows_per_seq, int n_seq, uint32_t small_t);
+// [TAG_FN_L22_SMALLKEEP] the kept SMALL reserve fits beside FULL: free_now >= expect_full + pool + margin (no overflow);
+// false for an unknown FULL size (0)
+LLAMA_API bool     llama_fn_l22_smallkeep_fits(size_t free_now, size_t expect_full, size_t pool, size_t margin);
+// [TAG_FN_L22_XOVER] the crossover the PHOT rule reads through llama_fn_l22_offload_min (llama-fn-l22.h); 0 clears it
+LLAMA_API void     llama_fn_l22_offload_min_set(int32_t v);
 
 //
 // model hooks (src/llama.cpp) and lookups
