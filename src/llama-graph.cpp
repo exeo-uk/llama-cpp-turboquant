@@ -2393,8 +2393,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!gate_up_exps && gate_exps && down_exps && loras->empty()) {
         pfs = llama_prefill_stream_lookup(sched, up_exps, n_tokens);
     }
+    // [TAG_FN_L22_CPUSHARE] R-P16-1: with the CPU share hook the stream gate is built after the routing (at the hook)
+    const bool cs_defer_gate = pfs && (fn_hooks & LLAMA_FN_L22_HOOK_CPUSHARE) && il >= 0;
     if (pfs) {
-        pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur));
+        if (!cs_defer_gate) {
+            pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur));
+        }
         up_exps   = pfs->up;
         gate_exps = pfs->gate;
         down_exps = pfs->down;
@@ -2577,15 +2581,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // [TAG_FN_L22_CPUSHARE] P16: a CPU share of this streamed layer (LLAMA_FN_L22_CPUSHARE). A plan may give a skip table
     // for the device MUL_MAT_IDs (src[3], as set_skip) and a host sum that is added to the output. Stub: none
-    ggml_tensor * cs_table = nullptr;
-    int32_t       cs_miss  = 0;
-    ggml_tensor * cs_host  = nullptr;
-    if (pfs && (fn_hooks & LLAMA_FN_L22_HOOK_CPUSHARE) && il >= 0) {
-        llama_fn_cpushare_io io = { cur, selected_experts, weights, up_exps_host, gate_exps_host, down_exps_host, pfs };
-        if (llama_fn_cpushare_plan(const_cast<llm_graph_context *>(this), ubatch, il, &io)) {
-            cs_table = io.dev_table;
-            cs_miss  = io.dev_miss;
-            cs_host  = io.host_out;
+    ggml_tensor * cs_table   = nullptr;
+    int32_t       cs_miss    = 0;
+    ggml_tensor * cs_host    = nullptr;
+    bool          cs_planned = false;
+    ggml_tensor * mm_ids     = selected_experts; // the ids the three expert MUL_MAT_IDs read
+    llama_fn_cpushare_io cs_io = { cur, selected_experts, weights, up_exps_host, gate_exps_host, down_exps_host, pfs,
+                                   up_exps, gate_exps, down_exps };
+    if (cs_defer_gate) {
+        if (llama_fn_cpushare_plan(const_cast<llm_graph_context *>(this), ubatch, il, &cs_io)) {
+            cs_planned = true;
+            cs_table   = cs_io.dev_table;
+            cs_miss    = cs_io.dev_miss;
+            cs_host    = cs_io.host_out;
+            mm_ids     = cs_io.ids     ? cs_io.ids     : mm_ids;
+            up_exps    = cs_io.up_mm   ? cs_io.up_mm   : up_exps;
+            gate_exps  = cs_io.gate_mm ? cs_io.gate_mm : gate_exps;
+            down_exps  = cs_io.down_mm ? cs_io.down_mm : down_exps;
+        }
+        if (!cs_io.gate_built) {
+            pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur)); // the deferred gate (R-P16-1)
         }
     }
 
@@ -2925,7 +2940,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, mm_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens] ([TAG_FN_L22_CPUSHARE] mm_ids)
         cb(up, "ffn_moe_up", il);
 
         set_skip(up);
@@ -2940,7 +2955,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, mm_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
 
             set_skip(cur);
@@ -3043,7 +3058,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -3130,6 +3145,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (cs_host) {
         moe_out = ggml_add(ctx0, moe_out, cs_host); // [TAG_FN_L22_CPUSHARE] the CPU share's weighted sum
         cb(moe_out, "ffn_moe_cpushare", il);
+    }
+    if (cs_planned) {
+        moe_out = llama_fn_cpushare_finish(const_cast<llm_graph_context *>(this), &cs_io, moe_out); // R-P16-1
     }
 
     cb(moe_out, "ffn_moe_out", il);

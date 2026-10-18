@@ -248,6 +248,15 @@ static void test_stubs() {
     TCHECK(!llama_fn_dmashare_wanted(nullptr, nullptr) && llama_fn_dmashare_view(nullptr, nullptr, 1) == nullptr &&
            !llama_fn_dmashare_plan(nullptr, nullptr), "dmashare stub");
     TCHECK(llama_fn_kvrows_attn(nullptr, nullptr) == nullptr, "kvrows stub");
+    TCHECK(llama_fn_cpushare_finish(nullptr, nullptr, nullptr) == nullptr, "cpushare finish stub");
+    llama_fn_dmashare_job_done(nullptr, 0, 0, 0, 0);
+    llama_fn_dmashare_graph_end(nullptr, 0, -1.0);
+    llama_fn_dmashare_free(nullptr);
+    llama_fn_pin_decode_mark(true);
+    llama_fn_pin_decode_mark(false);
+    llama_fn_pin_note_need(nullptr, LLAMA_FN_PIN_NEED_KV_GROW, 1);
+    llama_fn_pin_shutdown(nullptr);
+    TCHECK(llama_fn_l22_offload_min() == 0 && !llama_fn_pin_active_ext(), "offload_min / pin_active_ext stubs");
     TCHECK(llama_fn_route_prior(nullptr, nullptr, 0) == nullptr, "prior stub returns its input");
     TCHECK(llama_fn_cvec_project(nullptr, nullptr, nullptr, 0) == nullptr, "cvec stub returns its input");
     TCHECK(llama_model_media_token(nullptr) == LLAMA_TOKEN_NULL && llama_fn_imgpass_mask_mode(nullptr) == 1 &&

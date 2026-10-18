@@ -163,8 +163,11 @@ LLAMA_API ggml_tensor * llama_fn_cvec_project(ggml_context * ctx, const llama_mo
 LLAMA_API ggml_tensor * llama_fn_route_prior(llm_graph_context * g, ggml_tensor * probs, int il);
 
 //
-// CPU share of streamed prompt ubatches (P16, src/llama-fn-cpushare.cpp; stub false). build_moe_ffn calls it for a layer
-// whose host experts come from the prefill stream, only when LLAMA_FN_L22_CPUSHARE is set
+// CPU share of streamed prompt ubatches (P16, src/llama-fn-cpushare.cpp; stub false). With LLAMA_FN_L22_HOOK_CPUSHARE
+// (R-P16-1) build_moe_ffn defers a streamed layer's stream gate to after the routing and calls the plan there (after the
+// routing trace); the plan may build the gate itself (gate_built), else build_moe_ffn builds it right after the call. A
+// plan that returns true may replace the ids and the bank aliases of the three expert MUL_MAT_IDs, give a src[3] skip
+// table and a host sum added to the output, and gets llama_fn_cpushare_finish(moe_out) before "ffn_moe_out"
 //
 
 struct llama_fn_cpushare_io {
@@ -176,14 +179,25 @@ struct llama_fn_cpushare_io {
     ggml_tensor * gate_host;
     ggml_tensor * down_host;
     const void  * pfs;              // const llama_pfs_view * of the layer (llama-moe-gen5.h)
-    // out (read only when the plan returns true)
-    ggml_tensor * dev_table = nullptr; // or null: i32 [n_expert] skip table of the device MUL_MAT_IDs (src[3])
-    int32_t       dev_miss  = 0;       // the value of a computed (not skipped) expert in dev_table
-    ggml_tensor * host_out  = nullptr; // or null: f32 [n_embd, n_tokens], the CPU share's weighted sum, added to the output
+    ggml_tensor * up_dev;           // the stream bank aliases the expert MUL_MAT_IDs read
+    ggml_tensor * gate_dev;
+    ggml_tensor * down_dev;
+    // out
+    bool          gate_built = false;   // the plan built the layer's stream gate (also when it returns false)
+    ggml_tensor * ids       = nullptr;  // or null: the ids the three expert MUL_MAT_IDs read instead of selected_experts
+    ggml_tensor * up_mm     = nullptr;  // or null: replacements of up_dev / gate_dev / down_dev in those MUL_MAT_IDs
+    ggml_tensor * gate_mm   = nullptr;
+    ggml_tensor * down_mm   = nullptr;
+    ggml_tensor * dev_table = nullptr;  // or null: i32 [n_expert] skip table of the expert MUL_MAT_IDs (src[3])
+    int32_t       dev_miss  = 0;        // the value of a computed (not skipped) expert in dev_table
+    ggml_tensor * host_out  = nullptr;  // or null: f32 [n_embd, n_tokens], the CPU share weighted sum, added to the output
+    void *        user      = nullptr;  // the plan state for llama_fn_cpushare_finish
 };
 
 // plan: llama_fn_cpushare_io *
-LLAMA_API bool llama_fn_cpushare_plan(llm_graph_context * g, const llama_ubatch & ubatch, int il, void * plan);
+LLAMA_API bool          llama_fn_cpushare_plan(llm_graph_context * g, const llama_ubatch & ubatch, int il, void * plan);
+// after a plan that returned true: the layer output before "ffn_moe_out" (stub: moe_out)
+LLAMA_API ggml_tensor * llama_fn_cpushare_finish(llm_graph_context * g, void * plan, ggml_tensor * moe_out);
 
 //
 // per-sequence K/V rows of a unified turbot cache (P13, src/llama-fn-kvrows.cpp; stub nullptr). build_attn_mha calls it

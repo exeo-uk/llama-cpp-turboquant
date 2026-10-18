@@ -7,3 +7,8 @@ bool llama_fn_cpushare_plan(llm_graph_context * g, const llama_ubatch & ubatch, 
     (void) g; (void) ubatch; (void) il; (void) plan;
     return false;
 }
+
+ggml_tensor * llama_fn_cpushare_finish(llm_graph_context * g, void * plan, ggml_tensor * moe_out) {
+    (void) g; (void) plan;
+    return moe_out;
+}
