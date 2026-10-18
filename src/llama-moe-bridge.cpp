@@ -1,5 +1,6 @@
 #include "llama-moe-bridge.h"
 #include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
+#include "llama-fn-prior.h" // [TAG_FN_L22_X_PRIOR]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -294,6 +295,7 @@ struct llama_moe_bridge {
         uint32_t             xd_seq = 0;
         int32_t              xd_n_light = -1;
         uint32_t             xd_seen = 0;       // owner: the last seq whose defer wait was counted
+        std::vector<uint8_t> pr_seen;           // [TAG_FN_L22_X_PRIOR] [n_expert] scratch of a prior job's counts
     };
     std::vector<chan> chans;
     std::unordered_map<const ggml_tensor *, int> by_up;
@@ -384,6 +386,16 @@ struct llama_moe_bridge {
     std::atomic<uint64_t> xd_ns{0};     // executor: host time of the light parts
     std::atomic<uint64_t> xd_ns_max{0};
     uint64_t xd_waits = 0, xd_wait_ns = 0, xd_ready = 0; // owner: device defer waits counted
+    // [TAG_FN_L22_X_PRIOR] (qwen4exp, opt-in, changes answers) P12: the route prior's table exists (llama-fn-prior.cpp) and the
+    // channels carry the unbiased top-k for the observer (raw). Counters of the jobs flagged GGML_MOE_BRIDGE_JOB_PRIOR, under
+    // graph_mtx (job thread), one line per 4096 jobs and at the end
+    bool prior_on  = false;
+    bool prior_raw = false;
+    struct prstats {
+        uint64_t jobs = 0, raw = 0, noraw = 0;
+        uint64_t cold_used = 0;                        // all prior jobs: distinct cold experts of the picked ids
+        uint64_t cold_used_r = 0, cold_raw = 0, chg = 0; // jobs with raw ids: picked / unbiased cold experts, changed picks
+    } pr;
 };
 
 // [TAG_FN_L3_MTP_COST2] add one job's cold prefix counts to the running graph's: for t = 0..T-1 the distinct experts of
@@ -501,6 +513,63 @@ static void br_xstats_job(llama_moe_bridge * br, llama_moe_bridge::chan & c, con
     }
 }
 
+// [TAG_FN_L22_X_PRIOR] the prior counters as one line, then zero (job thread under graph_mtx, or the owner at the end)
+static void br_prior_flush(llama_moe_bridge * br, const char * why) {
+    auto & s = br->pr;
+    if (s.jobs == 0) {
+        return;
+    }
+    const double nr = s.raw > 0 ? (double) s.raw : 1.0;
+    LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_PRIOR] %s: %" PRIu64 " prior jobs, %.2f cold experts picked each; %" PRIu64
+            " jobs (%.1f%%) carried the unbiased ids: cold experts picked %.2f vs unbiased %.2f, picks changed %.2f per job; %"
+            PRIu64 " not observed (no unbiased ids)\n", __func__, br->bid, why, s.jobs, (double) s.cold_used/(double) s.jobs,
+            s.raw, 100.0*s.raw/(double) s.jobs, s.cold_used_r/nr, s.cold_raw/nr, s.chg/nr, s.noraw);
+    s = llama_moe_bridge::prstats();
+}
+
+// [TAG_FN_L22_X_PRIOR] a job whose ids the route prior / resident swap picked (caller holds graph_mtx): its counts against the
+// job's hot table (layer->table, as the CPU skips), and the ids the routing observer gets: the unbiased top-k in raw mode
+// (nullptr when the job has none: not observed, so the prior never feeds its own picks back into the hot set), the picked
+// ids in used mode
+static const int32_t * br_prior_job(llama_moe_bridge * br, llama_moe_bridge::chan & c, const ggml_cpu_moe_layer * layer,
+        const ggml_moe_bridge_job * j) {
+    const int32_t * raw = (j->flags & GGML_MOE_BRIDGE_JOB_RAW) ? j->raw_ids : nullptr;
+    const int64_t n_exp = c.up->ne[2];
+    if (c.pr_seen.size() != (size_t) n_exp) {
+        c.pr_seen.assign((size_t) n_exp, 0);
+    }
+    uint32_t cu = 0;
+    uint32_t cr = 0;
+    uint32_t ch = 0;
+    llama_fn_prior_job_counts(j->ids, raw, j->n_tokens, j->n_used, layer->table, layer->table_miss, (int) n_exp,
+            c.pr_seen.data(), &cu, &cr, &ch);
+    auto & s = br->pr;
+    s.jobs++;
+    s.cold_used += cu;
+    if (raw) {
+        s.raw++;
+        s.cold_used_r += cu;
+        s.cold_raw    += cr;
+        s.chg         += ch;
+    }
+    const int32_t * obs = j->ids;
+    if (br->prior_raw) {
+        obs = raw;
+        if (obs == nullptr) {
+            s.noraw++;
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true)) {
+                LLAMA_LOG_WARN("%s: MoE bridge %d: [TAG_FN_L22_X_PRIOR] prior jobs without the unbiased ids (the top-k ran unfused "
+                        "or without the fused post): the hot-set observer skips them\n", __func__, br->bid);
+            }
+        }
+    }
+    if (s.jobs >= 4096) {
+        br_prior_flush(br, "4096 prior jobs");
+    }
+    return obs;
+}
+
 // the job on the CPU MoE pool: runs on the executor thread (spin) or the driver's callback thread (hostfunc)
 static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
     auto * br = (llama_moe_bridge *) ud;
@@ -547,7 +616,11 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         }
         void * obs_ud = nullptr;
         ggml_moe_obs_cb_t obs = ggml_get_moe_obs_callback(&obs_ud);
-        if (obs) {
+        const int32_t * obs_ids = j->ids;
+        if (j->flags & GGML_MOE_BRIDGE_JOB_PRIOR) {
+            obs_ids = br_prior_job(br, c, layer, j); // [TAG_FN_L22_X_PRIOR]
+        }
+        if (obs && obs_ids) {
             ggml_tensor t;
             memset(&t, 0, sizeof(t));
             t.type  = GGML_TYPE_I32;
@@ -559,7 +632,7 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
             t.nb[1] = sizeof(int32_t)*j->n_used;
             t.nb[2] = t.nb[1]*j->n_tokens;
             t.nb[3] = t.nb[2];
-            t.data  = (void *) j->ids;
+            t.data  = (void *) obs_ids;
             obs(c.gate_name.c_str(), &t, obs_ud);
         }
 
@@ -1005,6 +1078,11 @@ static void br_destroy(llama_moe_bridge * br) {
         br->pool_free(br->pool);
         br->pool = nullptr;
     }
+    if (br->prior_on) { // [TAG_FN_L22_X_PRIOR] no job and no graph of this bridge runs any more
+        br_prior_flush(br, "end");
+        llama_fn_prior_free();
+        br->prior_on = false;
+    }
     delete br;
     g_bridge_owned.store(false);
 }
@@ -1420,6 +1498,18 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         }
     }
     bp.hint_k = br->hint_k;
+    // [TAG_FN_L22_X_PRIOR] P12 (qwen4exp, opt-in): the prior's table on the router's device (before ready) and, with
+    // LLAMA_FN_L22_X_PRIOR_STATS=raw, a raw-id area per channel for the unbiased top-k. Unset: nothing allocated, same layout
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        std::vector<std::pair<int, const ggml_tensor *>> pl;
+        pl.reserve(br->chans.size());
+        for (const auto & c : br->chans) {
+            pl.emplace_back(c.il, c.up);
+        }
+        br->prior_on  = llama_fn_prior_init(model, dev, pl);
+        br->prior_raw = br->prior_on && llama_fn_prior_raw_wanted();
+    }
+    bp.raw_ids = br->prior_raw ? 1 : 0;
     br->gb = br->fn_new(&bp);
     if (br->gb == nullptr) {
         return give_up("the device could not create the bridge");

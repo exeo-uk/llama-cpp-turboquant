@@ -46,6 +46,9 @@ enum ggml_moe_bridge_error {
 #define GGML_MOE_BRIDGE_JOB_NOPF  32 // [TAG_FN_L22_TBO] R-D5-5: no next-layer prefetch after this job (two-chain decode)
 #define GGML_MOE_BRIDGE_JOB_LIGHT 64 // [TAG_FN_L22_X_DEFER] pool job / sync op only (never on a post): the light part of a
                                     // deferred job (DEFER = the rest). Both set is invalid
+#define GGML_MOE_BRIDGE_JOB_PRIOR 128 // [TAG_FN_L22_X_PRIOR] the ids were picked with the route prior / resident swap (P12,
+                                      // opt-in, changes answers): the hot-set observer may want job->raw_ids instead
+#define GGML_MOE_BRIDGE_JOB_RAW   256 // [TAG_FN_L22_X_PRIOR] job->raw_ids holds the unbiased top-k of the same rows
 
 // [TAG_FN_R4_BRIDGE_DMA] the largest PCIe share of one job, in experts
 #define GGML_MOE_BRIDGE_MAX_FETCH 32
@@ -79,6 +82,7 @@ struct ggml_moe_bridge_params {
     int     max_fetch;   // [TAG_FN_R4_BRIDGE_DMA] experts per job a fetch may copy (0: no fetch, <= GGML_MOE_BRIDGE_MAX_FETCH)
     int     hint_k;      // [TAG_FN_L3_CPU_DEVPRED] predicted experts per token a hint may carry (0: no hints,
                          // <= GGML_MOE_BRIDGE_MAX_HINT_K)
+    int     raw_ids;     // [TAG_FN_L22_X_PRIOR] 1: every channel has a raw-id area of n_used x max_tokens int32 (0: none)
 };
 
 // one posted job; the pointers stay valid until it is completed
@@ -94,6 +98,7 @@ struct ggml_moe_bridge_job {
     const float   * w;       // [n_used, n_tokens]
     float         * out;     // [n_embd, n_tokens], written by the host
     struct ggml_moe_bridge_plan * plan; // [TAG_FN_R4_BRIDGE_DMA] the job's plan area (mapped), NULL without a fetch
+    const int32_t * raw_ids; // [TAG_FN_L22_X_PRIOR] [n_used, n_tokens] the unbiased top-k (mapped), NULL unless JOB_RAW
 };
 
 // [TAG_FN_R4_BRIDGE_DMA] what the device measured for the last job of a channel (mapped memory, written by the device)
