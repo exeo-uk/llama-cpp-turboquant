@@ -82,6 +82,9 @@ struct ggml_fn_moe_args {
     float           tail_w;
     float           defer_w;
     uint32_t        l22_flags;
+    int             stagger;            // [TAG_FN_L22_POOL_STAGGER] split >= 1, or 0: thread ith walks its experts from act
+                                        // position (ith % stagger)*n_act/stagger on (a thief walks a victim's list in the
+                                        // victim's order). Piece order only: the same values.
 };
 
 // [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: the "where am I" words of each thread of a pool job
@@ -148,6 +151,11 @@ int64_t ggml_fn_moe_dflow_words(const struct ggml_tensor * up, int n_used, int n
 void   ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, void (*barrier)(void *), void * barrier_ctx);
 // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM on the CPU: types, shapes and the fused kernel (ggml-cpu.c)
 bool   ggml_cpu_moe_host_sum_supported(const struct ggml_tensor * op);
+// [TAG_FN_L22_X_TAILSKIP] the tail rule (rank, weight) of a sync op that carries GGML_MOE_BRIDGE_JOB_TAIL: the bridge's pool
+// sets it at its creation (ggml_cpu_moe_pool_params tail_rank / tail_w; one bridge per process), so a retried ubatch drops
+// exactly what the bridged job dropped. Zero: no rule.
+void   ggml_fn_moe_tail_set(int rank, float w);
+void   ggml_fn_moe_tail_get(int * rank, float * w);
 // [TAG_FN_R2_BRIDGE_PF] prefetch the pieces thread ith of nth reads in a job of the experts list[0..n) (ascending);
 // stops before the next piece once *stop != 0; returns the bytes covered. mode 0: real loads, 1: software prefetches
 size_t ggml_fn_moe_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
@@ -162,6 +170,9 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
 // 4 KiB), and whole-line vector loads
 #define GGML_FN_PF_FINE_STOP 1
 #define GGML_FN_PF_VEC       2
+// [TAG_FN_L22_POOL_STAGGER] bits 8..15 of the flags: the job's stagger G (0 off); thread ith pulls the list from position
+// (ith % G)*n/G on, as it computes the job
+#define GGML_FN_PF_STAGGER_SHIFT 8
 
 
 #if defined(_MSC_VER)

@@ -16,6 +16,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "ggml-turbot.h" // [TAG_TURBOT]
+#include "ggml-moe-bridge.h" // [TAG_FN_L22_X_TAILSKIP] GGML_MOE_BRIDGE_JOB_TAIL
 #include "common.h"
 #include "tiled/tiled.h"
 
@@ -2114,6 +2115,7 @@ static size_t ggml_fn_moe_thread_bytes(const struct ggml_tensor * up, const stru
     b += GGML_PAD(sizeof(int32_t)*(size_t) n_used*n_tokens, 64); // entries (slot + n_used*t), grouped by expert
     b += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*n_tokens, 64); // active experts: expert, first entry, entries
     b += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*n_tokens, 64); // [TAG_FN_L3_CPU_SPLIT] the same in prio order
+    b += GGML_PAD((size_t) up->ne[2], 64);                          // [TAG_FN_L22_X_TAILSKIP] per expert: tail-skip mark
     return b;
 }
 
@@ -2215,7 +2217,15 @@ struct ggml_fn_moe_ctx {
     int32_t *         df_dn;     // [TAG_FN_L4_MEM_POOLBAR] or NULL: per block of GGML_FN_MOE_PD down rows, its pieces done
     int64_t           np3;       // gate / up pieces per expert
     volatile int64_t * wh;       // [TAG_FN_L22_POOLDIAG] or NULL: this thread's words
+    int               stag;      // [TAG_FN_L22_POOL_STAGGER] G of a split >= 1 job, else 0
+    int               rot;       // [TAG_FN_L22_POOL_STAGGER] this thread's first act position (0: none)
+    const uint8_t *   tsk;       // [TAG_FN_L22_X_TAILSKIP] or NULL: [n_expert], 1 = the tail rule drops the expert
 };
+
+// [TAG_FN_L22_POOL_STAGGER] the first act position of thread t's walk
+static inline int ggml_fn_moe_rot(const struct ggml_fn_moe_ctx * c, int t) {
+    return c->stag > 0 && c->n_act > 1 ? (int) (((int64_t) (t % c->stag)*c->n_act)/c->stag) : 0;
+}
 
 // [TAG_FN_L22_POOLDIAG]
 #define GGML_FN_MOE_WH(wh, i, v) do { if (wh) { (wh)[(i)] = (int64_t) (v); } } while (0)
@@ -2338,7 +2348,7 @@ static void ggml_fn_moe_wsum(const struct ggml_fn_moe_ctx * c, int64_t r_begin, 
             float sum = 0.0f;
             for (int slot = 0; slot < n_used; ++slot) {
                 const int32_t e = *(const int32_t *) (a->ids + (size_t) slot*a->ids_nb0 + (size_t) t*a->ids_nb1);
-                if (a->table != NULL && a->table[e] != a->table_miss) {
+                if ((a->table != NULL && a->table[e] != a->table_miss) || (c->tsk != NULL && c->tsk[e])) {
                     continue;
                 }
                 sum += a->w[slot + (size_t) n_used*t]*dscr[((size_t) t*n_used + slot)*n_embd + r];
@@ -2412,15 +2422,18 @@ static void ggml_fn_moe_piece_pf(const struct ggml_fn_moe_ctx * c, int phase, in
 }
 
 // [TAG_FN_L3_CPU_SPLIT] the own piece of thread ith after (kk, pp) in its order (experts in act order, pieces ascending);
-// kk = -1 starts at the first. false at the end
-static bool ggml_fn_moe_next_own(const struct ggml_fn_moe_ctx * c, int64_t np_e, int ith, int nth, int * kk, int64_t * pp) {
+// kk = -1 starts at the first. false at the end. [TAG_FN_L22_POOL_STAGGER] the experts in the order (rot + j) mod n_act,
+// j = 0 .. n_act - 1; *kj is the position j of *kk (equal without a rotation)
+static bool ggml_fn_moe_next_own(const struct ggml_fn_moe_ctx * c, int64_t np_e, int ith, int nth, int * kj, int * kk, int64_t * pp) {
     if (*kk >= 0 && *pp + nth < np_e) {
         *pp += nth;
         return true;
     }
-    for (int k = *kk + 1; k < c->n_act; ++k) {
+    for (int j = *kj + 1; j < c->n_act; ++j) {
+        const int k = c->rot > 0 ? (c->rot + j) % c->n_act : j;
         const int64_t p0 = (ith - ggml_fn_moe_owner0(c->act[3*k], nth) + nth) % nth;
         if (p0 < np_e) {
+            *kj = j;
             *kk = k;
             *pp = p0;
             return true;
@@ -2454,13 +2467,15 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
     int32_t * claim = a->split >= 2 && a->claim ? a->claim + (size_t) phase*nth*c->claim_run : NULL;
     const uint8_t * pfd = a->pf_done ? a->pf_done + (size_t) ith*c->wu->ne[2] : NULL;
     int64_t j  = 0;
+    int     kj = -1; // [TAG_FN_L22_POOL_STAGGER] walk position of kk
     int     kk = -1;
     int64_t pp = 0;
-    bool    more = ggml_fn_moe_next_own(c, np_e, ith, nth, &kk, &pp);
+    bool    more = ggml_fn_moe_next_own(c, np_e, ith, nth, &kj, &kk, &pp);
     while (more) {
+        int     jn = kj;
         int     kn = kk;
         int64_t pn = pp;
-        const bool has_next = ggml_fn_moe_next_own(c, np_e, ith, nth, &kn, &pn);
+        const bool has_next = ggml_fn_moe_next_own(c, np_e, ith, nth, &jn, &kn, &pn);
         if (claim == NULL || ggml_fn_moe_claim(claim + (size_t) ith*c->claim_run + j, a->epoch)) { // else another thread took it
             if (a->swpf > 0 && has_next) { // [TAG_FN_L3_CPU_SWPF]
                 ggml_fn_moe_piece_pf(c, phase, kn, pn, a->swpf);
@@ -2473,6 +2488,7 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
             }
         }
         j++;
+        kj   = jn;
         kk   = kn;
         pp   = pn;
         more = has_next;
@@ -2484,9 +2500,11 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
 
     // then the free pieces of the other threads, from the end of their lists (their owners work from the front, where
     // their prefetched pieces are); every owner walks its whole list, so each piece is computed exactly once, and a
-    // thief leaves a list at its first claimed piece: the owner (or a thief before it) is there and takes the rest
+    // thief leaves a list at its first claimed piece: the owner (or a thief before it) is there and takes the rest.
+    // [TAG_FN_L22_POOL_STAGGER] a victim's list is in its own rotated order, so jj stays the position in its walk
     for (int dv = 1; dv < nth; ++dv) {
         const int v = (ith + dv) % nth;
+        const int rot_v = ggml_fn_moe_rot(c, v);
         int64_t n_v = 0;
         for (int kv = 0; kv < n_act; ++kv) {
             const int64_t p0 = (v - ggml_fn_moe_owner0(c->act[3*kv], nth) + nth) % nth;
@@ -2495,7 +2513,8 @@ static void ggml_fn_moe_phase(const struct ggml_fn_moe_ctx * c, int phase, int i
         int32_t * cv = claim + (size_t) v*c->claim_run;
         int64_t jj = n_v;
         bool met = false;
-        for (int kv = n_act - 1; kv >= 0 && jj > 0 && !met; --kv) {
+        for (int jv = n_act - 1; jv >= 0 && jj > 0 && !met; --jv) {
+            const int kv = rot_v > 0 ? (rot_v + jv) % n_act : jv;
             const int64_t p0 = (v - ggml_fn_moe_owner0(c->act[3*kv], nth) + nth) % nth;
             if (p0 >= np_e) {
                 continue;
@@ -2572,6 +2591,8 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     int32_t * act = (int32_t *) my;
     my += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*T, 64);
     int32_t * act2 = (int32_t *) my; // [TAG_FN_L3_CPU_SPLIT] act in the order of a->prio
+    my += GGML_PAD(sizeof(int32_t)*3*(size_t) n_used*T, 64);
+    uint8_t * tsk_buf = (uint8_t *) my; // [TAG_FN_L22_X_TAILSKIP] [n_exp]
 
     // down rows go to the graph layout in out, or to the scratch for the weighted sum
     char * orow = a->w ? (char *) dscr : a->out;
@@ -2579,7 +2600,47 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     const size_t o_nb2 = a->w ? (size_t) n_embd*n_used*sizeof(float) : a->out_nb2;
 
 #define GGML_FN_MOE_ID(slot, t) (*(const int32_t *) (a->ids + (size_t) (slot)*a->ids_nb0 + (size_t) (t)*a->ids_nb1))
-#define GGML_FN_MOE_SKIP(e)     (a->table != NULL && a->table[e] != a->table_miss)
+#define GGML_FN_MOE_TSKIP(e)    (a->table != NULL && a->table[e] != a->table_miss)
+#define GGML_FN_MOE_SKIP(e)     (GGML_FN_MOE_TSKIP(e) || (tsk != NULL && tsk[e]))
+
+    // [TAG_FN_L22_X_TAILSKIP] (opt-in, changes answers) a cold expert (one the table leaves to this job) whose smallest rank
+    // (slot) over the window's tokens is >= tail_rank, or whose largest weight is < tail_w, contributes nothing: no piece,
+    // no term in the sum, no renormalization (Strata's measured rule). Every thread derives the same marks from the same
+    // routing, so any thread count gives the same values. bit 2: seen, bit 0: a rank below the bound, bit 1: a weight at
+    // or above it; then 1 = dropped, 0 = kept
+    const int   tail_r = a->tail_rank > 0 ? (int) a->tail_rank : 0;
+    const float tail_w = a->w != NULL && a->tail_w > 0.0f ? a->tail_w : 0.0f;
+    uint8_t * tsk = NULL;
+    if (tail_r > 0 || tail_w > 0.0f) {
+        tsk = tsk_buf;
+        memset(tsk, 0, (size_t) n_exp);
+        for (int t = 0; t < T; ++t) {
+            for (int slot = 0; slot < n_used; ++slot) {
+                const int32_t e = GGML_FN_MOE_ID(slot, t);
+                GGML_ASSERT(e >= 0 && e < n_exp);
+                if (GGML_FN_MOE_TSKIP(e)) {
+                    continue;
+                }
+                uint8_t f = 4;
+                if (tail_r > 0 && slot < tail_r) {
+                    f |= 1;
+                }
+                if (tail_w > 0.0f && a->w[slot + (size_t) n_used*t] >= tail_w) {
+                    f |= 2;
+                }
+                tsk[e] |= f;
+            }
+        }
+        for (int t = 0; t < T; ++t) {
+            for (int slot = 0; slot < n_used; ++slot) {
+                const int32_t e = GGML_FN_MOE_ID(slot, t);
+                const uint8_t f = tsk[e];
+                if (f & 4) {
+                    tsk[e] = ((tail_r > 0 && !(f & 1)) || (tail_w > 0.0f && !(f & 2))) ? 1 : 0;
+                }
+            }
+        }
+    }
 
     // 1. the input rows in the dot types of up and gate: every thread makes its own copy, so no barrier
     for (int t = 0; t < T; ++t) {
@@ -2692,6 +2753,9 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     c.df_dn  = dfl && a->w ? a->dflow + (size_t) n_used*T*GGML_FN_MOE_DFLOW_STRIDE : NULL;
     c.np3    = (n_ff + c.pr - 1)/c.pr;
     c.wh     = wh;
+    c.stag   = a->split >= 1 && a->stagger > 0 ? MIN(a->stagger, 64) : 0; // [TAG_FN_L22_POOL_STAGGER]
+    c.rot    = ggml_fn_moe_rot(&c, ith);
+    c.tsk    = tsk; // [TAG_FN_L22_X_TAILSKIP]
     GGML_ASSERT(c.pr <= 256);
     if (wh) { // [TAG_FN_L22_POOLDIAG]
         int64_t asum = 0;
@@ -2727,7 +2791,7 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
         ts[GGML_FN_MOE_TS_B1] = ts[GGML_FN_MOE_TS_P3] + acc[3]; // the waits for experts count as the barrier's wait
     }
     // graph layout: the rows of the slots computed elsewhere are zero, as the unfused op leaves them
-    if (a->table && !a->w) {
+    if ((a->table || tsk) && !a->w) {
         for (int i = ith; i < n_used*T; i += nth) {
             const int slot = i % n_used;
             const int t    = i/n_used;
@@ -2782,6 +2846,7 @@ void ggml_fn_moe_compute(const struct ggml_fn_moe_args * a, int ith, int nth, vo
     GGML_FN_MOE_WH(wh, GGML_FN_MOE_WH_STAGE, 9); // [TAG_FN_L22_POOLDIAG] done
 
 #undef GGML_FN_MOE_ID
+#undef GGML_FN_MOE_TSKIP
 #undef GGML_FN_MOE_SKIP
 }
 
@@ -2985,6 +3050,9 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
     const int64_t np3    = (n_ff + pr - 1)/pr;
     const int64_t pd     = GGML_FN_MOE_PD;
     const int64_t np4    = (n_embd + pd - 1)/pd;
+    // [TAG_FN_L22_POOL_STAGGER] thread ith pulls the list from position (ith % G)*n/G on, as its job walk starts there
+    const int     stag   = (flags >> GGML_FN_PF_STAGGER_SHIFT) & 0xff;
+    const int     rot    = stag > 0 && n > 1 ? (int) (((int64_t) (ith % stag)*n)/stag) : 0;
     size_t bytes = 0;
     if (streams > 1 && mode == 0) {
         struct ggml_fn_pf_group g;
@@ -2992,8 +3060,8 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
         g.ns = MIN(streams, GGML_FN_PF_MAX_STREAMS);
         g.stop_mask = (flags & GGML_FN_PF_FINE_STOP) ? 1023 : 4095; // [TAG_FN_L6_PF]
         g.vec       = (flags & GGML_FN_PF_VEC) != 0;
-        for (int i = 0; i < n; ++i) {
-            const int32_t e = list[i];
+        for (int i0 = 0; i0 < n; ++i0) {
+            const int32_t e = list[rot > 0 ? (rot + i0) % n : i0];
             if (e < 0 || e >= n_exp) {
                 continue;
             }
@@ -3022,8 +3090,8 @@ size_t ggml_fn_moe_prefetch_stable(const struct ggml_tensor * up, const struct g
         }
         return bytes;
     }
-    for (int i = 0; i < n; ++i) {
-        const int32_t e = list[i];
+    for (int i0 = 0; i0 < n; ++i0) {
+        const int32_t e = list[rot > 0 ? (rot + i0) % n : i0];
         if (e < 0 || e >= n_exp) {
             continue;
         }
@@ -3242,6 +3310,27 @@ static void ggml_compute_forward_moe_fused(const struct ggml_compute_params * pa
     ggml_fn_moe_compute(&a, params->ith, params->nth, ggml_fn_moe_barrier_tp, params->threadpool);
 }
 
+// [TAG_FN_L22_X_TAILSKIP] the sync op's tail rule (ggml-cpu-impl.h): set once by the bridge's pool, read by every sync op
+static atomic_int ggml_fn_moe_tail_r_g = 0;
+static atomic_int ggml_fn_moe_tail_w_g = 0; // the bits of a float
+
+void ggml_fn_moe_tail_set(int rank, float w) {
+    int32_t wb = 0;
+    if (w > 0.0f) {
+        memcpy(&wb, &w, sizeof(wb));
+    }
+    atomic_store_explicit(&ggml_fn_moe_tail_r_g, rank > 0 ? rank : 0, memory_order_release);
+    atomic_store_explicit(&ggml_fn_moe_tail_w_g, wb, memory_order_release);
+}
+
+void ggml_fn_moe_tail_get(int * rank, float * w) {
+    const int32_t wb = atomic_load_explicit(&ggml_fn_moe_tail_w_g, memory_order_acquire);
+    float wf = 0.0f;
+    memcpy(&wf, &wb, sizeof(wf));
+    *rank = atomic_load_explicit(&ggml_fn_moe_tail_r_g, memory_order_acquire);
+    *w    = wf;
+}
+
 // [TAG_FN_R2_BRIDGE_SYNC] GGML_OP_MOE_HOST_SUM: the host job of a bridged MoE layer (the CPU MoE pool's weighted mode,
 // ggml_cpu_moe_run with w) on the graph's threads. ggml_fn_moe_compute gives the same values for any thread count (rows
 // and pieces each have one owner, the weighted sum runs per row in slot order), so this equals the bridge's answer.
@@ -3285,6 +3374,16 @@ static void ggml_compute_forward_moe_host_sum(const struct ggml_compute_params *
     a.w        = (const float *) w->data;
     a.out_sum  = (float *) dst->data;
     a.wdata    = params->wdata;
+    // [TAG_FN_L22_X_TAILSKIP] a retried ubatch of a flagged graph drops what the bridged job dropped: the same rule (the
+    // bridge's pool set it at its creation), the same marks in ggml_fn_moe_compute
+    if (ggml_moe_host_sum_get_flags(dst) & GGML_MOE_BRIDGE_JOB_TAIL) {
+        int   tr = 0;
+        float tw = 0.0f;
+        ggml_fn_moe_tail_get(&tr, &tw);
+        a.tail_rank = (int8_t) MIN(tr, 127);
+        a.tail_w    = tw;
+        a.l22_flags = GGML_MOE_BRIDGE_JOB_TAIL;
+    }
 
     GGML_ASSERT(a.n_tokens >= 1 && a.n_tokens <= GGML_FN_MOE_MAX_T);
     GGML_ASSERT(params->wsize >= ggml_fn_moe_work_size(a.up, a.gate, a.down, a.n_used, a.n_tokens, params->nth));
@@ -4569,8 +4668,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_SET_ROWS:
                     {
+                        // [TAG_FN_L22_SETROWS] upstream #30454: every graph thread runs the node (n_tasks is 1), and each
+                        // one converts its rows into its own (ne00 + CACHE_LINE_SIZE_F32) floats (ops.cpp set_rows_impl)
                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                            cur = ggml_type_size(GGML_TYPE_F32) * (node->src[0]->ne[0] + CACHE_LINE_SIZE_F32) * n_threads;
                         }
                     } break;
                 case GGML_OP_SOFT_MAX:
