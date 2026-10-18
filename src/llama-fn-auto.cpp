@@ -335,7 +335,7 @@ const fn_item k_items[] = {
     { "LLAMA_KV_ROWS",                      "0",       P_ALL }, // P13 [TAG_UPSTREAM_29510] not for qwen4exp (the 27B launcher sets it)
     { "LLAMA_FN_L22_QSA_SEQPOOLS",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SEQPOOLS] D12
     { "LLAMA_FN_L22_QSA_SHAREPFX",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SHAREPFX] R-P13-4 (exact)
-    { "LLAMA_FN_L22_TBO",                   "1",       P_ALL }, // D5 [TAG_FN_L22_TBO] R-D5-1 two-chain decode (kld; 2 active sequences only)
+    { "LLAMA_FN_L22_TBO",                   "0",       P_ALL }, // D5 [TAG_FN_L22_TBO] two-chain decode (kld; 2 active sequences only), R-D5-6: opt-in (owner 10-18)
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner

@@ -273,7 +273,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_KV_ROWS", "0", false },
     { "LLAMA_FN_L22_QSA_SEQPOOLS", "1", false },
     { "LLAMA_FN_L22_QSA_SHAREPFX", "1", false },
-    { "LLAMA_FN_L22_TBO", "1", false },
+    { "LLAMA_FN_L22_TBO", "0", false },
     { "LLAMA_FN_L22_DMASHARE", "0", false },
     { "LLAMA_FN_L22_DMASHARE_SLOTS", "4", false },
     { "LLAMA_FN_L22_X_PRIOR", "0", false },
