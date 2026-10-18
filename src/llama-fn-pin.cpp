@@ -1000,10 +1000,18 @@ void fn_thread(fn_pin_state * st) {
             std::lock_guard<std::mutex> op(st->op_mtx);
             st->n_watch.fetch_add(1);
             int n = 0;
-            const uint64_t b = fn_unpin(st, [&](uint64_t) {
+            // R-REV-1: as the OOM hook, at most the bytes whose measured LOCAL charge covers the deficit per check (no visible
+            // charge: the target's bytes), so one check never unpins every range for headroom it cannot raise
+            const uint64_t want_w = thr + 512*FN_MIB;
+            const double   ratio  = st->cfg.l_ratio;
+            const uint64_t cap    = fn_pin::oom_cap_bytes(want_w, head, ratio < fn_pin::OOM_RATIO_MIN, ratio);
+            const uint64_t b = fn_unpin(st, [&](uint64_t f) {
+                if (f >= cap) {
+                    return true;
+                }
                 bool ok2 = false;
                 const int64_t h2 = fn_local_headroom(st, &ok2);
-                return !ok2 || h2 >= (int64_t) (thr + 512*FN_MIB);
+                return !ok2 || h2 >= (int64_t) want_w;
             }, 200000, true, &n);
             bool ok3 = false;
             const int64_t h3 = fn_local_headroom(st, &ok3);
