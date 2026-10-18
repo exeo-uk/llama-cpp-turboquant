@@ -185,7 +185,7 @@ struct clip_ctx {
     int64_t fn_hw_patches      = 0; // most patches encoded in one graph so far
     size_t  fn_limit_test      = 0; // tests: device compute limit forced on any backend (0: off)
     uint64_t fn_n_split        = 0;
-    std::map<std::tuple<int, int, int>, size_t> fn_need; // (nx, ny, k) -> device compute bytes of a k-image graph
+    std::map<std::tuple<int, int, int, int>, size_t> fn_need; // (nx, ny, k, flash attn) -> device compute bytes of a k-image graph
     ggml_backend_sched_ptr fn_sched_measure;             // measures only, never allocates
 
     // for audio gen, reseeded only when the caller asks for another seed
@@ -6751,7 +6751,7 @@ static size_t clip_fn_l22_limit(const clip_ctx * ctx) {
 // device compute bytes of a k-image graph of nx x ny pictures, measured with a scheduler that never allocates (the
 // weights must be on the device: parked weights would count as compute)
 size_t clip_fn_l22_need_bytes(struct clip_ctx * ctx, int nx, int ny, int k) {
-    const auto key = std::make_tuple(nx, ny, k);
+    const auto key = std::make_tuple(nx, ny, k, (int) ctx->flash_attn_type);
     const auto it  = ctx->fn_need.find(key);
     if (it != ctx->fn_need.end()) {
         return it->second;
@@ -6819,7 +6819,7 @@ static bool clip_fn_l22_encode_stills(clip_ctx * ctx, clip_encode_params * param
     for (const int k : plan) {
         groups += (groups.empty() ? "" : "+") + std::to_string(k);
     }
-    const auto it_b = ctx->fn_need.find(std::make_tuple(e0.nx(), e0.ny(), B));
+    const auto it_b = ctx->fn_need.find(std::make_tuple(e0.nx(), e0.ny(), B, (int) ctx->flash_attn_type));
     LOG_WRN("%s: [TAG_FN_L22_VLBATCH] %d pictures %dx%d: %.0f MiB compute, limit %.0f MiB%s: groups %s\n", __func__, B,
             e0.nx(), e0.ny(), it_b != ctx->fn_need.end() ? it_b->second/1048576.0 : 0.0, limit/1048576.0,
             pins ? " (pins: no new high-water)" : "", groups.c_str());
