@@ -88,6 +88,22 @@ bool llama_batch_allocr::init(
         }
     }
 
+    // [TAG_FN_L22_IMGPASS] the token ids the entries stand for (llama_batch_ext_set_token_aux), kept only if one is set
+    for (int32_t i = 0; i < n_tok; ++i) {
+        const llama_token ta = batch_inp.tokens[i].tok_aux;
+        if (ta == LLAMA_TOKEN_NULL) {
+            continue;
+        }
+        if (ta < 0 || ta >= batch_inp.n_vocab) {
+            LLAMA_LOG_ERROR("%s: invalid tok_aux[%d] = %d\n", __func__, i, ta);
+            return false;
+        }
+        if (tok_aux_vec.empty()) {
+            tok_aux_vec.assign(n_tok, LLAMA_TOKEN_NULL);
+        }
+        tok_aux_vec[i] = ta;
+    }
+
     //
     // build flat token/embd array
     //
@@ -796,6 +812,7 @@ void llama_batch_allocr::clear() {
     token_vec   .clear();
     state_vec   .clear(); // [TAG_FN_L21_MTP_VISION]
     n_embd_state = 0;
+    tok_aux_vec .clear(); // [TAG_FN_L22_IMGPASS]
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -839,6 +856,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->output    .resize(n_tokens);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
     udata->embd_state.resize(state_vec.empty() ? 0 : (size_t) n_tokens * n_embd_state); // [TAG_FN_L21_MTP_VISION]
+    udata->tok_aux   .resize(tok_aux_vec.empty() ? 0 : n_tokens); // [TAG_FN_L22_IMGPASS]
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -859,6 +877,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         if (!state_vec.empty()) { // [TAG_FN_L21_MTP_VISION]
             memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state,
                     n_embd_state*sizeof(float));
+        }
+
+        if (!tok_aux_vec.empty()) { // [TAG_FN_L22_IMGPASS]
+            udata->tok_aux[i] = tok_aux_vec[idxs[i]];
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -921,6 +943,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ udata,
         /*.embd_state   =*/ udata->embd_state.empty() ? nullptr : udata->embd_state.data(), // [TAG_FN_L21_MTP_VISION]
+        /*.tok_aux      =*/ udata->tok_aux.empty() ? nullptr : udata->tok_aux.data(), // [TAG_FN_L22_IMGPASS]
     };
 
     if (debug > 0) {

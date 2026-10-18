@@ -66,6 +66,7 @@ struct llama_ubatch {
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
         std::vector<float>          embd_state; // [TAG_FN_L21_MTP_VISION]
+        std::vector<llama_token>    tok_aux;    // [TAG_FN_L22_IMGPASS]
 
         std::vector<llama_seq_id> seq_id_data;
 
@@ -82,6 +83,11 @@ struct llama_ubatch {
     // [TAG_FN_L21_MTP_VISION] [n_embd_state, n_tokens]: the target hidden state of each row, set only on MTP batches whose
     // rows carry an image embedding in embd (upstream #30257 embd_state); NULL = the hidden state is in embd as before
     float * embd_state = nullptr;
+
+    // [TAG_FN_L22_IMGPASS] [n_tokens]: the token id each row of an embedding ubatch stands for (a merged image turn: the
+    // text row's token, llama_model_media_token for an image row; LLAMA_TOKEN_NULL for none); NULL when no row has one.
+    // PLE ids, KV ext.tok and the predecessor rule read it; it changes no graph topology.
+    llama_token * tok_aux = nullptr;
 };
 
 struct llama_hparams;
@@ -228,6 +234,7 @@ private:
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          state_vec;    // [TAG_FN_L21_MTP_VISION] state rows in entry order, empty if none
     uint32_t                    n_embd_state = 0;
+    std::vector<llama_token>    tok_aux_vec;  // [TAG_FN_L22_IMGPASS] per entry, empty if no entry has one
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

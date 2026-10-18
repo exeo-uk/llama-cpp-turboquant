@@ -2937,8 +2937,12 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const llama_token img_tok = hparams.ple_image_token_id != 0
         ? (llama_token) hparams.ple_image_token_id
         : (llama_token) hparams.ple_eos_token_id;
+    // [TAG_FN_L22_IMGPASS] a merged image turn: the side channel names each row (the text token, or the media token)
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        if (ubatch->token) {
+            return ubatch->token[k];
+        }
+        return ubatch->tok_aux && ubatch->tok_aux[k] != LLAMA_TOKEN_NULL ? ubatch->tok_aux[k] : img_tok;
     };
 
     const int64_t n_tokens = ubatch->n_tokens;
