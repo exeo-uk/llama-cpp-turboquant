@@ -11,6 +11,7 @@
 #include "server-stream.h"
 #include "server-fn-l22-dump.h" // [TAG_FN_L22_LOGITDUMP]
 #include "server-fn-l22-p3.h"   // [TAG_FN_L22] P3's pure policies (merged image turns, anchors, ring victim, phase)
+#include "server-fn-l22-two.h"  // [TAG_FN_L22] P9's pure policies (one prompt per batch, D2 windows, pause, SHAREKV)
 
 #include "build-info.h"
 #include "common.h"
@@ -1338,6 +1339,21 @@ struct server_slot {
     int32_t share_prefix_stop      = 0;
     bool    share_prefix_published = false;
 
+    // [TAG_FN_L22_ONEPROMPT] the claimers this slot's prompt gave way to (once per claiming task), and the last one
+    int32_t l22_n_yield    = 0;
+    int     l22_yield_task = -1;
+    // [TAG_FN_L22_PAUSE] the answer is left out of batches until this time (0 = not paused) or until task
+    // l22_pause_by_task ends; pending = paused from the next step on that has no rows of this slot in flight
+    int64_t l22_pause_until_us = 0;
+    int64_t l22_pause_t0_us    = 0;
+    int     l22_pause_by_task  = -1;
+    int32_t l22_n_pauses       = 0;
+    bool    l22_pause_pending  = false;
+    bool    l22_pause_checked  = false; // this request's prompt start was checked as a pauser
+    bool    l22_pause_json     = false; // /slots shows "paused" (the switch is on)
+    // [TAG_FN_L22_SHAREKV] some of this slot's cells carry another sequence's id too (a zero-copy prefix share)
+    bool    l22_kv_shared      = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * tokens_next = nullptr,
@@ -1390,6 +1406,8 @@ struct server_slot {
         prompt.clear();
 
         kc_spill.clear(); // [TAG_FN_L19_CONVSTORE_SPILL] they describe the tokens just dropped
+
+        l22_kv_shared = false; // [TAG_FN_L22_SHAREKV]
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1460,6 +1478,16 @@ struct server_slot {
         // [TAG_SHARED_PREFIX_FANOUT]
         share_prefix_stop      = 0;
         share_prefix_published = false;
+
+        // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] per request (l22_kv_shared describes the memory: prompt_clear)
+        l22_n_yield        = 0;
+        l22_yield_task     = -1;
+        l22_pause_until_us = 0;
+        l22_pause_t0_us    = 0;
+        l22_pause_by_task  = -1;
+        l22_n_pauses       = 0;
+        l22_pause_pending  = false;
+        l22_pause_checked  = false;
 
         spec_is_replay = false;
 
@@ -1843,6 +1871,10 @@ struct server_slot {
         res["parked"]        = parked;
         res["n_parks_total"] = n_parks_total;
         res["park_cells"]    = parked ? park_cells : 0;
+
+        if (l22_pause_json) {
+            res["paused"] = l22_pause_until_us != 0; // [TAG_FN_L22_PAUSE]
+        }
 
         // [TAG_MTMD_ASYNC_ENCODE] waiting_media: the prompt is held at a media chunk until its encode finishes
         res["waiting_media"] = media_blocked();
@@ -2244,6 +2276,32 @@ private:
         uint64_t    n_dec_prompt = 0;
         uint64_t    n_dec_bad    = 0;
     } l22;
+
+    // [TAG_FN_L22] P9's two-connection switches, read once per model load by l22two_init() (llama_model_fn_env). Each
+    // needs 2+ slots; unset = today's code paths.
+    struct l22two_cfg_t {
+        bool    one       = false;   // LLAMA_FN_L22_ONEPROMPT: one prompt per batch, shortest first
+        int     gs2       = 0;       // LLAMA_FN_L22_GENSHARE2: 1 = one context ubatch of prompt rows while a slot answers, 2 = 8K
+        bool    gs2_all   = false;   // LLAMA_FN_L22_GENSHARE2_ALL: the same cut without an answer (P10 R4, BIGUB2=2)
+        bool    pause     = false;   // LLAMA_FN_L22_PAUSE: a short request pauses a long answer
+        int32_t pause_tok = 2048;    // LLAMA_FN_L22_PAUSE_TOKENS
+        int64_t pause_us  = 8000000; // LLAMA_FN_L22_PAUSE_S
+        bool    sharekv   = false;   // LLAMA_FN_L22_SHAREKV: the shared-prefix fan-out by seq_cp (needs --kv-unified)
+    } l22two;
+
+    // [TAG_FN_L22_SHAREKV] the last boundary a leader published: its slot, task and boundary
+    struct {
+        int     slot     = -1;
+        int     task     = -1;
+        int32_t n_shared = 0;
+    } l22_share_src;
+
+    // [TAG_FN_L22_GENSHARE2] media chunks decoded in pre_decode beside generating rows (their own llama_decode calls)
+    int64_t l22_media_us   = 0;
+    int32_t l22_media_rows = 0;
+    int32_t l22_cap_rows   = 0; // the batch cap of the last pre_decode (the log line)
+    // [TAG_FN_L22_ONEPROMPT] the task that claimed the last prompt batch (for the log line on a change)
+    int     l22_last_claim = -1;
 
     server_metrics metrics;
 
@@ -2876,6 +2934,7 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
+        l22two_init();  // [TAG_FN_L22] P9: after the slots and the prompt cache
         if (const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_L19_TTFT_CKPT_TAIL"); e && *e) { // [TAG_FN_L19_TTFT_CKPT]
             ckpt_tail_min = std::max<long long>(0, strtoll(e, nullptr, 10));
             SRV_WRN("[TAG_FN_L19_TTFT_CKPT] a prompt batch of >= %lld tokens leaves its last 4 tokens to their own batch with a "
@@ -3094,11 +3153,17 @@ private:
             return v > 0 ? v : 2048;
         }();
 
-        if (!enabled || !prompt_cache || slots.size() < 2) {
+        // [TAG_FN_L22_SHAREKV] with --kv-unified the follower takes the leader's cells (seq_cp), no prompt cache needed
+        if (!enabled || (!prompt_cache && !l22two.sharekv) || slots.size() < 2) {
             return false;
         }
 
         if (task.type != SERVER_TASK_TYPE_COMPLETION || task.id_slot != -1) {
+            return false;
+        }
+
+        // [TAG_FN_L22_SHAREKV] without the prompt cache only a follower that can take the cells waits
+        if (!prompt_cache && (task.is_parent() || task.is_child() || !task.params.cache_prompt)) {
             return false;
         }
 
@@ -3159,7 +3224,7 @@ private:
     // exercise is wasted. Saved ON the boundary, the cached prompt IS the shared prefix, the
     // follower's f_keep is 1.0, and it processes only its own tail.
     void share_prefix_publish_ready() {
-        if (!prompt_cache || slots.size() < 2) {
+        if ((!prompt_cache && !l22two.sharekv) || slots.size() < 2) { // [TAG_FN_L22_SHAREKV]
             return;
         }
 
@@ -3177,8 +3242,19 @@ private:
             slot.share_prefix_stop      = 0;
             slot.share_prefix_published = true;
 
+            // [TAG_FN_L22_SHAREKV] the woken followers copy the leader's cells while it sits on the boundary (they launch
+            // before the next update_slots); the prompt cache entry below stays the fallback for a follower with no slot now
+            if (l22two.sharekv && slot.task && slot.state == SLOT_STATE_PROCESSING_PROMPT && (int) slot.prompt.n_tokens() == n_shared) {
+                l22_share_src.slot     = slot.id;
+                l22_share_src.task     = slot.task->id;
+                l22_share_src.n_shared = n_shared;
+                SLT_INF(slot, "[TAG_FN_L22_SHAREKV] share_prefix: %d tokens at the shared boundary for zero-copy followers\n", n_shared);
+            }
+
             // shared = true: this is a boundary entry, exempt from containment
-            if (slot.prompt_save(*prompt_cache, nullptr, /*shared =*/ true)) {
+            if (!prompt_cache) {
+                // [TAG_FN_L22_SHAREKV] no prompt cache: the cells are the only copy
+            } else if (slot.prompt_save(*prompt_cache, nullptr, /*shared =*/ true)) {
                 prompt_cache->update();
                 SLT_INF(slot, "share_prefix: published %d tokens at the shared boundary\n", n_shared);
             } else {
@@ -3303,12 +3379,25 @@ private:
                 return ret;
             }
 
+            // [TAG_FN_L22_SHAREKV] a leader sits on a boundary this task shares: the slot takes its cells below (keepctx
+            // restores only a stored conversation that gives more)
+            server_slot * l22_leader = l22two.sharekv ? l22_sharekv_leader(task, *ret) : nullptr;
+
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
                 const int64_t t_kc0 = ggml_time_us();
                 ret->l22_turn.kc_what = 0;
-                keepctx_switch(*ret, task);
+                keepctx_switch(*ret, task, l22_leader ? l22_share_src.n_shared : 0);
                 ret->l22_turn.kc_ms = (ggml_time_us() - t_kc0) / 1000.0; // [TAG_FN_L22_PASSLOG]
+            }
+
+            if (l22_leader && l22_sharekv_leader(task, *ret) == l22_leader) {
+                if (prompt_cache && update_cache) {
+                    ret->prompt_save(*prompt_cache, &task.tokens); // what the slot held, as the cache update would save it
+                    prompt_cache->update();
+                }
+                l22_sharekv_take(*l22_leader, *ret);
+                update_cache = false;
             }
 
             update_cache = update_cache && prompt_cache;
@@ -3436,6 +3525,190 @@ private:
             SRV_INF("[TAG_FN_L22] P3 switches: vlend hold %d, MTP keep %d (MTP draft %d), media anchors %d, checkpoint keep %d, "
                     "checkpoint split %d, keep-lend hint %d\n", l22.vlend_hold, l22.mtp_keep, l22.spec_mtp, l22.anchor,
                     l22.ckpt_keep, l22.ckpt_split, l22.keeplend);
+        }
+    }
+
+    // [TAG_FN_L22] P9's switches (l22two_cfg_t); every rule needs 2+ slots, so --parallel 1 runs today's code paths
+    void l22two_init() {
+        l22two         = l22two_cfg_t();
+        l22_share_src  = decltype(l22_share_src)();
+        l22_media_us   = 0;
+        l22_media_rows = 0;
+        l22_last_claim = -1;
+        for (auto & s : slots) {
+            s.l22_pause_json = false;
+        }
+        if (slots.size() < 2) {
+            return;
+        }
+        auto on = [&](const char * name) {
+            return llama_fn_l22_switch_on(llama_model_fn_env(model_tgt, name));
+        };
+        auto num = [&](const char * name, double def) {
+            const char * e = llama_model_fn_env(model_tgt, name);
+            return e && *e ? atof(e) : def;
+        };
+        l22two.one       = on("LLAMA_FN_L22_ONEPROMPT");
+        l22two.gs2       = on("LLAMA_FN_L22_GENSHARE2") ? (num("LLAMA_FN_L22_GENSHARE2", 1.0) >= 2.0 ? 2 : 1) : 0;
+        l22two.gs2_all   = l22two.gs2 > 0 && on("LLAMA_FN_L22_GENSHARE2_ALL");
+        l22two.pause     = on("LLAMA_FN_L22_PAUSE");
+        l22two.pause_tok = (int32_t) std::clamp(num("LLAMA_FN_L22_PAUSE_TOKENS", 2048.0), 0.0, 1e9);
+        l22two.pause_us  = (int64_t) (std::clamp(num("LLAMA_FN_L22_PAUSE_S", 8.0), 0.0, 3600.0) * 1e6);
+        const bool sharekv_sw = on("LLAMA_FN_L22_SHAREKV");
+        l22two.sharekv   = sharekv_sw && params_base.kv_unified;
+        for (auto & s : slots) {
+            s.l22_pause_json = l22two.pause;
+        }
+        if (l22two.one || l22two.gs2 || l22two.pause || sharekv_sw) {
+            SRV_INF("[TAG_FN_L22] P9 two-connection rules (%zu slots): [TAG_FN_L22_ONEPROMPT] %d, [TAG_FN_L22_GENSHARE2] %d%s, "
+                    "[TAG_FN_L22_PAUSE] %d (<= %d tokens, %.1f s), [TAG_FN_L22_SHAREKV] %d%s\n", slots.size(), (int) l22two.one,
+                    l22two.gs2, l22two.gs2_all ? " (also without an answer)" : "", (int) l22two.pause, l22two.pause_tok,
+                    l22two.pause_us / 1e6, (int) l22two.sharekv, sharekv_sw && !l22two.sharekv ? " (off: needs --kv-unified)" : "");
+        }
+    }
+
+    // [TAG_FN_L22_SHAREKV] the leader whose published boundary this follower (in slot ret) can take now, or nullptr
+    server_slot * l22_sharekv_leader(const server_task & task, const server_slot & ret) {
+        if (!l22two.sharekv || l22_share_src.slot < 0 || l22_share_src.slot >= (int) slots.size()) {
+            return nullptr;
+        }
+        if (task.type != SERVER_TASK_TYPE_COMPLETION || task.id_slot != -1 || task.is_parent() || task.is_child() ||
+                !task.params.cache_prompt) {
+            return nullptr;
+        }
+        server_slot & L = slots[l22_share_src.slot];
+        if (!L.task) {
+            return nullptr;
+        }
+        l22_share_view v;
+        v.task_now  = L.task->id;
+        v.task_rec  = l22_share_src.task;
+        v.prompting = L.state == SLOT_STATE_PROCESSING_PROMPT;
+        v.parked    = L.parked;
+        v.n_tokens  = L.prompt.n_tokens();
+        v.n_shared  = l22_share_src.n_shared;
+        v.same_slot = &L == &ret;
+        v.ret_idle  = !ret.is_processing();
+        v.n_task    = (int32_t) task.n_tokens();
+        if (v.n_tokens != v.n_shared || v.same_slot || !v.prompting) {
+            return nullptr; // the cheap tests first (the prefixes below scan tokens)
+        }
+        v.lcp_task  = (int32_t) L.prompt.tokens.get_common_prefix(task.tokens);
+        v.lcp_ret   = (int32_t) ret.prompt.tokens.get_common_prefix(task.tokens);
+        return l22_sharekv_usable(v) ? &L : nullptr;
+    }
+
+    // [TAG_FN_L22_SHAREKV] the follower F takes the leader L's cells: L sits exactly on the boundary, so all of L is the
+    // shared prefix. Attention cells get F's id too (no copy), the recurrent cell is shared and copied on the first write
+    // of either sequence, the draft context gets the same copy, and the MTP carry (the h F's first row pairs with) too.
+    void l22_sharekv_take(server_slot & L, server_slot & F) {
+        const int64_t t0       = ggml_time_us();
+        const int32_t n_shared = l22_share_src.n_shared;
+
+        F.prompt_clear(); // an empty destination (turbot adopts the write-row counter, the old recurrent cell is free)
+        F.mem.seq_cp(L.id, F.id, -1, -1);
+        F.prompt.tokens = L.prompt.tokens.clone();
+        F.prompt.tokens.keep_first(n_shared);
+        if (spec) {
+            std::vector<uint8_t> carry;
+            common_speculative_get_carry(spec.get(), L.id, carry);
+            if (!common_speculative_set_carry(spec.get(), F.id, carry)) {
+                SLT_WRN(F, "%s", "[TAG_FN_L22_SHAREKV] the leader's draft carry did not apply (acceptance only)\n");
+            }
+        }
+        L.l22_kv_shared = true;
+        F.l22_kv_shared = true;
+
+        SLT_INF(F, "[TAG_FN_L22_SHAREKV] took %d prompt tokens from slot %d (task %d) by seq_cp in %.1f ms\n", n_shared, L.id,
+                L.task ? L.task->id : -1, (ggml_time_us() - t0) / 1000.0);
+        if (llama_fn_l22_passlog_level() >= 1) {
+            llama_fn_l22_log("turn", "two=sharekv dst=%d src=%d task=%d n=%d ms=%.1f", F.id, L.id, L.task ? L.task->id : -1, n_shared,
+                             (ggml_time_us() - t0) / 1000.0);
+        }
+    }
+
+    // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] the prompt tokens a slot has left: exact once processing, an estimate from the
+    // slot's cached tokens while STARTED (a checkpoint restore can make it larger)
+    static int32_t l22_prompt_left(const server_slot & slot) {
+        if (!slot.task) {
+            return 0;
+        }
+        const int32_t total = (int32_t) slot.task->n_tokens();
+        if (slot.state == SLOT_STATE_STARTED) {
+            const int32_t lcp = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+            return std::max<int32_t>(1, total - lcp);
+        }
+        return std::max<int32_t>(0, total - (int32_t) slot.prompt.n_tokens());
+    }
+
+    // [TAG_FN_L22_PAUSE] the request family of a slot (an n_cmpl parent and its children)
+    static int l22_family(const server_slot & slot) {
+        if (!slot.task) {
+            return -1;
+        }
+        return slot.task->is_child() ? slot.task->id_parent : slot.task->id;
+    }
+
+    // [TAG_FN_L22_PAUSE] a generating slot of another request that a short request (work prompt tokens) may pause now
+    bool l22_pause_target(const server_slot & g, const server_slot & by, int32_t work) const {
+        return &g != &by && g.state == SLOT_STATE_GENERATING && g.task && !g.parked && g.l22_pause_until_us == 0 &&
+               !g.l22_pause_pending && l22_family(g) != l22_family(by) &&
+               l22_pause_eligible(work, l22two.pause_tok, g.l22_n_pauses);
+    }
+
+    // [TAG_FN_L22_PAUSE] at the top of pre_decode: pending pauses start where the slot has no rows in flight, paused
+    // answers go on at the timeout or when the request that paused them is gone
+    void l22_pause_update() {
+        const int64_t now = ggml_time_us();
+        for (auto & g : slots) {
+            if (g.l22_pause_pending) {
+                if (g.state != SLOT_STATE_GENERATING || !g.task) {
+                    g.l22_pause_pending = false;
+                    g.l22_pause_by_task = -1;
+                } else if (g.i_batch == -1 && g.spec_i_batch.empty() && !g.parked) {
+                    g.l22_pause_pending  = false;
+                    g.l22_pause_until_us = now + std::max<int64_t>(1, l22two.pause_us);
+                    g.l22_pause_t0_us    = now;
+                    g.l22_n_pauses++;
+                    if (spec) {
+                        common_speculative_get_draft_params(spec.get(), g.id).drafting = false;
+                    }
+                    if (llama_fn_l22_passlog_level() >= 1) {
+                        llama_fn_l22_log("turn", "two=pause slot=%d task=%d by=%d n=%d until_ms=%.0f", g.id, g.task->id,
+                                         g.l22_pause_by_task, g.l22_n_pauses, l22two.pause_us / 1000.0);
+                    }
+                }
+                continue;
+            }
+            if (g.l22_pause_until_us == 0) {
+                continue;
+            }
+            bool by_alive = false;
+            for (const auto & o : slots) {
+                if (&o != &g && o.is_processing() && o.task && o.task->id == g.l22_pause_by_task) {
+                    by_alive = true;
+                    break;
+                }
+            }
+            const bool timeout = now >= g.l22_pause_until_us;
+            if (g.state != SLOT_STATE_GENERATING || l22_pause_should_resume(now, g.l22_pause_until_us, by_alive)) {
+                // the pause is not decode time (as a park); a park inside it counts itself (pool_restore moves t0)
+                const int64_t end    = g.parked ? g.t_park_us : now;
+                const int64_t paused = std::max<int64_t>(0, end - g.l22_pause_t0_us);
+                if (g.state == SLOT_STATE_GENERATING) {
+                    g.stats.t_paused_gen_us += paused;
+                    if (g.stats.t_gen_last != 0) {
+                        g.stats.t_gen_last += paused;
+                    }
+                }
+                if (llama_fn_l22_passlog_level() >= 1) {
+                    llama_fn_l22_log("turn", "two=resume slot=%d task=%d why=%s paused_ms=%.0f", g.id, g.task ? g.task->id : -1,
+                                     timeout ? "timeout" : (by_alive ? "state" : "end"), paused / 1000.0);
+                }
+                g.l22_pause_until_us = 0;
+                g.l22_pause_t0_us    = 0;
+                g.l22_pause_by_task  = -1;
+            }
         }
     }
 
@@ -3920,7 +4193,9 @@ private:
     }
 
     // [TAG_FN_L18_KEEPCTX] slot is idle and about to take the task's prompt (cache_prompt: it reuses what the slot holds)
-    void keepctx_switch(server_slot & slot, const server_task & task) {
+    // l22_share_n: [TAG_FN_L22_SHAREKV] the slot takes that many tokens from a leader's cells right after, so only a stored
+    // conversation that gives more is restored (0 = no share)
+    void keepctx_switch(server_slot & slot, const server_task & task, int32_t l22_share_n = 0) {
         const server_tokens & tokens       = task.tokens;
         const bool            cache_prompt = task.params.cache_prompt;
 
@@ -3953,7 +4228,8 @@ private:
                 it_best  = it;
             }
         }
-        const bool restore = cache_prompt && it_best != keepctx->entries.end() && use_best >= use_cur + keepctx_min;
+        const bool restore = cache_prompt && it_best != keepctx->entries.end() && use_best >= use_cur + keepctx_min &&
+                             use_best > l22_share_n; // [TAG_FN_L22_SHAREKV] (it_best implies use_best > 0)
 
         // the slot loses most of its content and at least keepctx_min tokens
         const bool lose_most = n_cur - lcp_cur >= keepctx_min && 2*lcp_cur < n_cur;
@@ -4481,7 +4757,7 @@ private:
         const int32_t free1 = llama_memory_attn_n_free_ext(ctx_tgt, s.id);
 
         s.park_tgt      = std::move(bt);
-        s.park_cells    = free1 - free0;
+        s.park_cells    = l22_park_cells(free1 - free0, (int32_t) s.prompt.tokens.size(), s.l22_kv_shared); // [TAG_FN_L22_SHAREKV]
         s.park_n_tokens = s.prompt.tokens.size();
         s.park_state    = s.state;
         s.parked        = true;
@@ -4554,6 +4830,13 @@ private:
         s.t_run_us = now;
         pool_n_parked--;
 
+        // [TAG_FN_L22_SHAREKV] the resume wrote every cell of the slot as its own
+        s.l22_kv_shared = false;
+        // [TAG_FN_L22_PAUSE] a pause that runs on: the park counted its own time
+        if (s.l22_pause_until_us != 0 && s.l22_pause_t0_us != 0) {
+            s.l22_pause_t0_us += pause;
+        }
+
         SLT_WRN(s, "__TEST_TAG_POOL_RESUME__ after %.1f s, n_tokens = %d, took %.1f ms\n",
                 pause / 1e6, s.prompt.n_tokens(), (now - t0) / 1000.0);
         return true;
@@ -4586,6 +4869,7 @@ private:
         s.parked   = false;
         pool_n_parked--;
         s.prompt.clear();
+        s.l22_kv_shared = false; // [TAG_FN_L22_SHAREKV]
     }
 
     void pool_restore_failed(server_slot & s) {
@@ -6533,7 +6817,13 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            // [TAG_FN_L22_GENSHARE2] the generating rows decode as their own first view: the answer's token is sampled
+            // before the prompt pass, and the prompt runs the 1-slot ubatch grid (a view that starts at 0 and holds
+            // exactly the generating rows keeps every verify group whole)
+            if (l22two.gs2 > 0 && off == 0 && batch.n_gen_rows > 0 && batch.size() > batch.n_gen_rows) {
+                n_tokens = std::min(n_tokens, batch.n_gen_rows);
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -6593,7 +6883,10 @@ private:
 
         // [TAG_FN_L15_GENSHARE] a prompt chunk that held up generating slots opens their decode-only window; a chunk that
         // read the experts from the disk counts as LLAMA_SRV_GEN_SHARE_CAP_MS at most
-        if (batch.n_gen_rows > 0 && batch.size() > batch.n_gen_rows) {
+        // [TAG_FN_L22_GENSHARE2] media passes beside generating rows (decoded in pre_decode) open the window too, the cap
+        // scales with the rows of the pass
+        const bool l22_media_win = l22two.gs2 > 0 && batch.n_gen_rows > 0 && l22_media_us > 0;
+        if (batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) {
             static const double share = [] {
                 const char * e = getenv("LLAMA_SRV_GEN_SHARE");
                 return e ? std::max(0.0, atof(e)) : 0.0;
@@ -6604,7 +6897,19 @@ private:
             }();
             if (share > 0.0) {
                 const int64_t t1 = ggml_time_us();
-                gen_share_until_us = t1 + (int64_t) (share*(double) std::min(t1 - t_batch0, cap_us));
+                if (l22two.gs2 > 0) {
+                    const int64_t rows    = (int64_t) (batch.size() - batch.n_gen_rows) + l22_media_rows;
+                    const int64_t cap_eff = l22_window_cap_us(cap_us, rows, l22two.gs2);
+                    const int64_t base    = (t1 - t_batch0) + l22_media_us;
+                    gen_share_until_us = t1 + (int64_t) (share*(double) std::min(base, cap_eff));
+                    if (llama_fn_l22_passlog_level() >= 1) {
+                        llama_fn_l22_log("turn", "two=genshare2 rows=%lld cap_rows=%d gen_rows=%d window_ms=%.0f pass_ms=%.0f media_ms=%.0f "
+                                         "cap_ms=%.0f", (long long) rows, l22_cap_rows, batch.n_gen_rows, (gen_share_until_us - t1) / 1000.0,
+                                         base / 1000.0, l22_media_us / 1000.0, cap_eff / 1000.0);
+                    }
+                } else {
+                    gen_share_until_us = t1 + (int64_t) (share*(double) std::min(t1 - t_batch0, cap_us));
+                }
             }
         }
 
@@ -6722,6 +7027,13 @@ private:
             pool_unpark();
         }
 
+        // [TAG_FN_L22_PAUSE] pending pauses start, paused answers go on (after the unpark: the fields are independent)
+        if (l22two.pause) {
+            l22_pause_update();
+        }
+        l22_media_us   = 0; // [TAG_FN_L22_GENSHARE2]
+        l22_media_rows = 0;
+
         // start populating the batch for this iteration
         batch.clear();
 
@@ -6733,7 +7045,8 @@ private:
 
         // determine which slots are generating and drafting
         iterate("slots_3291", slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || slot.parked) {
+            // [TAG_FN_L22_PAUSE] a paused answer is left out like a parked one (its cells stay in the pool)
+            if (slot.state != SLOT_STATE_GENERATING || slot.parked || slot.l22_pause_until_us != 0) {
                 return;
             }
 
@@ -6913,14 +7226,88 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // [TAG_FN_L15_GENSHARE] inside the hold window the generating slots decode alone
-        const bool gen_share_hold = batch.n_gen_rows > 0 && ggml_time_us() < gen_share_until_us;
+        bool gen_share_hold = batch.n_gen_rows > 0 && ggml_time_us() < gen_share_until_us;
+
+        // [TAG_FN_L22_PAUSE] a short request that will pause an answer does not wait for the window (only it adds rows)
+        std::vector<char> l22_bypass;
+        if (gen_share_hold && l22two.pause) {
+            for (const auto & s : slots) {
+                if (s.state != SLOT_STATE_STARTED || s.parked || !s.task || s.l22_pause_checked ||
+                        s.task->type != SERVER_TASK_TYPE_COMPLETION) {
+                    continue;
+                }
+                const int32_t work = l22_prompt_left(s);
+                for (const auto & g : slots) {
+                    if (l22_pause_target(g, s, work)) {
+                        if (l22_bypass.empty()) {
+                            l22_bypass.assign(slots.size(), 0);
+                        }
+                        l22_bypass[s.id] = 1;
+                        break;
+                    }
+                }
+            }
+            if (!l22_bypass.empty()) {
+                gen_share_hold = false;
+            }
+        }
+
+        // [TAG_FN_L22_GENSHARE2] while a slot answers, the prompt rows of a batch fill one context ubatch (one stream pass)
+        int32_t n_batch_prompt = n_batch;
+        if (l22two.gs2 > 0 && !gen_share_hold && (batch.n_gen_rows > 0 || l22two.gs2_all) &&
+                (params_base.cont_batching || batch.size() == 0)) {
+            int32_t n_after = -1;
+            for (const auto & s : slots) {
+                if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
+                    n_after = std::max(n_after, l22_prompt_left(s));
+                }
+            }
+            if (n_after >= 0) {
+                // the hint first, then the width (as P3's merged-batch plan); the decode sets the hint again
+                llama_fn_prompt_after_ext(ctx_tgt, n_after);
+                const int32_t w = llama_fn_prompt_ubatch_width_ext(ctx_tgt);
+                llama_fn_prompt_after_ext(ctx_tgt, -1);
+                n_batch_prompt = l22_genshare2_prompt_cap(n_batch, batch.n_gen_rows, w, l22two.gs2, l22two.gs2_all);
+            }
+        }
+        l22_cap_rows = n_batch_prompt;
 
         // next, batch any pending prompts without exceeding n_batch
         if (!gen_share_hold && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate("slots_3456", slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            // [TAG_FN_L22_ONEPROMPT] 2+ slots with prompt tokens left: visit them shortest first (a slot that gave way twice
+            // goes first); the first one that adds prompt rows claims the batch, the others give way
+            std::vector<server_slot *> l22_order;
+            int     l22_claim      = -1;
+            int     l22_claim_slot = -1;
+            int32_t l22_claim_left = 0;
+            if (l22two.one) {
+                std::vector<l22_prompt_cand> cand;
+                std::vector<char>            is_cand(slots.size(), 0);
+                for (const auto & s : slots) {
+                    if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
+                        cand.push_back({ s.id, l22_prompt_left(s), s.l22_n_yield });
+                        is_cand[s.id] = 1;
+                    }
+                }
+                if (cand.size() >= 2) {
+                    for (const int id : l22_oneprompt_order(cand)) {
+                        l22_order.push_back(&slots[id]);
+                    }
+                    for (auto & s : slots) {
+                        if (!is_cand[s.id]) {
+                            l22_order.push_back(&s);
+                        }
+                    }
+                }
+            }
+
+            const auto prompt_pass = [&](server_slot & slot) {
+                // [TAG_FN_L22_GENSHARE2] a completion's prompt rows stop at the cap while a slot answers
+                const int32_t n_batch_slot = (n_batch_prompt < n_batch && slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION)
+                                           ? n_batch_prompt : n_batch;
+                if (!add_ok || batch.size() >= n_batch_slot) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -6930,6 +7317,12 @@ private:
                 }
 
                 if (!slot.is_processing() || slot.parked) {
+                    return;
+                }
+
+                // [TAG_FN_L22_PAUSE] inside a window only the request that pauses an answer adds prompt rows
+                if (!l22_bypass.empty() && !l22_bypass[slot.id] &&
+                        (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT)) {
                     return;
                 }
 
@@ -6950,6 +7343,8 @@ private:
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
+
+                    const bool l22_was_started = slot.state == SLOT_STATE_STARTED; // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE]
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -7266,6 +7661,23 @@ private:
                         }
                     } // end of SLOT_STATE_STARTED
 
+                    // [TAG_FN_L22_PAUSE] a short request (its tokens to process, known now) pauses the answers of other
+                    // requests from their next step on (their rows are in this batch already)
+                    if (l22two.pause && l22_was_started && !slot.l22_pause_checked && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                        slot.l22_pause_checked = true;
+                        const int32_t work = (int32_t) slot.task->n_tokens() - (int32_t) slot.prompt.n_tokens();
+                        for (auto & g : slots) {
+                            if (l22_pause_target(g, slot, work)) {
+                                g.l22_pause_pending = true;
+                                g.l22_pause_by_task = slot.task->id;
+                                if (llama_fn_l22_passlog_level() >= 2) {
+                                    llama_fn_l22_log("turn", "two=pause-pending slot=%d task=%d by=%d work=%d", g.id, g.task->id,
+                                                     slot.task->id, work);
+                                }
+                            }
+                        }
+                    }
+
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
@@ -7296,6 +7708,24 @@ private:
                             }
                             return;
                         }
+                    }
+
+                    // [TAG_FN_L22_ONEPROMPT] another prompt claimed this batch: give way. A slot that started in this pass
+                    // drops what lies past its kept tokens now (as below), so its memory matches its tokens
+                    if (!l22_order.empty() && l22_claim >= 0 && l22_claim != slot.task->id) {
+                        if (l22_was_started) {
+                            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                        }
+                        const int32_t n_yield0 = slot.l22_n_yield;
+                        l22_yield_note(slot.l22_n_yield, slot.l22_yield_task, l22_claim);
+                        if (l22_claim != l22_last_claim || slot.l22_n_yield != n_yield0) {
+                            l22_last_claim = l22_claim;
+                            if (llama_fn_l22_passlog_level() >= 1) {
+                                llama_fn_l22_log("turn", "two=oneprompt pick=%d task=%d left=%d yielded=%d:%d yielded_left=%d", l22_claim_slot,
+                                                 l22_claim, l22_claim_left, slot.id, slot.l22_n_yield, l22_prompt_left(slot));
+                            }
+                        }
+                        return;
                     }
 
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
@@ -7364,10 +7794,15 @@ private:
                     bool    l22_fail = false;
                     if (slot.mctx && !media_async && (l22.imgpass_ok || l22.vlend_hold) &&
                             !l22_media_starts(input_tokens, slot.prompt.n_tokens()).empty()) {
+                        const int64_t l22_t_enc0 = ggml_time_us();
                         if (l22_encode_rest(slot) != 0) {
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
                             slot.release();
                             return;
+                        }
+                        // [TAG_FN_L22_GENSHARE2] the encode held the generating rows too
+                        if (l22two.gs2 > 0 && batch.n_gen_rows > 0) {
+                            l22_media_us += ggml_time_us() - l22_t_enc0;
                         }
                         l22_end = l22_plan_merged(slot, n_batch, wait_shared);
                         if (l22_end >= 0) {
@@ -7470,6 +7905,12 @@ private:
                             return; // the slot is done, skip it entirely
                         }
 
+                        // [TAG_FN_L22_GENSHARE2] a media pass beside generating rows (its own decode): the window counts it
+                        if (l22two.gs2 > 0 && batch.n_gen_rows > 0) {
+                            l22_media_us   += ggml_time_us() - l22_t_chunk0;
+                            l22_media_rows += (int32_t) n_tokens_out;
+                        }
+
                         // [TAG_MTMD_ASYNC_ENCODE] free the job (chunk copies, embeddings) once its last chunk is decoded
                         if (embd_async != nullptr && slot.media_job && slot.media_job->idxs.back() == (size_t) cur_token_idx) {
                             slot.media_job.reset();
@@ -7568,7 +8009,7 @@ private:
                         return should_break && (turn_split_forced || (int64_t) (batch.size() - n_tokens_prev) >= tail_min);
                     };
 
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot // [TAG_FN_L22_GENSHARE2]
                            && (share_stop == 0 || (int) slot.prompt.n_tokens() < share_stop)) {
                         // [TAG_FN_L22_IMGPASS] a merged batch ends at its planned end (a media boundary or the prompt end)
                         if (l22_end >= 0 && (int64_t) slot.prompt.n_tokens() >= l22_end) {
@@ -7765,12 +8206,25 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
+
+                    // [TAG_FN_L22_ONEPROMPT] prompt rows (or media passes) of this slot: the batch is its own
+                    if (!l22_order.empty() && l22_claim < 0 && (n_tokens_cur > 0 || has_mtmd)) {
+                        l22_claim      = slot.task->id;
+                        l22_claim_slot = slot.id;
+                        l22_claim_left = l22_prompt_left(slot);
+                    }
                 }
 
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
-            });
+            };
+
+            if (!l22_order.empty()) {
+                iterate("slots_3456", l22_order, prompt_pass); // [TAG_FN_L22_ONEPROMPT]
+            } else {
+                iterate("slots_3456", slots, prompt_pass);
+            }
         }
     }
 

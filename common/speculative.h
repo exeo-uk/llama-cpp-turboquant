@@ -150,6 +150,12 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_get_carry(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 bool common_speculative_set_carry(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// [TAG_FN_L22_DRAFT2] the p_min of draft position pos (0 = the first draft token) in a step where n_drafting sequences
+// draft: with draft2 > 0 and 2+ sequences, the second and later positions need at least draft2
+static inline float common_speculative_pmin_draft2(float pm, int pos, int n_drafting, float draft2) {
+    return (draft2 > 0.0f && n_drafting >= 2 && pos >= 1 && pm < draft2) ? draft2 : pm;
+}
+
 // print statistics about the speculative decoding
 
 // [TAG_SPEC_PHASE_PROBE] Wall-clock accounting of one speculative decode step.
