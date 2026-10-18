@@ -14,7 +14,7 @@
 //                    [--zc-file <gguf shard>] [--zc-mib 1024]   (zc: [TAG_FN_L3_CPU_ZC] test 6, only on request)
 //   moe-bridge-probe --only pin [--pin-files a.gguf,b.gguf] [--pin-ladder 4,8,16,32] [--pin-hot-every 0]
 //                    [--alloc-full-mib N] [--alloc-borrow-mib N] [--alloc-vision-mib N] [--lock-mib 1024]
-//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat]
+//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat] [--pin-mapped 1]
 //                    [TAG_FN_L22_PIN] test 7, only on request: pinned file pages (moe-bridge-pin.cpp)
 //   moe-bridge-probe --selftest [--threads 8] [--experts 64] [--reps 4] [--quick]
 //                    [TAG_MOE_BRIDGE] the ggml bridge ops against the CPU MUL_MAT_ID chain (moe-bridge-selftest.cpp)
@@ -752,6 +752,7 @@ int main(int argc, char ** argv) {
         else if (a == "--pin-margin-mib") { pin.margin_mib = strtoull(next(), nullptr, 10); }
         else if (a == "--pin-floor-mib") { pin.floor_mib = strtoull(next(), nullptr, 10); }
         else if (a == "--no-repeat") { pin.repeat = false; }
+        else if (a == "--pin-mapped") { pin.mapped = atoi(next()) != 0; }
         else { printf("unknown argument %s\n", a.c_str()); return 1; }
     }
     if (pinned_mib < 64) {

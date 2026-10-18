@@ -18,6 +18,7 @@ struct pin_probe_args {
     size_t                   margin_mib = 8192;           // NON_LOCAL margin
     size_t                   floor_mib  = 6144;           // RAM floor
     bool                     repeat     = true;           // step 5: the ladder once more
+    bool                     mapped     = true;           // register with cudaHostRegisterMapped too (the server does with DMASHARE)
 };
 
 using pin_say_fn = void (*)(const char * fmt, ...);

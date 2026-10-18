@@ -242,6 +242,9 @@ using fn_luid_fn_t  = bool (*)(ggml_backend_dev_t, uint64_t *);
 using fn_reg_fn_t   = bool (*)(void *, size_t);
 using fn_unreg_fn_t = void (*)(void *);
 using fn_devptr_t   = void * (*)(const void *); // R-P14-5 (P7): cudaHostGetDevicePointer of a registered address
+using fn_regmap_t   = bool (*)(void *, size_t, void **); // R-P14-5 (P7): register Portable | ReadOnly | Mapped + device pointer
+using fn_oomfn_t    = bool (*)(size_t, void *);
+using fn_set_oom_t  = void (*)(fn_oomfn_t, void *);    // R-P7-2 (P7): ggml-cuda calls it once before failing an allocation
 
 std::atomic<uint64_t> g_default_luid{0};
 
@@ -355,6 +358,9 @@ struct fn_pin_state {
     fn_reg_fn_t   reg_fn   = nullptr;
     fn_unreg_fn_t unreg_fn = nullptr;
     fn_devptr_t   devptr   = nullptr;
+    fn_regmap_t   regmap   = nullptr; // set only with LLAMA_FN_L22_DMASHARE (P14 reads pinned pages by device address)
+    fn_set_oom_t  set_oom  = nullptr;
+    bool          oom_hooked = false;
     ggml_backend_dev_t dev = nullptr;
     uint64_t luid = 0;
 
@@ -558,6 +564,39 @@ bool fn_touch(fn_pin_state * st, const uint8_t * p, size_t n) {
     return true;
 }
 
+// ggml-cuda's allocation hook (R-P7-2): one unpin before a graph instantiate or a pool growth fails
+bool fn_cuda_oom(size_t need, void * ud) {
+    (void) ud;
+    return llama_fn_pin_on_oom(need);
+}
+
+// one registration; *dev = the device address when known (0 else)
+bool fn_register(fn_pin_state * st, void * p, size_t n, uint64_t * dev) {
+    *dev = 0;
+    void * d = nullptr;
+    const bool ok = st->regmap != nullptr ? st->regmap(p, n, &d) : st->reg_fn(p, n);
+    if (!ok) {
+        return false;
+    }
+    if (d == nullptr && st->devptr != nullptr) {
+        d = st->devptr(p);
+    }
+    *dev = (uint64_t) (uintptr_t) d;
+    // pins are active from here: ggml-cuda may ask for an unpin before it fails an allocation
+    if (!st->oom_hooked && st->set_oom != nullptr) {
+        st->set_oom(fn_cuda_oom, nullptr);
+        st->oom_hooked = true;
+    }
+    return true;
+}
+
+void fn_unhook_oom(fn_pin_state * st) {
+    if (st->oom_hooked && st->set_oom != nullptr) {
+        st->set_oom(nullptr, nullptr);
+        st->oom_hooked = false;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // the arena (spec 9)
 
@@ -663,7 +702,8 @@ void fn_arena_run(fn_pin_state * st) {
                 break;
             }
             // registered at once, before any byte is written (register before touch)
-            if (!st->reg_fn(p, sz)) {
+            uint64_t dev = 0;
+            if (!fn_register(st, p, sz, &dev)) {
                 st->n_refused.fetch_add(1);
                 fn_commit_free(p, sz);
                 fn_log("event=arena_stop chunk=%d reason=refused", u);
@@ -671,6 +711,7 @@ void fn_arena_run(fn_pin_state * st) {
             }
             st->chunks[u].first = p;
             st->reg.set_unit(u, p, sz);
+            st->reg.set_unit_dev(u, dev);
         }
         // the copies (outside the lock: an OOM hook meanwhile freezes registration and this chunk goes below):
         // direct I/O, else the mapped bytes
@@ -710,9 +751,6 @@ void fn_arena_run(fn_pin_state * st) {
         }
         (void) page;
         st->reg.fix_copies(u, (const uint8_t *) p);
-        if (st->devptr != nullptr) {
-            st->reg.set_unit_dev(u, (uint64_t) (uintptr_t) st->devptr(p));
-        }
         st->reg.activate(u);
         n_ok++;
         bytes_ok += sz;
@@ -777,7 +815,8 @@ bool fn_ranges_run(fn_pin_state * st) {
                 break;
             }
             const int64_t tr = fn_now_us();
-            const bool done = st->reg_fn((void *) r.p, r.n);
+            uint64_t dev = 0;
+            const bool done = fn_register(st, (void *) r.p, r.n, &dev);
             const int64_t dt = fn_now_us() - tr;
             if (!done) {
                 st->n_refused.fetch_add(1);
@@ -790,9 +829,7 @@ bool fn_ranges_run(fn_pin_state * st) {
                 st->frozen.store(true);
                 break;
             }
-            if (st->devptr != nullptr) {
-                st->reg.set_unit_dev(ri, (uint64_t) (uintptr_t) st->devptr(r.p));
-            }
+            st->reg.set_unit_dev(ri, dev);
             st->reg.activate(ri);
             st->gst[g].n_on++;
             n_ok++;
@@ -907,6 +944,9 @@ void fn_thread(fn_pin_state * st) {
             int n = 0;
             const int64_t t_end = fn_now_us() + 3000000;
             const uint64_t b = fn_unpin(st, [&](uint64_t) { return fn_now_us() > t_end; }, 200000, false, &n);
+            if (!st->reg.any_active()) {
+                fn_unhook_oom(st);
+            }
             fn_log("event=contexts_gone unpinned_gib=%.2f units=%d left=%d", fn_gib(b), n, st->reg.n_active_units());
             break;
         }
@@ -1026,6 +1066,11 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     st->reg_fn   = reg_fn;
     st->unreg_fn = unreg_fn;
     st->devptr   = (fn_devptr_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_host_dev_ptr");
+    st->set_oom  = (fn_set_oom_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_set_oom_hook");
+    // device addresses of pinned pages only for the decode DMA share (P14): the mapped flag is not needed by copies
+    if (llama_fn_l22_switch_on(llama_fn_env(*model, "LLAMA_FN_L22_DMASHARE"))) {
+        st->regmap = (fn_regmap_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_register_host_mapped");
+    }
     st->dev      = llama_moe_hot_device(*model);
     if (st->dev == nullptr && ggml_backend_reg_dev_count(creg) > 0) {
         st->dev = ggml_backend_reg_dev_get(creg, 0);
@@ -1371,6 +1416,7 @@ void llama_fn_pin_shutdown(const llama_model * model) {
             left++;
         }
     }
+    fn_unhook_oom(st);
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s) (%.2f GiB) unregistered before the model's mapping closes (%d forced)\n", __func__,
             n + left, fn_gib(b), left);
     // the state stays allocated (a late release or query sees no active range)

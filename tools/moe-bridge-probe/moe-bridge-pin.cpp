@@ -18,7 +18,7 @@
 //
 //   moe-bridge-probe --only pin [--pin-files a.gguf,b.gguf] [--pin-ladder 4,8,16,32] [--pin-hot-every 0]
 //                    [--alloc-full-mib N] [--alloc-borrow-mib N] [--alloc-vision-mib N] [--lock-mib 1024]
-//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat]
+//                    [--pin-margin-mib 8192] [--pin-floor-mib 6144] [--no-repeat] [--pin-mapped 1]
 
 #include "moe-bridge-pin.h"
 
@@ -320,6 +320,7 @@ struct reg_entry {
 };
 
 bool g_sticky = false; // a CUDA error other than out-of-memory: stop all device work
+bool g_mapped = true;  // cudaHostRegisterMapped with the server's flags (LLAMA_FN_L22_DMASHARE registers mapped)
 
 bool cuda_ok(cudaError_t e, const char * what) {
     if (e == cudaSuccess) {
@@ -336,7 +337,7 @@ bool cuda_ok(cudaError_t e, const char * what) {
 
 bool reg(const uint8_t * p, size_t n, double * ms) {
     const double t0 = now_s();
-    const cudaError_t e = cudaHostRegister((void *) p, n, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    const cudaError_t e = cudaHostRegister((void *) p, n, cudaHostRegisterPortable | cudaHostRegisterReadOnly | (g_mapped ? cudaHostRegisterMapped : 0));
     if (ms) {
         *ms = (now_s() - t0)*1e3;
     }
@@ -499,6 +500,7 @@ void trim(const uint8_t * p, size_t n) {
 
 int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say) {
     g_say = say;
+    g_mapped = a.mapped;
     SAY("\n== 7. [TAG_FN_L22_PIN] pinned file pages: registration ladder, allocation, lock and touched / untouched tests\n");
 #ifndef _WIN32
     (void) a;
@@ -514,8 +516,8 @@ int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say) {
     const bool dx = dxgi_open(luid);
     int ro = 0;
     cudaDeviceGetAttribute(&ro, cudaDevAttrHostRegisterReadOnlySupported, 0);
-    SAY("  device %s, LUID %016llx (node mask %u), DXGI adapter %s, read-only registration %d\n", prop.name, (unsigned long long) luid,
-            prop.luidDeviceNodeMask, dx ? "found" : "NOT FOUND", ro);
+    SAY("  device %s, LUID %016llx (node mask %u), DXGI adapter %s, read-only registration %d, flags portable|readonly%s\n", prop.name,
+            (unsigned long long) luid, prop.luidDeviceNodeMask, dx ? "found" : "NOT FOUND", ro, g_mapped ? "|mapped" : "");
 
     // 1. CPU only
     const meas m0 = measure();
@@ -811,8 +813,8 @@ int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say) {
     const char * verdict = fail || g_sticky ? "FAIL" : (locked_R && !unclear_R) ? "FILE_OK" : "FILE_UNLOCKED";
     const bool untouched_ok = locked_N && dma_N && spg_N <= std::max(1.0, 4.0*spg_T);
     const char * mode = strcmp(verdict, "FILE_OK") != 0 ? "-" : untouched_ok ? "untouched" : locked_T ? "touched" : "-";
-    SAY("\nverdict: %s mode=%s pinned_max_gib=%.2f nonlocal_budget_gib=%.2f nonlocal_usage_gib=%.2f local_budget_gib=%.2f local_usage_gib=%.2f "
-        "local_charge_mib_per_gib=%.1f untouched_s_per_gib=%.2f touched_s_per_gib=%.2f%s%s\n", verdict, mode, gib(pinned_max), gib(m0.nl_b),
+    SAY("\nverdict: %s mode=%s mapped=%d pinned_max_gib=%.2f nonlocal_budget_gib=%.2f nonlocal_usage_gib=%.2f local_budget_gib=%.2f local_usage_gib=%.2f "
+        "local_charge_mib_per_gib=%.1f untouched_s_per_gib=%.2f touched_s_per_gib=%.2f%s%s\n", verdict, mode, g_mapped ? 1 : 0, gib(pinned_max), gib(m0.nl_b),
             gib(m0.nl_u), gib(m0.l_b), gib(m0.l_u), charge_per_gib, spg_N, spg_T, fail ? " why=" : "", fail ? fail_why.c_str() : "");
     if (strcmp(verdict, "FILE_OK") == 0) {
         SAY("  server: LLAMA_FN_L22_PIN=%d (LLAMA_FN_L22_PIN_UNIT=ranges)\n", strcmp(mode, "untouched") == 0 ? 1 : 2);
