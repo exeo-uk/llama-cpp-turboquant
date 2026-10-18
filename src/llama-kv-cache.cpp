@@ -12,6 +12,8 @@
 #include "llama-kv-tier.h"
 #include "llama-kv-cache-resolve.h"   // [TAG_KV_RESOLVE] turbot refusals shared with the KV type resolver
 #include "llama-fn-auto.h"            // [TAG_FN_L8_KVLEND] llama_fn_l3_flag
+#include "llama-fn-l22.h"             // [TAG_FN_L22_KVGROW] pins on an out-of-memory grow
+#include "llama-fn-l22-img.h"         // [TAG_FN_L22_IMGPASS] predecessor rule, keyed masks
 
 #include "ggml-turbot.h"
 
@@ -20,6 +22,7 @@
 #include <emmintrin.h> // [TAG_FN_L7_MASK]
 #endif
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <atomic>
@@ -27,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 // InnerQ: cross-TU shared state. Defined in ggml-base (ggml-turbo-innerq.cpp)
@@ -222,6 +226,46 @@ bool kvl_map_to(uint32_t cells) {
     return true;
 }
 
+// [TAG_FN_L22_KVGROW] grow ks to `want` cells (`add` new bytes): with pins and low DXGI LOCAL headroom the pins go first;
+// then the hot set gives `extra`, then 512 MiB more per round while the map fails and it still gives more (it returns
+// the bytes it has out); then the pins once more and one last map. false: the map failed (what was mapped stays).
+bool kvl_grow_l22(kvl_state * ks, uint32_t want, size_t extra, size_t add) {
+    const size_t mib512 = (size_t) 512 << 20;
+    bool oom_called = false;
+    if (llama_fn_pin_active()) {
+        uint64_t budget = 0;
+        uint64_t usage  = 0;
+        if (llama_fn_dxgi_query(0, 0, &budget, &usage) && budget < usage + add + mib512) {
+            oom_called = true;
+            llama_fn_pin_on_oom(add);
+            kvl_cur = ks;
+        }
+    }
+    size_t out_prev = 0;
+    for (int k = 0; k < 64; ++k) {
+        size_t out = 0;
+        if (g_kvl.release) {
+            out = g_kvl.release(g_kvl.owner, extra + (size_t) k*mib512);
+            kvl_cur = ks;
+        }
+        if (kvl_map_to(want)) {
+            return true;
+        }
+        if (!g_kvl.release || (k > 0 && out <= out_prev)) {
+            break; // the hot set has nothing more to give
+        }
+        out_prev = out;
+    }
+    const bool freed = llama_fn_pin_on_oom(add); // no pins: false at once
+    kvl_cur = ks;
+    if (freed && kvl_map_to(want)) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_KVGROW] mapped after the pins gave way (%.0f MiB, first call %s)\n", __func__,
+                add/1048576.0, oom_called ? "before the grow" : "none");
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // the lend's buffer for ctx's tensors (nullptr: not possible here - the caller allocates as usual)
@@ -397,6 +441,18 @@ bool llama_kv_cache::kvl_update(uint32_t need) const {
             after += std::max(r.mapped, kvl_bytes_for(r, want));
         }
         const size_t extra = kvl_extra_total(ks, after); // [TAG_FN_L10_KVLEND2] both lends' bytes
+        if (fn_kvgrow) {
+            // [TAG_FN_L22_KVGROW] the hot set gives VRAM until the map works or it has nothing left; pins go before a fail
+            const size_t add = after > kvl_mapped_total() ? after - kvl_mapped_total() : 0;
+            if (!kvl_grow_l22(ks, want, extra, add)) {
+                LLAMA_LOG_ERROR("%s: [TAG_FN_L22_KVGROW] the KV cache needs %u cells and could map only %u\n", __func__, need, g_kvl.cells);
+                return need <= g_kvl.cells;
+            }
+            g_kvl.n_grow++;
+            LLAMA_LOG_INFO("%s: [TAG_FN_L8_KVLEND] %u cells mapped (%.0f MiB) in %.1f ms\n", __func__, g_kvl.cells,
+                    kvl_mapped_total()/1048576.0, (ggml_time_us() - t0)/1000.0);
+            return need <= g_kvl.cells;
+        }
         if (g_kvl.release) {
             g_kvl.release(g_kvl.owner, extra);
         }
@@ -493,6 +549,14 @@ llama_kv_cache::llama_kv_cache(
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    // [TAG_FN_L22_IMGPASS_MASK] [TAG_FN_L22_KVGROW] round 22 switches (unset: off, today's behaviour)
+    {
+        std::string m = llama_fn_env(model, "LLAMA_FN_L22_IMGPASS_MASK") ? llama_fn_env(model, "LLAMA_FN_L22_IMGPASS_MASK") : "";
+        std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char) tolower(c); });
+        fn_imgkeys = m == "auto" || m == "keys" || m == "1";
+        fn_kvgrow  = llama_fn_l22_switch_on(llama_fn_env(model, "LLAMA_FN_L22_KVGROW"));
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -2223,6 +2287,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 if (ubatch.token) {
                     ext.tok = ubatch.token[i];
+                } else if (ubatch.tok_aux && ubatch.tok_aux[i] != LLAMA_TOKEN_NULL) {
+                    ext.tok = ubatch.tok_aux[i]; // [TAG_FN_L22_IMGPASS] the row's token (text) or the media token (image)
                 } else if (hparams.ple_n_heads > 0) {
                     // embd batch (multimodal input) has no token ids, need to pad it with the correct ID for PLE layers
                     // TODO @ngxson : check if we can do the same as gemma 3n / gemma 4
@@ -3000,7 +3066,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 //
 // The one-row form describes ONE sequence and is what leaked context between slots when a multi-sequence ubatch
 // reached it ([TAG_FA_POS_MASK_SEQ], llama-graph.cpp). It now refuses such a ubatch outright.
-void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     int32_t * data = (int32_t *) dst->data;
@@ -3012,7 +3078,17 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
         return e != nullptr && atoi(e) != 0;
     }();
     const int64_t t_start = pos_probe ? ggml_time_us() : 0;
-    if (n_rows == 1) {
+    if (fn_keys) {
+        // [TAG_FN_L22_IMGPASS_MASK] an image ubatch: keys pos * 4096 + raster rank (the graph was built for them, so the
+        // plan holds: same cells, same ubatch)
+        GGML_ASSERT(n_rows == 1 && ubatch->n_seqs_unq == 1 && "kv_pos keys: one sequence");
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        std::vector<llama_fn_l22_imgkey_group> groups;
+        const int r = llama_fn_l22_imgkeys_plan(cells, *ubatch, groups);
+        GGML_ASSERT(r == LLAMA_FN_L22_IMGKEY_OK && "kv_pos keys: the plan changed after the graph build");
+        llama_fn_l22_imgkeys_kv(cells, seq_id, groups, data, n_kv);
+    } else if (n_rows == 1) {
         // [TAG_4C_POSMASK_MS] the leak guard: one row holds one sequence
         GGML_ASSERT(ubatch->n_seqs_unq == 1 && "kv_pos: a single-sequence positional mask for a multi-sequence ubatch");
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
@@ -3076,8 +3152,20 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
 // ubatch->pos, what llama-graph.cpp uploaded directly before), row 1 of a two-row dst the bit of each token's sequence
 // in the numbering of set_input_kv_pos. Like set_input_kq_mask, a token carrying several sequence ids is keyed on its
 // first one.
-void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == (int64_t) ubatch->n_tokens);
+    if (fn_keys) {
+        // [TAG_FN_L22_IMGPASS_MASK] the query keys that go with set_input_kv_pos's (one sequence, one row)
+        GGML_ASSERT(dst->ne[1] == 1 && ubatch->n_seqs_unq == 1 && "q_pos keys: one sequence");
+        const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+        std::vector<llama_fn_l22_imgkey_group> groups;
+        const int r = llama_fn_l22_imgkeys_plan(cells, *ubatch, groups);
+        GGML_ASSERT(r == LLAMA_FN_L22_IMGKEY_OK && "q_pos keys: the plan changed after the graph build");
+        std::vector<int32_t> keys(ubatch->n_tokens);
+        llama_fn_l22_imgkeys_q(*ubatch, groups, keys.data());
+        ggml_backend_tensor_set(dst, keys.data(), 0, ubatch->n_tokens*ggml_element_size(dst));
+        return;
+    }
     ggml_backend_tensor_set(dst, ubatch->pos, 0, ubatch->n_tokens*ggml_element_size(dst));
     if (dst->ne[1] == 1) {
         return;
@@ -3090,6 +3178,30 @@ void llama_kv_cache::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * uba
         bits[i] = (int32_t) (1u << b);
     }
     ggml_backend_tensor_set(dst, bits.data(), dst->nb[1], ubatch->n_tokens*ggml_element_size(dst));
+}
+
+// [TAG_FN_L22_IMGPASS_MASK] whether an embedding ubatch with 2-D positions can use keyed positional vectors; called at
+// graph build (after apply_ubatch) and by the graph's reuse check. A refusal keeps the explicit mask and is logged.
+bool llama_kv_cache::fn_imgkeys_ok(const llama_ubatch & ubatch) const {
+    if (!fn_imgkeys || ubatch.token != nullptr || !ubatch.is_pos_2d() || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+        return false;
+    }
+    const llama_seq_id s = ubatch.seq_id[0][0];
+    if (s < 0 || s >= (llama_seq_id) seq_to_stream.size()) {
+        return false;
+    }
+    std::vector<llama_fn_l22_imgkey_group> groups;
+    const int r = llama_fn_l22_imgkeys_plan(v_cells[seq_to_stream[s]], ubatch, groups);
+    if (r != LLAMA_FN_L22_IMGKEY_OK) {
+        static std::atomic<int64_t> n_refused{0};
+        const int64_t k = ++n_refused;
+        if (k <= 8 || k % 64 == 0) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_IMGPASS_MASK] image ubatch of %u rows keeps the explicit mask: %s (%lld so far)\n",
+                    __func__, ubatch.n_tokens, llama_fn_l22_imgkey_res_str(r), (long long) k);
+        }
+        return false;
+    }
+    return true;
 }
 
 // [TAG_FN_L7_MASK] row i of the [n_kv, n_tokens] mask: 0 where lo <= pos[j] <= qpos[i], -inf elsewhere (F16 or F32), with
@@ -3322,59 +3434,13 @@ bool llama_kv_cache::has_cell_ext() const {
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
-    const uint32_t n_tokens = ubatch.n_tokens;
-
-    res.clear();
-    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
-
-    if (n == 0) {
-        return;
-    }
-
     // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
     //       of this very ubatch as well, which is what we want
-    // the nearest cell at or before a position also resolves M-RoPE gaps, where multiple tokens
-    // share the same temporal pos
-
-    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
-    // do not encode the token order; resolve its predecessors by ubatch order instead
-    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
-    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
-
-    if (!ubatch.token) {
-        ord.resize(n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            auto & v = seq_idx[ubatch.seq_id[i][0]];
-            ord[i] = v.size();
-            v.push_back(i);
-        }
-    }
-
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        // TODO: a token that belongs to more than one sequence has an ambiguous history.
-        //       the n-gram architectures have to reject such batches
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-
-        for (uint32_t j = 0; j < n; ++j) {
-            const llama_pos d = (llama_pos) (n - j);
-
-            llama_pos p;
-            if (!ubatch.token) {
-                const auto & v = seq_idx[seq_id];
-                const int64_t k = (int64_t) ord[i] - d;
-                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
-                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
-            } else {
-                p = ubatch.pos[i] - d;
-            }
-
-            if (p < 0) {
-                continue;
-            }
-
-            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
-        }
-    }
+    // [TAG_FN_L22_IMGPASS] the body is in llama-fn-l22-img.h (the CPU test runs the same code); with tok_aux it adds the
+    // edge rule for a merged image turn whose ubatch starts inside an image (media token 0 = no rule)
+    const llama_token media = hparams.ple_image_token_id != 0 ? (llama_token) hparams.ple_image_token_id : LLAMA_TOKEN_NULL;
+    llama_fn_l22_prev_tokens(ubatch, n, media,
+            [this](llama_seq_id s) -> const llama_kv_cells & { return v_cells[seq_to_stream[s]]; }, res);
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -5103,18 +5169,22 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
-void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys) const {
     if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
         return;
     }
-    kv->set_input_kv_pos(dst, ubatch);
+    kv->set_input_kv_pos(dst, ubatch, fn_keys);
 }
 
-void llama_kv_cache_context::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache_context::set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys) const {
     if (dst == nullptr || dst->buffer == nullptr) { // [TAG_KV_NO_LAYERS]
         return;
     }
-    kv->set_input_q_pos(dst, ubatch);
+    kv->set_input_q_pos(dst, ubatch, fn_keys);
+}
+
+bool llama_kv_cache_context::fn_imgkeys_ok(const llama_ubatch & ubatch) const {
+    return kv != nullptr && kv->fn_imgkeys_ok(ubatch); // [TAG_FN_L22_IMGPASS_MASK]
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

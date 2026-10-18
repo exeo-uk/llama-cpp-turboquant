@@ -273,9 +273,16 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
-    void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
+    // [TAG_FN_L22_IMGPASS_MASK] fn_keys: keyed vectors (pos * 4096 + raster rank, llama-fn-l22-img.h) for an image ubatch
+    // that fn_imgkeys_ok() accepted when its graph was built
+    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
+    void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // [TAG_FN_L22_IMGPASS_MASK] LLAMA_FN_L22_IMGPASS_MASK=auto|keys: an embedding ubatch with 2-D positions may take the
+    // positional mask with keys; false = it keeps the explicit mask (switch off, or a fallback case, logged)
+    bool fn_imgkeys_on() const { return fn_imgkeys; }
+    bool fn_imgkeys_ok(const llama_ubatch & ubatch) const;
 
     //
     // TriAttention KV cache eviction
@@ -349,6 +356,10 @@ public:
 private:
     const llama_model & model;
     const llama_hparams & hparams;
+
+    // [TAG_FN_L22_IMGPASS_MASK] [TAG_FN_L22_KVGROW] round 22 switches, read once from the model's profile / environment
+    bool fn_imgkeys = false;
+    bool fn_kvgrow  = false;
 
     struct kv_layer {
         // layer index in the model
@@ -593,9 +604,12 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
-    void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
+    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_FA_POS_MASK] per-cell position, -1 if not visible
+    void set_input_q_pos     (ggml_tensor * dst, const llama_ubatch * ubatch, bool fn_keys = false) const;   // [TAG_4C_POSMASK_MS] query positions (+ sequence bits)
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // [TAG_FN_L22_IMGPASS_MASK] see llama_kv_cache
+    bool fn_imgkeys_ok(const llama_ubatch & ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

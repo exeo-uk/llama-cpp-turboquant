@@ -367,6 +367,8 @@ public:
     // [TAG_FA_POS_MASK] positional mask: set instead of self_kq_mask when the cache is plain causal, single stream
     ggml_tensor * self_kv_pos = nullptr; // I32 [n_kv]
     ggml_tensor * self_q_pos  = nullptr; // I32 [n_batch]
+    // [TAG_FN_L22_IMGPASS_MASK] the vectors carry keys (pos * 4096 + raster rank) for an image ubatch
+    bool fn_imgkeys = false;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
