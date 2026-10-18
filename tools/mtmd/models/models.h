@@ -48,6 +48,7 @@ struct clip_graph_qwen2vl : clip_graph {
 struct clip_graph_qwen3vl : clip_graph_qwen2vl {
     clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen2vl(ctx, img) {}
     ggml_cgraph * build() override;
+    ggml_cgraph * build_fn_l22_batch(); // [TAG_FN_L22_VLBATCH]
 };
 
 struct clip_graph_ling3vl : clip_graph_qwen3vl {

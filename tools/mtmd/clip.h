@@ -6,7 +6,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <functional>
 #include <map>
+#include <vector>
 
 // !!! Internal header, to be used by mtmd only !!!
 
@@ -155,6 +157,19 @@ bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 
 bool clip_support_batch(const struct clip_ctx * ctx);
+
+// [TAG_FN_L22_VLBATCH] round 22 (P2b): Qwen3-VL encodes a batch of independent still images of one size
+// (clip_image_f32_batch::fn_n_images > 1) as one graph, split into balanced groups when it needs more device compute
+// than this encode may use. enable: true for a Qwen3-VL vision context (changes nothing for others)
+bool    clip_fn_l22_enable_batch(struct clip_ctx * ctx);
+bool    clip_fn_l22_batch_on(const struct clip_ctx * ctx);
+int32_t clip_fn_l22_reserve_tokens(const struct clip_ctx * ctx); // output tokens of the warm-up picture (0: no warm-up)
+uint64_t clip_fn_l22_n_split(const struct clip_ctx * ctx);        // batches that ran as several groups
+// group sizes for n pictures: the largest k with fits(k) (1 always fits), as balanced groups
+std::vector<int> clip_fn_l22_split_plan(int n, const std::function<bool(int)> & fits);
+// device compute bytes of a k-image graph (cached per size); tests: a forced limit on any backend (0: off)
+size_t  clip_fn_l22_need_bytes(struct clip_ctx * ctx, int nx, int ny, int k);
+void    clip_fn_l22_set_test_limit(struct clip_ctx * ctx, size_t bytes);
 
 int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : remove, refactor this
 

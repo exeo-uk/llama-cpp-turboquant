@@ -859,11 +859,15 @@ static void clip_log_internal(enum ggml_log_level level, const char * format, ..
 struct clip_image_f32_batch {
     std::vector<clip_image_f32> entries;
     bool is_audio = false;
+    // [TAG_FN_L22_VLBATCH] 0/1: entries are the frames of one image (Qwen-VL video pair); > 1: that many independent
+    // still images of one size (Qwen3-VL batched encode). Not serialized
+    int32_t fn_n_images = 0;
 
     clip_image_f32_batch clone() const {
         clip_image_f32_batch new_batch{
-            /* entries  */ {},
-            /* is_audio */ is_audio,
+            /* entries     */ {},
+            /* is_audio    */ is_audio,
+            /* fn_n_images */ fn_n_images,
         };
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
