@@ -240,7 +240,9 @@ static void test_stubs() {
            "pin_query: one unpinned segment");
     TCHECK(!llama_fn_pin_active() && !llama_fn_pin_on_oom(1 << 20) && !llama_fn_pin_on_oom_ext(nullptr, 1 << 20), "no pins");
     uint64_t b = 1, u = 1;
-    TCHECK(!llama_fn_dxgi_query(0, 1, &b, &u) && b == 0 && u == 0, "dxgi stub");
+    // P6 made the helper real: false (no CUDA device visible) leaves both 0, true gives a budget
+    const bool dx = llama_fn_dxgi_query(0, 1, &b, &u);
+    TCHECK(dx ? b > 0 : (b == 0 && u == 0), "dxgi query: outputs zeroed on false");
     TCHECK(llama_fn_res_class(nullptr, 0, 0) == LLAMA_FN_RES_RAM && llama_fn_res_gen(nullptr) == 0 &&
            llama_fn_res_stream_bytes(nullptr, LLAMA_FN_RES_SSD) == 0, "residency stub");
     llama_fn_dio_req rq = { buf, sizeof(buf), buf };
