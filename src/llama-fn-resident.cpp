@@ -958,6 +958,23 @@ bool llama_fn_p5_ready(const llama_model & model) {
             resset ? 1 : 0, rewarm ? 1 : 0, ssd, pin ? 1 : 0);
     // the pin planner starts (its own thread): it marks its experts PIN, the warm pass skips them
     llama_fn_pin_on_ready(&model);
+    // R-P6-3: with pins planned (PIN-marked experts, or pins already active) the warm, SSD and re-warm floors stay at least
+    // LLAMA_FN_L22_PIN_FLOOR_MIB + 1 GiB of available RAM: the pin valve unpins below its floor and never registers again
+    if (pin) {
+        bool marked = llama_fn_pin_active();
+        for (size_t li = 0; li < t->L.size() && !marked; ++li) {
+            for (int e = 0; e < t->L[li].n_exp && !marked; ++e) {
+                marked = (t->L[li].fl[e].load() & F_PIN) != 0;
+            }
+        }
+        if (marked) {
+            const size_t pf = ((size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L22_PIN_FLOOR_MIB", 6144)) << 20) + GIB;
+            t->floor_b      = std::max(t->floor_b, pf);
+            t->rewarm_floor = std::max(t->rewarm_floor, pf);
+            LLAMA_LOG_INFO("%s: [TAG_FN_L22_RESSET] pins planned: warm / SSD floor %.1f GiB, re-warm floor %.1f GiB\n", __func__,
+                    t->floor_b/1073741824.0, t->rewarm_floor/1073741824.0);
+        }
+    }
     if (resset) {
         res_ssd_plan(t, 0); // the table-driven warm pass then skips the SSD experts (the old pass reads everything)
     }
@@ -972,6 +989,11 @@ bool llama_fn_p5_ready(const llama_model & model) {
 bool llama_fn_p5_resset(const llama_model & model) {
     res_ref r(&model);
     return r.t != nullptr && r.t->resset;
+}
+
+size_t llama_fn_p5_floor(const llama_model & model) {
+    res_ref r(&model);
+    return r.t != nullptr ? r.t->floor_b : 0;
 }
 
 std::vector<llama_fn_p5_piece> llama_fn_p5_warm_list(const llama_model & model, size_t max_bytes, std::vector<size_t> & layer_end,

@@ -707,7 +707,8 @@ static void fn_warm(const llama_model & model, HANDLE stop) {
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     GlobalMemoryStatusEx(&ms);
-    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
+    const size_t keep   = std::max((size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20,
+                                   llama_fn_p5_floor(model)); // R-P6-3: higher while pins are planned
     const size_t budget = (size_t) ms.ullAvailPhys > keep ? (size_t) ms.ullAvailPhys - keep : 0;
     size_t n_use = 0;
     size_t bytes = 0;
@@ -808,7 +809,8 @@ static size_t fn_warm_l22(const llama_model & model, HANDLE stop, double * secs_
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     GlobalMemoryStatusEx(&ms);
-    const size_t keep   = (size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20;
+    const size_t keep   = std::max((size_t) std::max(0, llama_fn_l3_int(model, "LLAMA_FN_L15_WARM_FREE_MIB", 4096)) << 20,
+                                   llama_fn_p5_floor(model)); // R-P6-3: higher while pins are planned
     const size_t budget = (size_t) ms.ullAvailPhys > keep + pin_pending ? (size_t) ms.ullAvailPhys - keep - pin_pending : 0;
     PROCESS_MEMORY_COUNTERS pm0 = {};
     GetProcessMemoryInfo(GetCurrentProcess(), &pm0, sizeof(pm0));

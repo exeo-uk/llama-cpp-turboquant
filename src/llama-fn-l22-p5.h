@@ -33,6 +33,10 @@ bool llama_fn_p5_ready(const llama_model & model);
 // the table drives the warm pass (RESSET)
 bool llama_fn_p5_resset(const llama_model & model);
 
+// the warm pass's floor of available RAM (LLAMA_FN_L15_WARM_FREE_MIB, raised to LLAMA_FN_L22_PIN_FLOOR_MIB + 1 GiB while
+// pins are planned, R-P6-3); 0 when no table
+size_t llama_fn_p5_floor(const llama_model & model);
+
 // one warm piece: experts [e0, e1) of part `part` (0 up, 1 gate, 2 down) of layer il; [p, p + n) their bytes
 struct llama_fn_p5_piece {
     int          il;
