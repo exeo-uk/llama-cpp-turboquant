@@ -382,22 +382,25 @@ static void turbo_probe_gdn(const ggml_tensor * dst, bool chunked, bool mma = fa
     fflush(stderr);
 }
 
-// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_CHUNK=0 keeps chunk-eligible K == 1 ops (27B prefill prefix) on the #26001
-// chunked kernels (the old path); otherwise the one-kernel MMA chunked GDN (gated-delta-net-mma.cu) runs them
+// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_CHUNK=1 runs chunk-eligible K == 1 ops (27B prefill prefix) on the one-kernel MMA
+// chunked GDN (gated-delta-net-mma.cu); unset or 0 keeps the #26001 chunked kernels (the old path, 27B bit-identical).
+// [TAG_FN_L22_GDNMMA] off unless set (round 22): numbers move (kld class), so only a profile or the test turns it on.
 static bool ggml_cuda_gdn_mma_chunk_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_GDN_MMA_CHUNK");
-        return !(e && e[0] == '0' && e[1] == '\0');
+        return e != nullptr && atoi(e) != 0;
     }();
     return enabled;
 }
 
-// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_SNAP=0 keeps long K > 1 snapshot ops (Flash-Next prefill) on the sequential
-// kernel (the old path); otherwise the MMA kernel runs all tokens but the last K - 1 and the sequential kernel the rest
+// [TAG_UPSTREAM_29353] GGML_CUDA_GDN_MMA_SNAP=1 runs long K > 1 snapshot ops (Flash-Next prefill) as the MMA kernel over all
+// tokens but the last K - 1 and the sequential kernel over the rest; unset or 0 keeps the sequential kernel (old path).
+// The qwen4exp profile exports 1. Upstream (merged dde6a4d93) only guarantees slot 0 when n_tokens > K; this split
+// writes slot K - 1 from the MMA state and slots K - 2 .. 0 from the tail, so the snapshot rollback keeps all K slots.
 static bool ggml_cuda_gdn_mma_snap_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_GDN_MMA_SNAP");
-        return !(e && e[0] == '0' && e[1] == '\0');
+        return e != nullptr && atoi(e) != 0;
     }();
     return enabled;
 }
