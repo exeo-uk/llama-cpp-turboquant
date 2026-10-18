@@ -175,6 +175,11 @@ extern "C" {
         const float   * w;                   // [n_used, n_tokens] or NULL
         float         * out;                 // w != NULL: [n_embd, n_tokens] = sum over the computed slots, in slot order, of w * expert(x)
                                              // w == NULL: [n_embd, n_used, n_tokens], rows of slots not computed here zeroed
+        // [TAG_FN_L22_X_TAILSKIP] [TAG_FN_L22_X_DEFER] round 22 opt-in rules (P8 / P11); all zero = today's job
+        int8_t          tail_rank;           // 0, or skip a cold expert whose best rank in the job is >= tail_rank
+        float           tail_w;              // 0, or skip a cold expert whose largest weight in the job is < tail_w
+        float           defer_w;             // 0, or the light-expert weight bound of a deferred job
+        uint32_t        l22_flags;           // GGML_MOE_BRIDGE_JOB_TAIL / _DEFER bits of the job
     };
 
     struct ggml_cpu_moe_pool_params {

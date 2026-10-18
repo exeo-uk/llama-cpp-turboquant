@@ -342,6 +342,29 @@ target_include_directories(test-ple-dio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../s
 # lookup and environment handling, expert placement detection, VRAM fit and RAM fit plans. CPU only, no model.
 llama_build_and_test(test-fn-auto.cpp)
 
+# [TAG_FN_L22] round 22 scaffold (src/llama-fn-l22.h): the tok_aux side channel through common_batch, the decode-phase
+# rule and the X lever bits, the sync op's flags, the stubs. CPU only, no model.
+llama_build_and_test(test-fn-l22-batch.cpp)
+
+# [TAG_FN_L22_IMGPASS_MASK] round 22 P1: keyed positional masks and the PLE predecessor rule. CPU only, no model.
+llama_build_and_test(test-fn-l22-mask.cpp)
+
+# [TAG_FN_L22] round 22 package tests (requests R-P11-1, R-P12-3, R-P13-3, R-P14-6, R-P15-2, R-D5-2, P5, P6 R5, P8, P9 R2):
+# every tests/test-fn-l22-*.cpp besides the two above, and tests/test-fn-pin.cpp, is built and registered, CPU only, no
+# model; a package adds its file, no CMake edit. They may call the CPU backend directly (static backends only).
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    file(GLOB LLAMA_FN_L22_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test-fn-l22-*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/test-fn-pin.cpp)
+    list(SORT LLAMA_FN_L22_TESTS)
+    foreach (l22_src ${LLAMA_FN_L22_TESTS})
+        get_filename_component(l22_name ${l22_src} NAME)
+        if (NOT l22_name STREQUAL "test-fn-l22-batch.cpp" AND NOT l22_name STREQUAL "test-fn-l22-mask.cpp")
+            llama_build_and_test(${l22_name})
+            get_filename_component(l22_target ${l22_src} NAME_WE)
+            target_include_directories(${l22_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        endif()
+    endforeach()
+endif()
+
 # [TAG_FN_L19_CONVSTORE] the policy of the agent conversation store (tools/server/server-convstore.h, header only): the
 # checkpoint a full ring drops, the eviction value of a stored conversation, the thinning on disk. CPU only, no model.
 llama_build_and_test(test-fn-convstore.cpp)

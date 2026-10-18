@@ -1,6 +1,7 @@
 // [TAG_FN_AUTO] automatic qwen4exp (Flash-Next) defaults behind LLAMA_FLASHNEXT_PROFILE. See llama-fn-auto.h.
 
 #include "llama-fn-auto.h"
+#include "llama-fn-l22.h" // [TAG_FN_L22_PASSLOG]
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -254,7 +255,104 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L20_BIGPROMPT_UB",      "16384",  P_ALL }, // [TAG_FN_L20_BIGPROMPT_UB] prompts wider than the command's -ub run in 16384-token ubatches (FULL16)
     // [TAG_FN_L21_BIGUB] round 21: the 16K ubatches only for prompts above 16K, the tail sized for 8K FULL (start-up layout and KV slot lend as without them), the extra from the borrow slots - the test stage decides by KLD + needles + the first answer after a start
     { "LLAMA_FN_L21_BIGUB",             "1",      P_ALL }, // [TAG_FN_L21_BIGUB]
+    // [TAG_FN_L22] round 22 (E:/turbot-gates/flashnext/test/r22/PLAN.md section 6): the build defaults of the test's NEW
+    // arm, one row per switch (package, tag). Code default of every new switch = off; the answer-changing X levers, PIN,
+    // DMASHARE and CPUSHARE stay 0 here (owner calls). No row: LLAMA_FN_L22_LOGITDUMP (unset) and _PIN_MAX_MIB (no value).
+    { "LLAMA_FN_L22_PASSLOG",               "1",       P_ALL }, // P0 [TAG_FN_L22_PASSLOG] per-pass / switch / residency / pin / media / turn lines (0/1/2)
+    { "LLAMA_FN_L22_IMGPASS",               "1",       P_ALL }, // P1 P3 [TAG_FN_L22_IMGPASS] one prompt pass per image turn
+    { "LLAMA_FN_L22_IMGPASS_MASK",          "auto",    P_ALL }, // P1 [TAG_FN_L22_IMGPASS_MASK] auto = keys | keys | explicit
+    { "LLAMA_FN_L22_IMGPASS_MASK_MIB",      "1024",    P_ALL }, // P3 the merged rows' cap in explicit-mask mode
+    { "LLAMA_FN_L22_SAMPSTATIC",            "1",       P_ALL }, // P1 P4 [TAG_FN_L22_SAMPSTATIC] E7 (#30223)
+    { "LLAMA_FN_L22_KVGROW",                "1",       P_ALL }, // P1 [TAG_FN_L22_KVGROW] F6 + OOM hook
+    { "LLAMA_FN_L22_VLEND_HOLD",            "1",       P_ALL }, // P2 P3 [TAG_FN_L22_VLEND_HOLD] C1 one lend per turn
+    { "LLAMA_FN_L22_VLEND_SIZE",            "1",       P_ALL }, // P2 [TAG_FN_L22_VLEND_SIZE] C8
+    { "LLAMA_FN_L22_IMGCACHE",              "24",      P_ALL }, // P2 [TAG_FN_L22_IMGCACHE] C4 entries (0 off)
+    { "LLAMA_FN_L22_IMGDEC_THREADS",        "4",       P_ALL }, // P2 [TAG_FN_L22_IMGDEC] C5
+    { "LLAMA_FN_L22_IMG_MAXROWS",           "0",       P_ALL }, // P2 [TAG_FN_L22_IMG_MAXROWS] C10 changes answers: owner
+    { "LLAMA_FN_L22_TOKCACHE",              "1",       P_ALL }, // P2 [TAG_FN_L22_TOKCACHE] E11
+    { "LLAMA_FN_L22_TOKCACHE_VERIFY",       "1",       P_ALL }, // P2
+    { "LLAMA_FN_L22_JSONFLOAT",             "1",       P_ALL }, // P2 [TAG_FN_L22_JSONFLOAT] E8 towards the reference
+    { "LLAMA_FN_L22_VLRESIZE",              "0",       P_ALL }, // P2 F7 until an OCR A/B
+    { "LLAMA_FN_L22_VLBATCH",               "0",       P_ALL }, // P2b until its encoder KLD
+    { "LLAMA_FN_L22_MTP_KEEP",              "1",       P_ALL }, // P3 [TAG_FN_L22_MTP_KEEP] C0
+    { "LLAMA_FN_L22_MEDIA_ANCHOR",          "1",       P_ALL }, // P3 [TAG_FN_L22_MEDIA_ANCHOR] C3
+    { "LLAMA_FN_L22_CKPT_KEEP",             "1",       P_ALL }, // P3 [TAG_FN_L22_CKPT_KEEP] A5
+    { "LLAMA_FN_L22_CKPT_SPLIT",            "1",       P_ALL }, // P3 [TAG_FN_L22_CKPT_SPLIT] X1 (kld, grid)
+    { "LLAMA_FN_L22_LENDCLASS",             "1",       P_ALL }, // P4 [TAG_FN_L22_LENDCLASS] width classes
+    { "LLAMA_FN_L22_REFILL",                "1",       P_ALL }, // P4 [TAG_FN_L22_REFILL]
+    { "LLAMA_FN_L22_READAHEAD",             "1",       P_ALL }, // P4 [TAG_FN_L22_READAHEAD]
+    { "LLAMA_FN_L22_KEEPLEND",              "1",       P_ALL }, // P3 P4 [TAG_FN_L22_KEEPLEND] placement
+    { "LLAMA_FN_L22_ENDOVERLAP",            "1",       P_ALL }, // P4 [TAG_FN_L22_ENDOVERLAP] placement
+    { "LLAMA_FN_L22_GRAPHKEY",              "1",       P_ALL }, // P4 P7 [TAG_FN_L22_GRAPHKEY] G4
+    { "LLAMA_FN_L22_SCHEDBUF",              "1",       P_ALL }, // P4 P7 [TAG_FN_L22_SCHEDBUF] M1
+    { "GGML_SCHED_FN_L22_SPLITS",           "4096",    P_ALL }, // P7 (getenv in ggml)
+    { "LLAMA_FN_L22_RESSET",                "1",       P_ALL }, // P5 [TAG_FN_L22_RESSET] M2 resident set
+    { "LLAMA_FN_L22_REWARM",                "1",       P_ALL }, // P5 [TAG_FN_L22_REWARM] N2 idle re-warm
+    { "LLAMA_FN_L22_SSDTIER",               "2",       P_ALL }, // P4 P5 [TAG_FN_L22_SSDTIER] (0/1/2)
+    { "LLAMA_FN_L22_SSDTIER_IO",            "8",       P_ALL }, // P5 I/O threads
+    { "LLAMA_FN_L22_PIN",                   "0",       P_ALL }, // P4 P6 [TAG_FN_L22_PIN] GPU-fault class: the pin block sets 1; owner
+    { "LLAMA_FN_L22_PIN_UNIT",              "ranges",  P_ALL }, // P6
+    { "LLAMA_FN_L22_PIN_MARGIN_MIB",        "8192",    P_ALL }, // P6 NON_LOCAL margin
+    { "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB",  "1024",    P_ALL }, // P6 LOCAL margin
+    { "LLAMA_FN_L22_PIN_FLOOR_MIB",         "6144",    P_ALL }, // P6
+    { "LLAMA_FN_L22_PIN_ARENA_MIB",         "16384",   P_ALL }, // P6 anonymous fallback
+    { "GGML_CUDA_FN_L22_GRAPHKEEP",         "1",       P_ALL }, // P7 [TAG_FN_L22_GRAPHKEEP] G1
+    { "GGML_CUDA_FN_L22_GRAPH_CAP",         "512,64",  P_ALL }, // P7
+    { "GGML_CUDA_FN_L22_GRAPH_MAXROWS",     "128",     P_ALL }, // P7
+    { "GGML_CUDA_FN_L22_GRAPH2",            "1",       P_ALL }, // P7 [TAG_FN_L22_GRAPH2] G2
+    { "GGML_CUDA_FN_L22_GRAPHDIAG",         "0",       P_ALL }, // P7 log
+    { "GGML_CUDA_FN_L22_SKCAP",             "1",       P_ALL }, // P7 [TAG_FN_L22_SKCAP]
+    { "GGML_CUDA_FN_L22_MMQ_Y8",            "1",       P_ALL }, // P7 [TAG_FN_L22_MMQ_Y8] E4 (#30493)
+    { "GGML_CUDA_FN_L22_GLUQ8",             "1",       P_ALL }, // P7 [TAG_FN_L22_GLUQ8] E5 (#30489)
+    { "GGML_CUDA_MMQ_GLU_FUSION",           "1",       P_ALL }, // P7 #29948 mode 1
+    { "GGML_CUDA_FN_L22_MMVQ_R1",           "0",       P_ALL }, // P7 by bench
+    { "GGML_CUDA_GDN_MMA_SNAP",             "1",       P_ALL }, // P7 #29353 (kld)
+    { "GGML_CUDA_GDN_MMA_CHUNK",            "0",       P_ALL }, // P7 #29353 chunked prefill
+    { "LLAMA_MOE_POOL_STAGGER",             "0",       P_BR  }, // P8 [TAG_FN_L22_POOL_STAGGER] by stall A/B
+    { "LLAMA_MOE_POOL_PRETOUCH",            "0",       P_BR  }, // P8 [TAG_FN_L22_PRETOUCH] by stall A/B
+    { "LLAMA_MOE_POOL_JOBPF",               "1",       P_BR  }, // P8 [TAG_FN_L22_JOBPF]
+    { "LLAMA_FN_L22_X_STATS",               "0",       P_ALL }, // P8 [TAG_FN_L22_X_STATS] (1 in T5)
+    { "LLAMA_FN_L22_X_TAILSKIP",            "0",       P_ALL }, // P0 P8 [TAG_FN_L22_X_TAILSKIP] changes answers: owner
+    { "LLAMA_FN_L22_X_TAILSKIP_W",          "0",       P_ALL }, // P8
+    { "LLAMA_FN_L22_X_TAILSKIP_MULTI",      "0",       P_ALL }, // P0
+    { "LLAMA_FN_L22_X_TAILSKIP_PF",         "0",       P_ALL }, // P8
+    { "LLAMA_FN_L22_ONEPROMPT",             "1",       P_ALL }, // P9 [TAG_FN_L22_ONEPROMPT] D1
+    { "LLAMA_FN_L22_GENSHARE2",             "1",       P_ALL }, // P9 [TAG_FN_L22_GENSHARE2] D2
+    { "LLAMA_FN_L22_PAUSE",                 "1",       P_ALL }, // P9 [TAG_FN_L22_PAUSE] D10
+    { "LLAMA_FN_L22_PAUSE_TOKENS",          "2048",    P_ALL }, // P9
+    { "LLAMA_FN_L22_PAUSE_S",               "8",       P_ALL }, // P9
+    { "LLAMA_FN_L22_SHAREKV",               "1",       P_ALL }, // P9 [TAG_FN_L22_SHAREKV] D9
+    { "LLAMA_FN_L22_DRAFT2",                "0",       P_ALL }, // P9 [TAG_FN_L22_DRAFT2] D7 by A/B
+    { "LLAMA_FN_L22_STAGERS",               "auto",    P_ALL }, // P10 [TAG_FN_L22_STAGERS] M7
+    { "LLAMA_FN_L22_XOVER",                 "1",       P_ALL }, // P10 [TAG_FN_L22_XOVER] placement
+    { "LLAMA_FN_L22_UBPLAN",                "1",       P_ALL }, // P10 [TAG_FN_L22_UBPLAN] M9 (kld)
+    { "LLAMA_FN_L22_BIGUB2",                "1",       P_ALL }, // P10 [TAG_FN_L22_BIGUB2] D3 (kld)
+    { "LLAMA_FN_L22_SMALLKEEP",             "1",       P_ALL }, // P10 [TAG_FN_L22_SMALLKEEP] G3
+    { "LLAMA_FN_L22_X_DEFER",               "0",       P_ALL }, // P11 [TAG_FN_L22_X_DEFER] changes answers: owner
+    { "LLAMA_FN_L22_X_DEFER_W",             "0.1",     P_ALL }, // P11
+    { "LLAMA_FN_L22_X_DEFER_R",             "7",       P_ALL }, // P11
+    { "LLAMA_KV_ROWS",                      "0",       P_ALL }, // P13 [TAG_UPSTREAM_29510] not for qwen4exp (the 27B launcher sets it)
+    { "LLAMA_FN_L22_QSA_SEQPOOLS",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SEQPOOLS] D12
+    { "LLAMA_FN_L22_QSA_SHAREPFX",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SHAREPFX] R-P13-4 (exact)
+    { "LLAMA_FN_L22_TBO",                   "1",       P_ALL }, // D5 [TAG_FN_L22_TBO] R-D5-1 two-chain decode (kld; 2 active sequences only)
+    { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
+    { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
+    { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner
+    { "LLAMA_FN_L22_X_PRIOR_STATS",         "raw",     P_ALL }, // P12
+    { "LLAMA_FN_L22_X_RESIDENT",            "0",       P_ALL }, // P12 changes answers: owner
+    { "LLAMA_FN_L22_CPUSHARE",              "0",       P_ALL }, // P16 [TAG_FN_L22_CPUSHARE] M11, the pin block sets 1; owner
+    { "LLAMA_FN_L22_CPUSHARE_MAX",          "3072",    P_ALL }, // P16
+    { "LLAMA_FN_L22_CPUSHARE_ROWS",         "8",       P_ALL }, // P16
 };
+
+} // namespace
+
+// [TAG_FN_L22_XOVER] P10 R1 (src/llama-fn-l22.h). P0 stub: 0, the PHOT rule reads GGML_OP_OFFLOAD_MIN_BATCH as before
+int32_t llama_fn_l22_offload_min(void) {
+    return 0;
+}
+
+namespace {
 
 // names the fn-auto aware code reads through llama_fn_env(): never put into the environment
 // [TAG_FN_SHIP1] LLAMA_PLE_DIO_FILE as well: qwen4exp's loader tells the profile's default copy from the user's path
@@ -976,11 +1074,15 @@ void llama_fn_auto_after_load(llama_model & model) {
     }
     LLAMA_LOG_INFO("fn-auto: %d of %d trunk layers run their routed experts from the host with the router on a device%s\n",
             n, st->n_layer, st->mtp_loaded ? "; the MTP block is loaded" : "");
+    llama_fn_l22_passlog_model(&model, true); // [TAG_FN_L22_PASSLOG] the profile's level
 }
 
 void llama_fn_auto_on_free(llama_model & model) {
     llama_fn_l3_host_on_free(model); // [TAG_FN_L3_HOST_QOS] [TAG_FN_L3_HOST_POKE] no-op for a model on_load skipped
     if (model.fn_auto) {
+        if (model.fn_auto->active) {
+            llama_fn_l22_passlog_model(&model, false); // [TAG_FN_L22_PASSLOG]
+        }
         llama_fn_state_undo(*model.fn_auto);
         model.fn_auto->active = false;
     }

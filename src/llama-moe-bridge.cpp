@@ -1,4 +1,5 @@
 #include "llama-moe-bridge.h"
+#include "llama-fn-l22.h" // [TAG_FN_L22_DMASHARE] round 22 hooks
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -253,6 +254,7 @@ struct llama_moe_bridge {
     bool    stats      = false;
     int     max_fetch  = 0;     // [TAG_FN_R4_BRIDGE_DMA] experts per fetch the device side was made for (0: no fetch)
     bool    dma_on     = false; // [TAG_FN_R4_BRIDGE_DMA] the ring is registered: graphs may fetch
+    bool    l22_dmashare = false; // [TAG_FN_L22_DMASHARE] P14 plans the fetches from pinned pages (no gen5 ring)
 
     struct chan {
         int il = -1;
@@ -445,7 +447,31 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         // [TAG_FN_R4_BRIDGE_DMA] the graph fetches a share of this job: plan it (ring-ready cold experts), publish the plan
         // for the device (mapped memory, no CUDA call), then the CPU skips the hot experts and the fetched ones. The plan
         // is published even when it fetches nothing, so the device's fetch never waits for nothing.
-        if ((j->flags & GGML_MOE_BRIDGE_JOB_DMA) && j->plan) {
+        if ((j->flags & GGML_MOE_BRIDGE_JOB_DMA) && j->plan && br->l22_dmashare && !c.dma) {
+            // [TAG_FN_L22_DMASHARE] P14 plans the job from pinned pages: the plan area and the skip table (hot experts
+            // marked here), then the plan is published as below. Stub: never reached (no l22_dmashare)
+            const int64_t n_exp = c.up->ne[2];
+            if (c.skip.size() != (size_t) n_exp) {
+                c.skip.assign(n_exp, 0);
+            }
+            if (layer->table) {
+                for (int64_t e = 0; e < n_exp; ++e) {
+                    c.skip[e] = layer->table[e] != layer->table_miss ? 1 : 0;
+                }
+            } else {
+                std::fill(c.skip.begin(), c.skip.end(), 0);
+            }
+            llama_fn_dmashare_job jv = { br, j, j->chan, c.il, c.layer.up, c.layer.gate, c.layer.down, layer->table,
+                                         layer->table_miss, std::min(br->max_fetch, GGML_MOE_BRIDGE_MAX_FETCH) };
+            if (!llama_fn_dmashare_plan(&jv, c.skip.data())) {
+                return false;
+            }
+            br->fn_publish_plan(br->gb, j);
+            c.layer_dma            = c.layer;
+            c.layer_dma.table      = c.skip.data();
+            c.layer_dma.table_miss = 0;
+            layer = &c.layer_dma;
+        } else if ((j->flags & GGML_MOE_BRIDGE_JOB_DMA) && j->plan) {
             if (!c.dma || !br->dma_on || j->n_used*j->n_tokens > br->max_t*br->n_used) {
                 return false; // the graph asked for a fetch this bridge cannot plan: fail the job (and with it the ubatch)
             }
@@ -538,6 +564,9 @@ static bool br_run(const ggml_moe_bridge_job * j, void * ud) {
         c.job_fetch = (j->flags & GGML_MOE_BRIDGE_JOB_DMA) && j->plan;
         std::atomic_thread_fence(std::memory_order_release);
         c.job_seq   = j->seq;
+        if (br->l22_dmashare) {
+            llama_fn_dmashare_job_done(br, j->chan, j->seq, (uint64_t) ns, n_cpu); // [TAG_FN_L22_DMASHARE] R-P14-3 (a)
+        }
     }
     return ok;
 }
@@ -748,6 +777,9 @@ static void br_destroy(llama_moe_bridge * br) {
         br->cv.notify_all();
         br->exec.join();
     }
+    if (br->l22_dmashare) {
+        llama_fn_dmashare_free(br); // [TAG_FN_L22_DMASHARE] R-P14-3 (c): no plan runs any more
+    }
     if (br->gb) { // waits for host function nodes still queued (hostfunc mode) before their pool goes
         br->fn_free(br->gb);
         br->gb = nullptr;
@@ -788,7 +820,8 @@ bool llama_moe_bridge_wanted(const llama_model & model) {
     return false;
 }
 
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap, int seq_t_cap) {
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap, int seq_t_cap, int n_chains) {
+    (void) n_chains; // [TAG_FN_L22_TBO] R-D5-3: P0 stub, one chain (D5 adds the second)
     if (env_int("LLAMA_MOE_BRIDGE", 0) <= 0) {
         return nullptr;
     }
@@ -1070,6 +1103,12 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
             LLAMA_LOG_WARN("%s: LLAMA_MOE_BRIDGE_DMA needs LLAMA_MOE_BRIDGE_WAIT=spin: no DMA share in the bridged graphs\n", __func__);
         }
     }
+    // [TAG_FN_L22_DMASHARE] P14: the decode DMA share from pinned pages also needs the fetch side (spin mode). Stub: never
+    if (br->max_fetch == 0 && br->mode == GGML_MOE_BRIDGE_WAIT_SPIN && br->fn_set_ring && br->fn_publish_plan &&
+            br->fn_chan_times && llama_fn_dmashare_wanted(&model, br)) {
+        br->l22_dmashare = true;
+        br->max_fetch    = std::min(GGML_MOE_BRIDGE_MAX_FETCH, std::max(1, llama_fn_l3_int(model, "LLAMA_FN_L22_DMASHARE_SLOTS", 4)));
+    }
     bp.max_fetch = br->max_fetch;
     // [TAG_FN_L3_CPU_DEVPRED] hints need the next-layer prefetch (spin mode) and a device side that reads them back
     if (br->hint_k > 0) {
@@ -1087,6 +1126,11 @@ llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_thre
         return give_up("the device could not create the bridge");
     }
     br->bid = br->fn_id(br->gb);
+    if (br->l22_dmashare) {
+        br->dma_on = true; // [TAG_FN_L22_DMASHARE] graphs may fetch (P14's banks, llama_fn_dmashare_view)
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_DMASHARE] decode DMA share from pinned pages: fetch <= %d experts per job\n", __func__,
+                br->max_fetch);
+    }
     // [TAG_FN_L14_PROBE] diagnostics only: the clocks are aligned once, and the stamps never change a value
     if (llama_fn_l3_flag(model, "LLAMA_FN_L14_PROBE") && br->fn_chan_times && br->fn_clock_off) {
         br->probe    = br->fn_clock_off(br->gb, &br->probe_off);
@@ -1321,6 +1365,9 @@ bool llama_moe_bridge_attach_dma(llama_moe_bridge * br, const void * owner) {
     if (br == nullptr) {
         return false;
     }
+    if (br->l22_dmashare) {
+        return br->dma_on; // [TAG_FN_L22_DMASHARE] R-P14-1: P14's banks, no gen5 ring
+    }
     // [TAG_FN_R4_REVIEW] a bridge-mode DMA state (llama_moe_gen5_init made one for this bridge) that no graph will fetch
     // from - hostfunc waits, or a ring the device cannot read - would keep its pinned ring (LLAMA_MOE_DMA_RING_MIB,
     // 1 GiB by default) and its fill threads to the end of the context: give them back now. Another owner's state is
@@ -1491,6 +1538,15 @@ bool llama_moe_bridge_layer(const llama_moe_bridge * br, const ggml_tensor * up_
     return true;
 }
 
+// [TAG_FN_L22_TBO] R-D5-3, P0 stubs: one chain
+int llama_moe_bridge_n_chains(const llama_moe_bridge * br) {
+    return br != nullptr ? 1 : 0;
+}
+
+bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor * up_exps, int chain, int32_t * id, int32_t * chan) {
+    return chain == 0 && llama_moe_bridge_layer(br, up_exps, id, chan);
+}
+
 void llama_moe_bridge_step(llama_moe_bridge * br) {
     if (br == nullptr || br->active) {
         return;
@@ -1585,6 +1641,9 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
     br->n_graphs++;
     const uint32_t err = br->fn_error(br->gb);
     llama_fn_stall_mark("bridge graph ends (err)", err); // [TAG_FN_L18_FIRSTANS_STALL]
+    if (br->l22_dmashare) {
+        llama_fn_dmashare_graph_end(br, err, -1.0); // [TAG_FN_L22_DMASHARE] R-P14-3 (b): the graph synced
+    }
     if (br->trk_on) {
         std::lock_guard<std::mutex> lk(br->graph_mtx);
         br->last_ok     = trk_ok && err == GGML_MOE_BRIDGE_ERR_NONE;

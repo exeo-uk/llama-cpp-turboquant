@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-ext.h"
+#include "llama-fn-l22.h" // [TAG_FN_L22_PHASE]
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
@@ -69,6 +70,10 @@ struct llama_context {
     void fn_ready();
     // [TAG_FN_L20_BIGPROMPT_UB] the caller's prompt tokens after the next decode's batch (-1: not known), read once by it
     void fn_prompt_after(int32_t n) { l20_prompt_after = n; }
+    // [TAG_FN_L22_PHASE] the decode-phase flag (llama_set_decode_phase_ext): read by the next decode's graphs, PROMPT again
+    // when that decode returns
+    void    fn_set_phase(int32_t phase) { fn_phase = phase == LLAMA_FN_PHASE_GEN ? LLAMA_FN_PHASE_GEN : LLAMA_FN_PHASE_PROMPT; }
+    int32_t fn_get_phase() const { return fn_phase; }
     // [TAG_FN_L20_BIGPROMPT_PLEPRE] the next prompt batch's tokens (with up to 16 before them for the n-gram context): their
     // PLE rows are read ahead once this decode's first ubatch has its inputs
     void fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first);
@@ -545,6 +550,11 @@ private:
     size_t   l20_base_need    = 0;  // tail bytes a FULL reserve at l20_base_ub needs given back
     size_t   l20_full_base_b  = 0;
     int32_t  l20_prompt_after = -1;
+    // [TAG_FN_L22_PHASE] the decode-phase flag and the model's X levers (read at construction); graph_params folds both into
+    // fn_gen / fn_x (plan 3.8)
+    int32_t            fn_phase = LLAMA_FN_PHASE_PROMPT;
+    llama_fn_l22_x_cfg fn_l22_x;
+    uint8_t            fn_l22_hooks = 0; // [TAG_FN_L22] llama_fn_l22_hook bits, read at construction
     // [TAG_FN_L20_BIGPROMPT_PLEPRE] the pending read-ahead (empty toks: none)
     llama_seq_id             l20_ple_seq   = -1;
     llama_pos                l20_ple_pos0  = 0;

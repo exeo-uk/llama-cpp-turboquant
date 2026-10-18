@@ -47,6 +47,15 @@ set(LLAMA_CORE_SOURCES
     llama-fn-tier.cpp        # [TAG_FN_L14_TIER] fork-only
     llama-fn-stall.cpp       # [TAG_FN_L18_FIRSTANS_STALL] fork-only
     llama-fn-hostprof.cpp    # [TAG_FN_L4_HOST] fork-only
+    llama-fn-l22-log.cpp     # [TAG_FN_L22] fork-only: round 22 P0 (switches, fn_gen, expert ranges, PASSLOG)
+    llama-fn-resident.cpp    # [TAG_FN_L22_RESSET] fork-only: P5
+    llama-fn-dio.cpp         # [TAG_FN_L22_SSDTIER] fork-only: P5
+    llama-fn-pin.cpp         # [TAG_FN_L22_PIN] fork-only: P6
+    llama-fn-cvec.cpp        # [TAG_FN_L22_X_CVEC] fork-only: P12c
+    llama-fn-prior.cpp       # [TAG_FN_L22_X_PRIOR] fork-only: P12
+    llama-fn-cpushare.cpp    # [TAG_FN_L22_CPUSHARE] fork-only: P16
+    llama-fn-kvrows.cpp      # [TAG_UPSTREAM_29510] fork-only: P13
+    llama-fn-dmashare.cpp    # [TAG_FN_L22_DMASHARE] fork-only: P14
     llama-prefill-stream.cpp # [TAG_FN_PREFILL_STREAM] fork-only
     llama-ple-dio.cpp        # [TAG_FN_PLE_DIRECT_IO] fork-only
     llama-quant.cpp

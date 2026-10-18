@@ -1154,6 +1154,15 @@ llama_context::llama_context(
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
+    // [TAG_FN_L22_PHASE] the answer-changing levers of this model (LLAMA_FN_L22_X_*), read once; all off = fn_gen always 0
+    fn_l22_x = llama_fn_l22_x_read(&model);
+    fn_l22_hooks = llama_fn_l22_hooks_read(&model); // [TAG_FN_L22] graph hooks (LLAMA_FN_L22_CPUSHARE)
+    if (fn_l22_x.any()) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PHASE] answer-changing levers set: tailskip %d%s%s%s%s (decode-phase GEN graphs only)\n",
+                __func__, fn_l22_x.tailskip, fn_l22_x.tail_multi ? " multi" : "", fn_l22_x.prior ? " prior" : "",
+                fn_l22_x.defer ? " defer" : "", fn_l22_x.resident ? " resident" : "");
+    }
+
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -3724,6 +3733,17 @@ static void llama_probe_ubatch_add(const llama_context * ctx, const char * arch,
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // [TAG_FN_L22_PHASE] the phase flag holds for this decode only: PROMPT again on every return path. [TAG_FN_L22_PIN]
+    // P6 R1: the pin watcher sees when a decode runs (stub: no-op)
+    llama_fn_pin_decode_mark(true);
+    struct fn_phase_reset {
+        int32_t & phase;
+        ~fn_phase_reset() {
+            phase = LLAMA_FN_PHASE_PROMPT;
+            llama_fn_pin_decode_mark(false);
+        }
+    } fn_phase_reset_on_exit{fn_phase};
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -5131,6 +5151,8 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // [TAG_FN_L22_PHASE] plan 3.8: 1 only in a GEN-phase decode, every row an output row, an X lever set
+    const uint8_t fn_gen = llama_fn_l22_gen_rule(fn_phase, ubatch.n_tokens, (uint32_t) n_outputs, fn_l22_x.any());
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -5150,6 +5172,9 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.moe_bridge  =*/ llama_moe_bridge_active(moe_bridge) ? moe_bridge : nullptr, // [TAG_MOE_BRIDGE]
         /*.moe_bridge_sync =*/ llama_moe_bridge_sync(moe_bridge) ? moe_bridge : nullptr, // [TAG_FN_R2_BRIDGE_SYNC]
+        /*.fn_gen      =*/ fn_gen, // [TAG_FN_L22_PHASE]
+        /*.fn_x        =*/ llama_fn_l22_x_bits(fn_l22_x, fn_gen, ubatch.n_seqs_unq),
+        /*.fn_hooks    =*/ fn_l22_hooks,
     };
 }
 
@@ -7741,6 +7766,22 @@ void llama_fn_prompt_after_ext(llama_context * ctx, int32_t n_after) {
     if (ctx) {
         ctx->fn_prompt_after(n_after); // [TAG_FN_L20_BIGPROMPT_UB]
     }
+}
+
+// [TAG_FN_L22_PHASE] round 22 P0
+void llama_set_decode_phase_ext(llama_context * ctx, int32_t phase) {
+    if (ctx) {
+        ctx->fn_set_phase(phase);
+    }
+}
+
+int32_t llama_get_decode_phase_ext(const llama_context * ctx) {
+    return ctx ? ctx->fn_get_phase() : LLAMA_FN_PHASE_PROMPT;
+}
+
+// [TAG_FN_L22_GENSHARE2] round 22 P4. P0 stub: the context's n_ubatch
+int32_t llama_fn_prompt_ubatch_width_ext(llama_context * ctx) {
+    return ctx ? (int32_t) llama_n_ubatch(ctx) : 0;
 }
 
 void llama_context::fn_ple_next(llama_seq_id seq, llama_pos pos0, const llama_token * toks, int32_t n, int32_t i_first) {

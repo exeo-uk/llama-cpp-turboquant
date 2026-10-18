@@ -8,6 +8,24 @@ struct ggml_cuda_topk_moe_args; // topk-moe.cuh
 
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op);
 
+// [TAG_FN_L22_DMASHARE] R-P14-2 (a): the device views a fetch of channel chan reads (P14's fetch from pinned pages waits
+// and fails exactly as the ring fetch does). false: no such bridge / channel, another device, or no plan areas
+struct ggml_cuda_mb_fetch_view {
+    struct ggml_moe_bridge_plan * plan;  // the channel's plan area (device view of mapped memory)
+    const uint32_t * plan_word;          // host writes: the job whose plan is published
+    const uint32_t * done_word;          // host writes: the answered job
+    const uint32_t * taken_word;         // host writes: the job being computed
+    uint32_t       * err_state;          // device memory: the sticky bridge error
+    const uint32_t * release;            // host writes: nonzero = every wait and fetch gives up at once
+    int32_t        * g_err_chan;         // mapped: the first failing channel / job / error
+    uint32_t       * g_err_seq;
+    uint32_t       * g_err;
+    unsigned long long timeout_ns;
+    unsigned long long job_max_ns;
+    int              max_fetch;
+};
+bool ggml_cuda_moe_bridge_fetch_view(int32_t bridge_id, int device, int32_t chan, ggml_cuda_mb_fetch_view * out);
+
 void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_moe_host_wait(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

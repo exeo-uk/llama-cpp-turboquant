@@ -2225,6 +2225,15 @@ bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
     return true;
 }
 
+// [TAG_FN_L22_IMGPASS]
+bool common_batch::set_token_aux(int32_t idx, llama_token tok) {
+    if (idx < 0 || idx >= size()) {
+        return false;
+    }
+    tokens[idx].tok_aux = tok;
+    return true;
+}
+
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
     token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
@@ -2276,6 +2285,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
+        }
+        if (t.tok_aux != LLAMA_TOKEN_NULL) {
+            llama_batch_ext_set_token_aux(res, idx, t.tok_aux); // [TAG_FN_L22_IMGPASS]
         }
     }
 

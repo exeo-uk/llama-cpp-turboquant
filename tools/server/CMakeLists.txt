@@ -28,6 +28,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-fn-l22-dump.cpp
+    server-fn-l22-dump.h
 )
 
 if (BUILD_SHARED_LIBS)

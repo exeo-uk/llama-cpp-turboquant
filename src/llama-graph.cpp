@@ -7,6 +7,7 @@
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "ggml-moe-bridge.h"  // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
+#include "llama-fn-l22.h"  // [TAG_FN_L22] round 22 hooks
 #include "ggml-fn-l3.h"     // [TAG_FN_L3_GPU]
 
 #include "llama-impl.h"
@@ -1826,7 +1827,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()),
     moe_bridge       (params.moe_bridge),        // [TAG_MOE_BRIDGE]
-    moe_bridge_sync  (params.moe_bridge_sync) {  // [TAG_FN_R2_BRIDGE_SYNC]
+    moe_bridge_sync  (params.moe_bridge_sync),   // [TAG_FN_R2_BRIDGE_SYNC]
+    fn_gen           (params.fn_gen),            // [TAG_FN_L22_PHASE]
+    fn_x             (params.fn_x),
+    fn_hooks         (params.fn_hooks) {         // [TAG_FN_L22]
         res->set_params(params);
     }
 
@@ -2384,6 +2388,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
     const llama_pfs_view * pfs = nullptr;
     ggml_tensor * const up_exps_host = up_exps; // [TAG_FN_L3_POLICY_SEED] the hot set knows the layer by its host tensor
+    ggml_tensor * const gate_exps_host = gate_exps; // [TAG_FN_L22_CPUSHARE] the host tensors the CPU share reads
+    ggml_tensor * const down_exps_host = down_exps;
     if (!gate_up_exps && gate_exps && down_exps && loras->empty()) {
         pfs = llama_prefill_stream_lookup(sched, up_exps, n_tokens);
     }
@@ -2485,6 +2491,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // [TAG_FN_L22_X_PRIOR] P12: route prior / resident swap on the selection probabilities in a context with X_PRIOR or
+    // X_RESIDENT (R-P12-2; the hook acts by fn_gen / fn_x); the weights below still come from the unscaled probs. Stub:
+    // unchanged
+    if ((fn_hooks & LLAMA_FN_L22_HOOK_PRIOR) && selected_experts_in == nullptr && il >= 0) {
+        selection_probs = llama_fn_route_prior(const_cast<llm_graph_context *>(this), selection_probs, il);
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
@@ -2562,6 +2575,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         res->t_moe_pred.push_back(it != res->t_moe_pred_next.end() ? it->second : nullptr);
     }
 
+    // [TAG_FN_L22_CPUSHARE] P16: a CPU share of this streamed layer (LLAMA_FN_L22_CPUSHARE). A plan may give a skip table
+    // for the device MUL_MAT_IDs (src[3], as set_skip) and a host sum that is added to the output. Stub: none
+    ggml_tensor * cs_table = nullptr;
+    int32_t       cs_miss  = 0;
+    ggml_tensor * cs_host  = nullptr;
+    if (pfs && (fn_hooks & LLAMA_FN_L22_HOOK_CPUSHARE) && il >= 0) {
+        llama_fn_cpushare_io io = { cur, selected_experts, weights, up_exps_host, gate_exps_host, down_exps_host, pfs };
+        if (llama_fn_cpushare_plan(const_cast<llm_graph_context *>(this), ubatch, il, &io)) {
+            cs_table = io.dev_table;
+            cs_miss  = io.dev_miss;
+            cs_host  = io.host_out;
+        }
+    }
+
     // MoE expert cache (see llama-moecache.h): during single-token decode on a
     // layer whose experts live in host memory, run a parallel mul_mat_id chain
     // over a device-resident cache of hot experts. Cached ids are skipped by
@@ -2586,7 +2613,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!mcache && hot_max_t > 0 && slot_chain_ok && !pfs && il >= 0 && n_tokens > llama_moe_hot_graph_max_t() &&
         n_tokens <= llama_moe_hot_prompt_max_t()) {
         const char * e_off = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
-        const int64_t off_min = e_off && atoi(e_off) > 0 ? atoi(e_off) : 32;
+        const int32_t l22_off = llama_fn_l22_offload_min(); // [TAG_FN_L22_XOVER] P10 R1 (stub: 0 = the variable)
+        const int64_t off_min = l22_off > 0 ? l22_off : (e_off && atoi(e_off) > 0 ? atoi(e_off) : 32);
         const llama_moe_bridge * br_chk = moe_bridge ? moe_bridge : moe_bridge_sync;
         if (n_tokens < off_min && !(br_chk && llama_moe_bridge_fits(br_chk, (int) n_tokens, 1))) {
             mcache = llama_moe_cache_lookup(up_exps);
@@ -2622,6 +2650,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         llama_moe_bridge_layer(br_any, up_exps, &br_id, &br_chan)) {
         if (moe_bridge && br_ring && llama_moe_bridge_dma(moe_bridge) && !pfs) {
             br_dma = llama_moe_dma_bridge_lookup(up_exps, n_tokens);
+            if (br_dma == nullptr) {
+                br_dma = llama_fn_dmashare_view(moe_bridge, up_exps, n_tokens); // [TAG_FN_L22_DMASHARE] P14 (stub: nullptr)
+            }
         }
         ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
@@ -2630,7 +2661,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int hint_k = hint_router ? llama_moe_bridge_hint_k(moe_bridge) : 0;
             const bool hint  = hint_k > 0 && hint_router->ne[0] == cur->ne[0] && hint_router->ne[1] >= hint_k;
             const int32_t br_flags = (mcache ? GGML_MOE_BRIDGE_JOB_TABLE : 0) | (br_dma ? GGML_MOE_BRIDGE_JOB_DMA : 0) |
-                                     (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0);
+                                     (hint ? GGML_MOE_BRIDGE_JOB_HINT : 0) |
+                                     ((fn_x & LLAMA_FN_L22_XB_TAIL) ? GGML_MOE_BRIDGE_JOB_TAIL : 0); // [TAG_FN_L22_X_TAILSKIP]
             br_ticket = ggml_moe_host_post(ctx0, cur, selected_experts, w2, br_id, br_chan, br_flags);
             if (moe_post_mark != 0) {
                 ggml_fn_l3_set(br_ticket, moe_post_mark); // [TAG_FN_L4_POST]
@@ -2657,6 +2689,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // the job's table: the hot set's, as the bridge's job takes it (GGML_MOE_BRIDGE_JOB_TABLE); no DMA share
             br_ticket = ggml_moe_host_sum(ctx0, cur, selected_experts, w2, up_exps, gate_exps, down_exps,
                     mcache ? mcache->host_table : nullptr, mcache ? mcache->n_slots : 0);
+            if (fn_x & LLAMA_FN_L22_XB_TAIL) {
+                ggml_moe_host_sum_set_flags(br_ticket, GGML_MOE_BRIDGE_JOB_TAIL); // [TAG_FN_L22_X_TAILSKIP] a retry: same rule
+            }
             cb(br_ticket, "ffn_moe_bridge_sync", il);
             br_sync = true;
         }
@@ -2789,6 +2824,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else if (mcache) {
             t->src[3] = mcache->host_table;
             t->op_params[0] = mcache->n_slots;
+        } else if (cs_table) {
+            t->src[3] = cs_table; // [TAG_FN_L22_CPUSHARE] the experts the CPU share computes
+            t->op_params[0] = cs_miss;
         }
     };
 
@@ -3089,6 +3127,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    if (cs_host) {
+        moe_out = ggml_add(ctx0, moe_out, cs_host); // [TAG_FN_L22_CPUSHARE] the CPU share's weighted sum
+        cb(moe_out, "ffn_moe_cpushare", il);
+    }
+
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
@@ -3379,6 +3422,17 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// [TAG_UPSTREAM_29510] LLAMA_KV_ROWS (the port's switch, read once): 1 or 2 asks P13's llama_fn_kvrows_attn for the turbot
+// FA of a unified cache; anything else never calls it
+static bool llm_fn_l22_kvrows_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_KV_ROWS");
+        const int    v = e ? atoi(e) : 0;
+        return v == 1 || v == 2;
+    }();
+    return on;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3438,8 +3492,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // one FA node over q, k, v (and the mask and granule table that go with them)
+        // [TAG_UPSTREAM_29510] q_pos_fa: the q_pos of q_fa (q_pos, or a slice's own for P13's cell-list FA)
         const auto build_fa = [&](ggml_tensor * q_fa, ggml_tensor * k_fa, ggml_tensor * v_fa, ggml_tensor * mask_fa,
-                                  ggml_tensor * gtab_fa) {
+                                  ggml_tensor * gtab_fa, ggml_tensor * q_pos_fa) {
             ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q_fa, k_fa, v_fa, mask_fa, kq_scale, hparams.f_max_alibi_bias,
                                                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
@@ -3449,7 +3504,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // GGML_TURBOT_OP_PARAMS_OFFSET, past slot 4), then the accumulator precision (slot 3)
             GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
             ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<int32_t>(n_kv_max));
-            ggml_flash_attn_ext_set_pos  (fa, kv_pos, q_pos);   // [TAG_FA_POS_MASK] no-op when kv_pos is null
+            ggml_flash_attn_ext_set_pos  (fa, kv_pos, q_pos_fa);   // [TAG_FA_POS_MASK] no-op when kv_pos is null
             if (turbot_params != nullptr) {
                 // [TAG_TURBOT] K and V are turbot views: src[7] = young pool, src[8] = granule table
                 ggml_flash_attn_ext_set_turbot(fa, turbot_pool, gtab_fa, turbot_params);
@@ -3459,7 +3514,36 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             return fa;
         };
 
-        if (turbot_params != nullptr && k->ne[3] > 1) {
+        // [TAG_UPSTREAM_29510] P13: per-sequence cell lists of a unified turbot cache (LLAMA_KV_ROWS). Stub: nullptr, the
+        // FA below
+        cur = nullptr;
+        if (turbot_params != nullptr && kv_pos != nullptr && k->ne[3] == 1 && fn_attn_kv_mctx != nullptr && llm_fn_l22_kvrows_on()) {
+            llama_fn_kvrows_args kr;
+            kr.q             = q;
+            kr.k             = k;
+            kr.v             = v;
+            kr.kq_mask       = kq_mask;
+            kr.sinks         = sinks;
+            kr.v_mla         = v_mla;
+            kr.kv_pos        = kv_pos;
+            kr.q_pos         = q_pos;
+            kr.turbot_pool   = turbot_pool;
+            kr.turbot_gtab   = turbot_gtab;
+            kr.turbot_params = turbot_params;
+            kr.n_kv_max      = n_kv_max;
+            kr.kq_scale      = kq_scale;
+            kr.il            = il;
+            kr.mctx          = fn_attn_kv_mctx;
+            kr.build_fa      = [&](ggml_tensor * q_fa, ggml_tensor * k_fa, ggml_tensor * v_fa, ggml_tensor * mask_fa,
+                                   ggml_tensor * gtab_fa, ggml_tensor * q_pos_fa) {
+                return build_fa(q_fa, k_fa, v_fa, mask_fa, gtab_fa, q_pos_fa);
+            };
+            cur = llama_fn_kvrows_attn(const_cast<llm_graph_context *>(this), &kr);
+        }
+
+        if (cur != nullptr) {
+            // the lists' FA output
+        } else if (turbot_params != nullptr && k->ne[3] > 1) {
             // [TAG_TURBOT_ANY_STREAMS] a turbot FA takes one stream (ne[3] == 1): one FA per stream j over the views of
             // q, k, v and the mask along dim 3, and the stream's slice of the granule table (stream-major, global
             // slots into the one young pool of the layer). Same scale, softcap, sinks, pool and params; the outputs
@@ -3481,11 +3565,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * mask_j = kq_mask == nullptr || kq_mask->ne[3] == 1 ? kq_mask : stream_view(kq_mask, j);
                 ggml_tensor * gtab_j = ggml_view_1d(ctx0, turbot_gtab, n_gran_s, j*n_gran_s*ggml_element_size(turbot_gtab));
 
-                ggml_tensor * fa = build_fa(stream_view(q, j), stream_view(k, j), stream_view(v, j), mask_j, gtab_j);
+                ggml_tensor * fa = build_fa(stream_view(q, j), stream_view(k, j), stream_view(v, j), mask_j, gtab_j, q_pos);
                 cur = cur == nullptr ? fa : ggml_concat(ctx0, cur, fa, 3);
             }
         } else {
-            cur = build_fa(q, k, v, kq_mask, turbot_gtab);
+            cur = build_fa(q, k, v, kq_mask, turbot_gtab, q_pos);
         }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
@@ -3873,10 +3957,14 @@ ggml_tensor * llm_graph_context::build_attn_mha_kv(
     // [TAG_FN_TURBOT_QSA] n_kv_max > 0 only from a sparse-attention caller. [TAG_FN_TURBOT_SPARSE] On a turbot FA it
     // selects the CUDA gather over the cells the mask rows select (fattn.cu ggml_cuda_fattn_turbot_sparse_ncols1);
     // with n_kv_max 0 the turbot FA reads every cell under the mask.
-    return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, kv_pos, q_pos,
+    // [TAG_UPSTREAM_29510] the layer's cache context for P13's hook inside build_attn_mha (LLAMA_KV_ROWS only)
+    fn_attn_kv_mctx = mctx_cur;
+    ggml_tensor * res_mha = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il, kv_pos, q_pos,
             turbot ? mctx_cur->get_turbot_pool(il) : nullptr,
             turbot ? turbot_gtab                   : nullptr,
             turbot ? &turbot_params                : nullptr);
+    fn_attn_kv_mctx = nullptr;
+    return res_mha;
 }
 
 ggml_tensor * llm_graph_context::build_attn(

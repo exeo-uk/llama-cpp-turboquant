@@ -82,6 +82,7 @@
 #include "ggml-cuda/fn-l3.cuh"            // [TAG_FN_L3_GPU]
 #include "ggml-cuda/fn-l4-qsa.cuh"        // [TAG_FN_L4_QSA]
 #include "ggml-cuda/fn-l4-hc.cuh"         // [TAG_FN_L4_HC]
+#include "ggml-cuda/fn-l22-dmafetch.cuh"   // [TAG_FN_L22_DMASHARE] R-P14-4
 #include "ggml.h"
 
 #include <algorithm>
@@ -8359,6 +8360,9 @@ static void ggml_backend_cuda_fn_unregister_host(void * buffer) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (void * p = ggml_cuda_fn_l22_dmafetch_proc(name)) { // [TAG_FN_L22_DMASHARE] R-P14-4 (stub: nullptr)
+        return p;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

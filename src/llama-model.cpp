@@ -3575,3 +3575,19 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+// [TAG_FN_L22_IMGPASS] round 22 P1 (src/llama-ext.h). P0 stubs: no host embedding rows, no media token, explicit masks.
+bool llama_model_token_embd_rows(const llama_model * model, const llama_token * toks, int32_t n, float * out) {
+    GGML_UNUSED(model); GGML_UNUSED(toks); GGML_UNUSED(n); GGML_UNUSED(out);
+    return false;
+}
+
+llama_token llama_model_media_token(const llama_model * model) {
+    GGML_UNUSED(model);
+    return LLAMA_TOKEN_NULL;
+}
+
+int32_t llama_fn_imgpass_mask_mode(const llama_model * model) {
+    GGML_UNUSED(model);
+    return 1;
+}

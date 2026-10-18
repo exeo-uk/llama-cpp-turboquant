@@ -2600,6 +2600,18 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     return chunks;
 }
 
+// [TAG_FN_L22_VLEND_HOLD] [TAG_FN_L22_OOMHOOK] round 22 P2. P0 stubs: no hold, no retry
+void mtmd_lend_hold(mtmd_context * ctx, bool on) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(on);
+}
+
+void mtmd_set_lend_oom(mtmd_context * ctx, mtmd_lend_oom_fn fn, void * user_data) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(fn);
+    GGML_UNUSED(user_data);
+}
+
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : clip_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;

@@ -442,6 +442,16 @@ MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 
+// [TAG_FN_L22_VLEND_HOLD] round 22 (P2): hold the projector's VRAM lend across several encodes (one take / upload before
+// the first, one park / give after the last): on = true counts a hold, false releases one. Every error path must release
+// its hold. No-op without the vision lend.
+MTMD_API void mtmd_lend_hold(mtmd_context * ctx, bool on);
+
+// [TAG_FN_L22_OOMHOOK] round 22 (P2): called with the bytes of a lend buffer whose allocation failed; true = memory was
+// released (e.g. llama_fn_pin_on_oom_ext), the allocation is tried once more. NULL (default): no retry.
+typedef bool (*mtmd_lend_oom_fn)(void * user_data, size_t bytes);
+MTMD_API void mtmd_set_lend_oom(mtmd_context * ctx, mtmd_lend_oom_fn fn, void * user_data);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -188,6 +188,9 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // [TAG_UPSTREAM_29510] round 22 (P13): the cells of a stream, read-only
+    const llama_kv_cells & fn_cells(uint32_t stream) const { return v_cells[stream]; }
+
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
 
@@ -613,6 +616,9 @@ public:
     ggml_tensor * turbot_cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, ggml_tensor * young, ggml_tensor * fill, int32_t il) const;
 
     void set_input_turbot(ggml_tensor * gtab, ggml_tensor * young, ggml_tensor * fill) const;
+
+    // [TAG_UPSTREAM_29510] round 22 (P13): the cells of a stream of the cache this context views, read-only
+    const llama_kv_cells & fn_cells(uint32_t stream) const { return kv->fn_cells(stream); }
 
 private:
     llama_memory_status status;

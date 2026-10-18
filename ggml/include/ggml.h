@@ -2882,6 +2882,11 @@ extern "C" {
             struct ggml_tensor  * table,
             int32_t               table_miss);
 
+    // [TAG_FN_L22_X_TAILSKIP] the GGML_MOE_BRIDGE_JOB_* flags a bridged post of the same layer would carry (op param 1 of a
+    // ggml_moe_host_sum node, 0 = none), so a retried ubatch applies the same host rule; get returns 0 for any other op
+    GGML_API void    ggml_moe_host_sum_set_flags(struct ggml_tensor * t, int32_t flags);
+    GGML_API int32_t ggml_moe_host_sum_get_flags(const struct ggml_tensor * t);
+
     // [TAG_FN_R4_BRIDGE_DMA] the PCIe share of a bridged MoE layer (the host plans it when the post carries
     // GGML_MOE_BRIDGE_JOB_DMA): wait (bounded) for the host's plan of the job of ticket, copy the planned experts from
     // the bridge's pinned ring (read through its device mapping) into bank slots, and return the bank slot of every

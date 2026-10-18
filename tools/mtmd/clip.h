@@ -128,6 +128,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 typedef size_t (*clip_lend_take_fn)(void * ud, size_t bytes);
 typedef void   (*clip_lend_give_fn)(void * ud);
 size_t clip_lend_park(struct clip_ctx * ctx, clip_lend_take_fn take, clip_lend_give_fn give, void * ud);
+// [TAG_FN_L22_OOMHOOK] round 22 (P2): a failed lend buffer allocation of bytes; true = memory was released, retry once
+typedef bool   (*clip_lend_oom_fn)(void * ud, size_t bytes);
 
 // the device the encoder runs on (nullptr: the CPU)
 ggml_backend_dev_t clip_get_device(const struct clip_ctx * ctx);

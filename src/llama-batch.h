@@ -116,6 +116,7 @@ struct llama_batch_ext {
         size_t       state_off = 0;     // index offset in the state array
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        llama_token  tok_aux = LLAMA_TOKEN_NULL; // [TAG_FN_L22_IMGPASS] see llama_batch_ext_set_token_aux() (P1 copies it into the ubatch)
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
     };

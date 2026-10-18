@@ -6964,6 +6964,16 @@ struct ggml_tensor * ggml_moe_host_sum(
     return result;
 }
 
+// [TAG_FN_L22_X_TAILSKIP]
+void ggml_moe_host_sum_set_flags(struct ggml_tensor * t, int32_t flags) {
+    GGML_ASSERT(t != NULL && t->op == GGML_OP_MOE_HOST_SUM);
+    ggml_set_op_params_i32(t, 1, flags);
+}
+
+int32_t ggml_moe_host_sum_get_flags(const struct ggml_tensor * t) {
+    return t != NULL && t->op == GGML_OP_MOE_HOST_SUM ? ggml_get_op_params_i32(t, 1) : 0;
+}
+
 // [TAG_FN_R4_QSA_POS]
 struct ggml_tensor * ggml_qsa_mask(
         struct ggml_context * ctx,

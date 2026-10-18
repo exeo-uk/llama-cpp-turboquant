@@ -1342,6 +1342,29 @@ bool llama_batch_ext_set_decision_order(llama_batch_ext * batch, int32_t idx, ll
     return batch->set_decision_order(idx, order);
 }
 
+// [TAG_FN_L22_IMGPASS] round 22 (src/llama-ext.h). P0 stores the id per entry; P1 copies it into the ubatch
+void llama_batch_ext_set_token_aux(llama_batch_ext * batch, int32_t idx, llama_token tok) {
+    if (batch == nullptr || idx < 0 || (size_t) idx >= batch->tokens.size()) {
+        return;
+    }
+    batch->tokens[idx].tok_aux = tok;
+}
+
+llama_token llama_batch_ext_get_token_aux(const llama_batch_ext * batch, int32_t idx) {
+    if (batch == nullptr || idx < 0 || (size_t) idx >= batch->tokens.size()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return batch->tokens[idx].tok_aux;
+}
+
+llama_batch_ext * llama_batch_ext_init_test(int32_t n_tokens_max, int32_t n_embd, int32_t n_seq_max, int32_t n_vocab, int32_t n_pos_per_embd) {
+    if (n_tokens_max <= 0 || n_embd <= 0 || n_seq_max <= 0 || n_vocab < 0 || n_pos_per_embd <= 0) {
+        return nullptr;
+    }
+    return new llama_batch_ext((size_t) n_tokens_max, (size_t) n_embd, (size_t) n_embd, (llama_seq_id) n_seq_max, nullptr,
+            (llama_token) n_vocab, (size_t) n_pos_per_embd);
+}
+
 // llama_batch_compat
 
 void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row, bool borrow_embd) {

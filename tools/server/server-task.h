@@ -98,6 +98,9 @@ struct task_params {
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
+    // [TAG_FN_L22_LOGITDUMP] round 22: the request's "l22" object, passed through unchanged (null: none)
+    json l22;
+
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
 };

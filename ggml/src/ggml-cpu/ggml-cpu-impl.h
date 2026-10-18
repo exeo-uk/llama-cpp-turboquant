@@ -77,6 +77,11 @@ struct ggml_fn_moe_args {
                                         // start. No barrier: a down piece waits for its expert's gate / up pieces, and the
                                         // thread that ends a block of down rows sums it (weighted mode). Same values.
     volatile int64_t * where;           // [TAG_FN_L22_POOLDIAG] or NULL: GGML_FN_MOE_WH_N words per thread (where + ith*N)
+    // [TAG_FN_L22_X_TAILSKIP] [TAG_FN_L22_X_DEFER] round 22 opt-in rules (P8 / P11), as in ggml_cpu_moe_job; zero = today
+    int8_t          tail_rank;
+    float           tail_w;
+    float           defer_w;
+    uint32_t        l22_flags;
 };
 
 // [TAG_FN_L22_POOLDIAG] LLAMA_FN_L22_POOLDIAG=1: the "where am I" words of each thread of a pool job

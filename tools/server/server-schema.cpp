@@ -81,6 +81,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.response_fields = json_value(data, "response_fields", std::vector<std::string>());
         }));
 
+    // [TAG_FN_L22_LOGITDUMP] round 22: test options for the logit dump (tools/server/server-fn-l22-dump.h)
+    add((new field_json("l22"))
+        ->set_desc("Round 22 test options (the logit dump of LLAMA_FN_L22_LOGITDUMP), passed through to the task unchanged")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.l22 = data.at("l22");
+        }));
+
 
     //
     // Sampling params

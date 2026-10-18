@@ -92,7 +92,10 @@ struct llama_moe_bridge;
 // nullptr when disabled or not possible here (the reason is logged). max_t_cap > 0: graphs wider than that never take
 // the bridge ([TAG_FN_R1_BRIDGE_RB]: the widest ubatch the recurrent ring can roll back whole). seq_t_cap > 0: nor graphs
 // with more tokens of one sequence ([TAG_FN_L13_BRIDGE_SEQS]: the ring is per sequence, so 2 streams of 3 tokens fit)
-llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0, int seq_t_cap = 0);
+// [TAG_FN_L22_TBO] R-D5-3: n_chains >= 2 asks for a second channel per bridged layer (two-chain decode, D5); P0 stub:
+// ignored (one chain)
+llama_moe_bridge * llama_moe_bridge_create(const llama_model & model, int n_threads, int max_t_cap = 0, int seq_t_cap = 0,
+        int n_chains = 1);
 void               llama_moe_bridge_free(llama_moe_bridge * br);
 // [TAG_FN_L4_EXIT] teardown only: every device wait and fetch of this bridge gives up at once (no CUDA call), so no graph
 // of its context spins on mapped flags while the context synchronizes and frees; the bridge is unusable afterwards
@@ -123,6 +126,10 @@ bool llama_moe_bridge_ring_ok(const llama_moe_bridge * br, int n_seq_tokens);
 int  llama_moe_bridge_n_used(const llama_moe_bridge * br);
 // the bridge id and channel for this layer's up_exps, false if the layer is not bridged
 bool llama_moe_bridge_layer (const llama_moe_bridge * br, const ggml_tensor * up_exps, int32_t * id, int32_t * chan);
+// [TAG_FN_L22_TBO] R-D5-3: the chains of the bridge (nullptr: 0; P0 stub: 1) and the channel of chain `chain` for this
+// layer (chain 0 = llama_moe_bridge_layer; P0 stub: false for any other chain)
+int  llama_moe_bridge_n_chains   (const llama_moe_bridge * br);
+bool llama_moe_bridge_layer_chain(const llama_moe_bridge * br, const ggml_tensor * up_exps, int chain, int32_t * id, int32_t * chan);
 
 // [TAG_FN_L3_MTP_COST2] cold-expert counts for the MTP draft-length policy (SPEC_MTP_COST=2). With tracking on, each
 // bridged graph sums over its layers, per token prefix t, the distinct experts of tokens 0..t that are not in the VRAM

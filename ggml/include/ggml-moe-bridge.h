@@ -38,6 +38,11 @@ enum ggml_moe_bridge_error {
                                     // computes, and skip the planned experts
 #define GGML_MOE_BRIDGE_JOB_HINT  4 // [TAG_FN_L3_CPU_DEVPRED] a hint (ggml_moe_host_hint) follows the post: the predicted
                                     // experts of the next layer arrive in the channel's hint area
+#define GGML_MOE_BRIDGE_JOB_TAIL  8 // [TAG_FN_L22_X_TAILSKIP] a decode-phase GEN graph with LLAMA_FN_L22_X_TAILSKIP: the host
+                                    // may skip the job's tail experts (opt-in, changes answers; P8)
+#define GGML_MOE_BRIDGE_JOB_DEFER 16 // [TAG_FN_L22_X_DEFER] the job's light experts are answered later on the defer channel
+                                    // (opt-in, changes answers; P11)
+#define GGML_MOE_BRIDGE_JOB_NOPF  32 // [TAG_FN_L22_TBO] R-D5-5: no next-layer prefetch after this job (two-chain decode)
 
 // [TAG_FN_R4_BRIDGE_DMA] the largest PCIe share of one job, in experts
 #define GGML_MOE_BRIDGE_MAX_FETCH 32

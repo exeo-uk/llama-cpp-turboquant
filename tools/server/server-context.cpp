@@ -9,6 +9,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-fn-l22-dump.h" // [TAG_FN_L22_LOGITDUMP]
 
 #include "build-info.h"
 #include "common.h"
@@ -7481,6 +7482,28 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // [TAG_FN_L22_LOGITDUMP] P15: the logit dump of a task with an "l22" object (stub: never). A dump that took
+                // the request decoded forced rows: no tokens are generated and the slot's cached prompt is dropped
+                if (slot.task->params.l22.is_object()) {
+                    int n_other_busy = 0;
+                    for (const auto & o : slots) {
+                        n_other_busy += (&o != &slot && o.is_processing()) ? 1 : 0;
+                    }
+                    const server_fn_l22_dump_args da = { slot.ctx_tgt, vocab, slot.id, slot.prompt.tokens.pos_next(),
+                                                         slot.i_batch - off, slot.task->id, slot.id, &slot.task->params.l22,
+                                                         slot.bs_attached, slot.task->is_parent() || slot.task->is_child(),
+                                                         n_other_busy, slot.n_ctx, (int32_t) slot.prompt.n_tokens(),
+                                                         &slot.prompt.tokens };
+                    if (server_fn_l22_dump_after_prompt(da)) {
+                        slot.i_batch = -1;
+                        slot.print_timings();
+                        send_final_response(slot);
+                        slot.prompt_clear();
+                        slot.release();
+                        return;
+                    }
+                }
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;

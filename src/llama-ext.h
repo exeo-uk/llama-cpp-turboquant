@@ -330,6 +330,47 @@ LLAMA_API void   llama_fn_vision_lend_register(const struct llama_model * model,
 LLAMA_API size_t llama_fn_vision_take(const struct llama_model * model, size_t bytes);
 LLAMA_API void   llama_fn_vision_give(const struct llama_model * model);
 
+//
+// [TAG_FN_L22] round 22 interfaces (E:/turbot-gates/flashnext/test/r22/PLAN.md section 4.2), written by P0 and frozen.
+// Owner and stub behaviour per entry; the internal ones are in src/llama-fn-l22.h.
+//
+
+// [TAG_FN_L22_IMGPASS] P1: the token id an embedding entry stands for in the PLE / KV ids (a text row of a merged image
+// turn: its token; an image row: llama_model_media_token). LLAMA_TOKEN_NULL = none. P0 stores it per entry (get returns
+// it, LLAMA_TOKEN_NULL for none or a bad idx); P1 carries it into the ubatch.
+LLAMA_API void        llama_batch_ext_set_token_aux(struct llama_batch_ext * batch, int32_t idx, llama_token tok);
+LLAMA_API llama_token llama_batch_ext_get_token_aux(const struct llama_batch_ext * batch, int32_t idx);
+// P1: the trunk's input embedding rows of n tokens (n x n_embd_inp floats, bit for bit the host gather's); stub false
+LLAMA_API bool        llama_model_token_embd_rows(const struct llama_model * model, const llama_token * toks, int32_t n, float * out);
+// P1: the token an image row stands for (qwen4exp: hparams.ple_image_token_id); stub LLAMA_TOKEN_NULL
+LLAMA_API llama_token llama_model_media_token(const struct llama_model * model);
+// [TAG_FN_L22_IMGPASS_MASK] P1: 0 = keyed positional masks for image ubatches, 1 = explicit masks; stub 1
+LLAMA_API int32_t     llama_fn_imgpass_mask_mode(const struct llama_model * model);
+
+// [TAG_FN_L22_GENSHARE2] P4: the width of the context's next prompt ubatch (read after llama_fn_prompt_after_ext); stub
+// n_ubatch
+LLAMA_API int32_t llama_fn_prompt_ubatch_width_ext(struct llama_context * ctx);
+
+// [TAG_FN_L22_PHASE] P0: the decode-phase flag (plan 3.8). The caller sets GEN before a decode whose batch holds only
+// generation / verify rows; every other decode runs as PROMPT. The flag goes back to PROMPT when the decode returns.
+// Only the answer-changing levers (LLAMA_FN_L22_X_*) read it, and only in ubatches whose rows are all output rows.
+enum {
+    LLAMA_FN_PHASE_PROMPT = 0,
+    LLAMA_FN_PHASE_GEN    = 1,
+};
+LLAMA_API void    llama_set_decode_phase_ext(struct llama_context * ctx, int32_t phase);
+LLAMA_API int32_t llama_get_decode_phase_ext(const struct llama_context * ctx);
+
+// [TAG_FN_L22_OOMHOOK] P0: llama_fn_pin_on_oom (P6) for code outside libllama (the vision lend, the server): a device
+// allocation of need_bytes failed or will fail; true = pins were released, retry once
+LLAMA_API bool llama_fn_pin_on_oom_ext(const struct llama_model * model, size_t need_bytes);
+// [TAG_FN_L22_PIN] (P2b request 3) llama_fn_pin_active (P6) for code outside libllama
+LLAMA_API bool llama_fn_pin_active_ext(void);
+
+// [TAG_FN_L22] test helper: a llama_batch_ext without a context (no memory, n_vocab ids accepted)
+LLAMA_API struct llama_batch_ext * llama_batch_ext_init_test(int32_t n_tokens_max, int32_t n_embd, int32_t n_seq_max,
+        int32_t n_vocab, int32_t n_pos_per_embd);
+
 // RAII: switch to seg, back to the previous segment at scope exit
 struct llama_hp_scope {
     int prev;

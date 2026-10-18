@@ -36,6 +36,7 @@
 
 #include "moe-bridge.cuh"
 #include "topk-moe.cuh" // [TAG_FN_L4_POST]
+#include "fn-l22-dmafetch.cuh" // [TAG_FN_L22_DMASHARE]
 
 #include "ggml-cuda.h"
 #include "ggml-fn-l4-gpumoe.h" // [TAG_FN_L4_POST]
@@ -1867,6 +1868,37 @@ bool ggml_backend_cuda_moe_bridge_read_hint(const ggml_moe_bridge * b, int32_t c
 #endif
 }
 
+// [TAG_FN_L22_DMASHARE] R-P14-2 (a), see moe-bridge.cuh
+bool ggml_cuda_moe_bridge_fetch_view(int32_t bridge_id, int device, int32_t chan, ggml_cuda_mb_fetch_view * out) {
+#ifdef GGML_MOE_BRIDGE_DISABLED
+    GGML_UNUSED(bridge_id);
+    GGML_UNUSED(device);
+    GGML_UNUSED(chan);
+    GGML_UNUSED(out);
+    return false;
+#else
+    const ggml_moe_bridge * b = mb_get(bridge_id);
+    if (b == nullptr || out == nullptr || b->params.device != device || chan < 0 || chan >= b->params.n_chan ||
+        b->dev.off_plan == 0 || b->dev.max_fetch <= 0) {
+        return false;
+    }
+    const mb_dev & v = b->dev;
+    out->plan       = (ggml_moe_bridge_plan *) (v.data + (size_t) chan*v.chan_bytes + v.off_plan);
+    out->plan_word  = &v.hdr[chan].plan;
+    out->done_word  = &v.hdr[chan].done;
+    out->taken_word = &v.hdr[chan].taken;
+    out->err_state  = v.state + 1;
+    out->release    = &v.glob->release;
+    out->g_err_chan = &v.glob->err_chan;
+    out->g_err_seq  = &v.glob->err_seq;
+    out->g_err      = &v.glob->err;
+    out->timeout_ns = v.timeout_ns;
+    out->job_max_ns = v.job_max_ns;
+    out->max_fetch  = v.max_fetch;
+    return true;
+#endif
+}
+
 // ---- ops ------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
@@ -1911,8 +1943,9 @@ bool ggml_cuda_moe_bridge_supports_op(int device, const ggml_tensor * op) {
         return op->type == GGML_TYPE_F32 && op->ne[0] == p.n_embd && op->ne[1] >= 1 && op->ne[1] <= p.max_tokens &&
             ggml_is_contiguous(op);
     }
-    if (op->op == GGML_OP_MOE_HOST_FETCH) { // [TAG_FN_R4_BRIDGE_DMA]
-        return p.max_fetch > 0 && b->dev.dma_ring != nullptr && op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
+    if (op->op == GGML_OP_MOE_HOST_FETCH) { // [TAG_FN_R4_BRIDGE_DMA] [TAG_FN_L22_DMASHARE] R-P14-2 (b): or P14's fetch
+        return p.max_fetch > 0 && (b->dev.dma_ring != nullptr || ggml_cuda_fn_l22_dmafetch_supported(device, op)) &&
+            op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
             op->ne[0] >= 1 && op->ne[0] <= p.n_used && op->ne[1] >= 1 && op->ne[1] <= p.max_tokens &&
             op->src[1] && op->src[2] && op->src[3] && op->src[1]->ne[2] >= 2 && op->src[1]->ne[2] - 1 <= INT32_MAX;
     }
@@ -2111,6 +2144,10 @@ void ggml_cuda_op_moe_host_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_UNUSED(dst);
     GGML_ABORT("MOE_HOST_FETCH is not supported on this backend");
 #else
+    // [TAG_FN_L22_DMASHARE] P14: the fetch from pinned pages (stub: false, the ring fetch below)
+    if (ggml_cuda_fn_l22_dmafetch(ctx, dst)) {
+        return;
+    }
     ggml_moe_bridge * b = mb_get(ggml_get_op_params_i32(dst, 0));
     GGML_ASSERT(b != nullptr && b->params.device == ctx.device && b->fetch != nullptr && b->dev.dma_ring != nullptr);
     const int32_t chan = ggml_get_op_params_i32(dst, 1);

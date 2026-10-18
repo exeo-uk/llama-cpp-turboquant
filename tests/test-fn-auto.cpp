@@ -81,6 +81,7 @@ static void test_profile_names() {
     TCHECK(llama_fn_parse_opt_list(nullptr, l) && l.empty(), "null list");
 }
 
+extern const size_t k_n_l22_rows_decl;
 static void test_profile_opts() {
     TCHECK(llama_fn_profile_opts(LLAMA_FN_PROFILE_OFF, nullptr).empty(), "off has no options");
 
@@ -103,7 +104,9 @@ static void test_profile_opts() {
                                    "SPEC_MTP_BLOCK_VERIFY", "LLAMA_MOE_POOL_SPLIT", "LLAMA_MOE_POOL_PF_STREAMS", "LLAMA_MOE_POOL_SWPF", "LLAMA_MOE_BRIDGE_PF_RANK", "LLAMA_MOE_POOL_EXEC_CPU", "LLAMA_KPOOL_PAD", "LLAMA_KV_PAD_INDEXER", "GGML_CUDA_FN_L18_HCUP" }; // [TAG_FN_L18_ADOPT] // [TAG_FN_L8_GRAPHPAD]
     const size_t n_lookup = sizeof(lookup_names)/sizeof(lookup_names[0]);
     const size_t n_lever  = sizeof(lever_names)/sizeof(lever_names[0]);
-    TCHECK(safe.size() == n_lookup + n_lever, "safe = the measured winners (%zu, want %zu)", safe.size(), n_lookup + n_lever);
+    // [TAG_FN_L22] plus the round 22 rows (test_l22_rows)
+    TCHECK(safe.size() == n_lookup + n_lever + k_n_l22_rows_decl, "safe = the measured winners (%zu, want %zu)", safe.size(),
+           n_lookup + n_lever + k_n_l22_rows_decl);
     for (const char * n : lookup_names) {
         const llama_fn_opt * o = find_opt(safe, n);
         TCHECK(o && !o->inject, "safe %s present and read through the lookup, never the environment", n);
@@ -158,7 +161,7 @@ static void test_profile_opts() {
            find_opt(tdma, "LLAMA_MOE_BRIDGE_PF") == nullptr && find_opt(tdma, "LLAMA_MOE_BRIDGE_PF_SOLO") == nullptr,
            "trial-dma has no bridge (and none of its switches)");
     TCHECK(find_opt(tdma, "LLAMA_MOE_DMA_SHARE") && find_opt(tdma, "LLAMA_MOE_DMA_SHARE")->value == "auto", "trial-dma DMA share");
-    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 15, "trial-dma keeps the rest"); // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV, [TAG_FN_L9_ADOPT] HINTTOPK (bridge only)
+    TCHECK(find_opt(tdma, "GGML_CPU_MOE_FUSE") != nullptr && tdma.size() == safe.size() - 15 - 3, "trial-dma keeps the rest"); // [TAG_FN_L22] - the 3 round 22 pool rows // [TAG_FN_L4_ADOPT] + POOLBAR, PFDEV, [TAG_FN_L9_ADOPT] HINTTOPK (bridge only)
 
     // safe ignores LLAMA_FLASHNEXT_FAST
     const auto safe_c = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, "GGML_CPU_MOE_FUSE=0,LLAMA_FN_TEST_X=1");
@@ -185,6 +188,135 @@ static void test_profile_opts() {
     const auto cust_fast = llama_fn_profile_opts(LLAMA_FN_PROFILE_FAST, "TURBO_QSA_CHUNK=0");
     const llama_fn_opt * cq = find_opt(cust_fast, "TURBO_QSA_CHUNK");
     TCHECK(cq && cq->value == "0" && cq->inject, "fast takes a lever list too");
+}
+
+// [TAG_FN_L22] round 22 rows (plan section 6): every row present in safe with its build default, read through the
+// lookup (LLAMA_FN_*) or put into the environment (the getenv names), no name twice; the bridge rows (P_BR) are not in
+// trial-dma. The answer-changing levers and the pin family stay 0
+struct l22_row { const char * name; const char * value; bool br; };
+static const l22_row k_l22_rows[] = {
+    { "LLAMA_FN_L22_PASSLOG", "1", false },
+    { "LLAMA_FN_L22_IMGPASS", "1", false },
+    { "LLAMA_FN_L22_IMGPASS_MASK", "auto", false },
+    { "LLAMA_FN_L22_IMGPASS_MASK_MIB", "1024", false },
+    { "LLAMA_FN_L22_SAMPSTATIC", "1", false },
+    { "LLAMA_FN_L22_KVGROW", "1", false },
+    { "LLAMA_FN_L22_VLEND_HOLD", "1", false },
+    { "LLAMA_FN_L22_VLEND_SIZE", "1", false },
+    { "LLAMA_FN_L22_IMGCACHE", "24", false },
+    { "LLAMA_FN_L22_IMGDEC_THREADS", "4", false },
+    { "LLAMA_FN_L22_IMG_MAXROWS", "0", false },
+    { "LLAMA_FN_L22_TOKCACHE", "1", false },
+    { "LLAMA_FN_L22_TOKCACHE_VERIFY", "1", false },
+    { "LLAMA_FN_L22_JSONFLOAT", "1", false },
+    { "LLAMA_FN_L22_VLRESIZE", "0", false },
+    { "LLAMA_FN_L22_VLBATCH", "0", false },
+    { "LLAMA_FN_L22_MTP_KEEP", "1", false },
+    { "LLAMA_FN_L22_MEDIA_ANCHOR", "1", false },
+    { "LLAMA_FN_L22_CKPT_KEEP", "1", false },
+    { "LLAMA_FN_L22_CKPT_SPLIT", "1", false },
+    { "LLAMA_FN_L22_LENDCLASS", "1", false },
+    { "LLAMA_FN_L22_REFILL", "1", false },
+    { "LLAMA_FN_L22_READAHEAD", "1", false },
+    { "LLAMA_FN_L22_KEEPLEND", "1", false },
+    { "LLAMA_FN_L22_ENDOVERLAP", "1", false },
+    { "LLAMA_FN_L22_GRAPHKEY", "1", false },
+    { "LLAMA_FN_L22_SCHEDBUF", "1", false },
+    { "GGML_SCHED_FN_L22_SPLITS", "4096", false },
+    { "LLAMA_FN_L22_RESSET", "1", false },
+    { "LLAMA_FN_L22_REWARM", "1", false },
+    { "LLAMA_FN_L22_SSDTIER", "2", false },
+    { "LLAMA_FN_L22_SSDTIER_IO", "8", false },
+    { "LLAMA_FN_L22_PIN", "0", false },
+    { "LLAMA_FN_L22_PIN_UNIT", "ranges", false },
+    { "LLAMA_FN_L22_PIN_MARGIN_MIB", "8192", false },
+    { "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", "1024", false },
+    { "LLAMA_FN_L22_PIN_FLOOR_MIB", "6144", false },
+    { "LLAMA_FN_L22_PIN_ARENA_MIB", "16384", false },
+    { "GGML_CUDA_FN_L22_GRAPHKEEP", "1", false },
+    { "GGML_CUDA_FN_L22_GRAPH_CAP", "512,64", false },
+    { "GGML_CUDA_FN_L22_GRAPH_MAXROWS", "128", false },
+    { "GGML_CUDA_FN_L22_GRAPH2", "1", false },
+    { "GGML_CUDA_FN_L22_GRAPHDIAG", "0", false },
+    { "GGML_CUDA_FN_L22_SKCAP", "1", false },
+    { "GGML_CUDA_FN_L22_MMQ_Y8", "1", false },
+    { "GGML_CUDA_FN_L22_GLUQ8", "1", false },
+    { "GGML_CUDA_MMQ_GLU_FUSION", "1", false },
+    { "GGML_CUDA_FN_L22_MMVQ_R1", "0", false },
+    { "GGML_CUDA_GDN_MMA_SNAP", "1", false },
+    { "GGML_CUDA_GDN_MMA_CHUNK", "0", false },
+    { "LLAMA_MOE_POOL_STAGGER", "0", true },
+    { "LLAMA_MOE_POOL_PRETOUCH", "0", true },
+    { "LLAMA_MOE_POOL_JOBPF", "1", true },
+    { "LLAMA_FN_L22_X_STATS", "0", false },
+    { "LLAMA_FN_L22_X_TAILSKIP", "0", false },
+    { "LLAMA_FN_L22_X_TAILSKIP_W", "0", false },
+    { "LLAMA_FN_L22_X_TAILSKIP_MULTI", "0", false },
+    { "LLAMA_FN_L22_X_TAILSKIP_PF", "0", false },
+    { "LLAMA_FN_L22_ONEPROMPT", "1", false },
+    { "LLAMA_FN_L22_GENSHARE2", "1", false },
+    { "LLAMA_FN_L22_PAUSE", "1", false },
+    { "LLAMA_FN_L22_PAUSE_TOKENS", "2048", false },
+    { "LLAMA_FN_L22_PAUSE_S", "8", false },
+    { "LLAMA_FN_L22_SHAREKV", "1", false },
+    { "LLAMA_FN_L22_DRAFT2", "0", false },
+    { "LLAMA_FN_L22_STAGERS", "auto", false },
+    { "LLAMA_FN_L22_XOVER", "1", false },
+    { "LLAMA_FN_L22_UBPLAN", "1", false },
+    { "LLAMA_FN_L22_BIGUB2", "1", false },
+    { "LLAMA_FN_L22_SMALLKEEP", "1", false },
+    { "LLAMA_FN_L22_X_DEFER", "0", false },
+    { "LLAMA_FN_L22_X_DEFER_W", "0.1", false },
+    { "LLAMA_FN_L22_X_DEFER_R", "7", false },
+    { "LLAMA_KV_ROWS", "0", false },
+    { "LLAMA_FN_L22_QSA_SEQPOOLS", "1", false },
+    { "LLAMA_FN_L22_QSA_SHAREPFX", "1", false },
+    { "LLAMA_FN_L22_TBO", "1", false },
+    { "LLAMA_FN_L22_DMASHARE", "0", false },
+    { "LLAMA_FN_L22_DMASHARE_SLOTS", "4", false },
+    { "LLAMA_FN_L22_X_PRIOR", "0", false },
+    { "LLAMA_FN_L22_X_PRIOR_STATS", "raw", false },
+    { "LLAMA_FN_L22_X_RESIDENT", "0", false },
+    { "LLAMA_FN_L22_CPUSHARE", "0", false },
+    { "LLAMA_FN_L22_CPUSHARE_MAX", "3072", false },
+    { "LLAMA_FN_L22_CPUSHARE_ROWS", "8", false },
+};
+static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
+const size_t k_n_l22_rows_decl = k_n_l22_rows;
+
+static void test_l22_rows() {
+    const auto safe = llama_fn_profile_opts(LLAMA_FN_PROFILE_SAFE, nullptr);
+    const auto tdma = llama_fn_profile_opts(LLAMA_FN_PROFILE_TRIAL_DMA, nullptr);
+    for (size_t i = 0; i < k_n_l22_rows; ++i) {
+        const l22_row & r = k_l22_rows[i];
+        const llama_fn_opt * o = find_opt(safe, r.name);
+        const bool lookup = strncmp(r.name, "LLAMA_FN_", 9) == 0;
+        TCHECK(o && o->value == r.value, "l22 row %s = %s", r.name, r.value);
+        TCHECK(o && o->inject == !lookup, "l22 row %s: %s", r.name, lookup ? "lookup" : "environment");
+        TCHECK((find_opt(tdma, r.name) == nullptr) == r.br, "l22 row %s in trial-dma iff not a bridge row", r.name);
+        int n = 0;
+        for (const auto & s2 : safe) {
+            n += s2.name == r.name ? 1 : 0;
+        }
+        TCHECK(n == 1, "l22 row %s once (%d)", r.name, n);
+    }
+    // every LLAMA_FN_L22_ / *_FN_L22_ name of the profile is in the list above
+    for (const auto & o : safe) {
+        if (o.name.find("_L22_") != std::string::npos) {
+            bool found = false;
+            for (size_t i = 0; i < k_n_l22_rows && !found; ++i) {
+                found = o.name == k_l22_rows[i].name;
+            }
+            TCHECK(found, "profile name %s listed", o.name.c_str());
+        }
+    }
+    const char * off_names[] = { "LLAMA_FN_L22_X_TAILSKIP", "LLAMA_FN_L22_X_DEFER", "LLAMA_FN_L22_X_PRIOR", "LLAMA_FN_L22_X_RESIDENT",
+                                 "LLAMA_FN_L22_PIN", "LLAMA_FN_L22_DMASHARE", "LLAMA_FN_L22_CPUSHARE", "LLAMA_FN_L22_IMG_MAXROWS" };
+    for (const char * n : off_names) {
+        const llama_fn_opt * o = find_opt(safe, n);
+        TCHECK(o && o->value == "0", "%s stays 0 (owner)", n);
+    }
+    TCHECK(find_opt(safe, "LLAMA_FN_L22_LOGITDUMP") == nullptr, "no LOGITDUMP row");
 }
 
 static void test_host_expert_layers() {
@@ -629,6 +761,7 @@ int main() {
     // no ggml_backend_load_all(): the backends are linked in (GGML_BACKEND_DL=OFF); run with CUDA_VISIBLE_DEVICES=-1
     test_profile_names();
     test_profile_opts();
+    test_l22_rows(); // [TAG_FN_L22]
     test_host_expert_layers();
     test_lookup();
     test_inject();
