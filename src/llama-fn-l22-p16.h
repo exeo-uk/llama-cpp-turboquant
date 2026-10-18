@@ -51,6 +51,9 @@ LLAMA_API void llama_fn_cpushare_free(const void * owner);
 LLAMA_API const llama_fn_cps_cfg * llama_fn_cpushare_cfg();
 // mode 1 is configured: the stream's banks carry a zero expert behind every layer
 LLAMA_API bool llama_fn_cpushare_zero_expert();
+// R-REV-7: the device bytes one share layer adds to a streamed ubatch of n_tokens rows beyond the reserve graph (ids / w
+// copies, the plan and share copies, rows / sum of the finish), 0 unless mode 1 is configured and n_tokens <= _MAX
+LLAMA_API size_t llama_fn_cpushare_reserve_extra(int64_t n_embd, int64_t n_used, int64_t n_tokens);
 
 // the share of one streamed layer (the hook body, also called by the CPU test): builds the plan / share / gate nodes and
 // fills io (gate_built, ids, *_mm, user). false: no share for this layer (the caller builds the plain gate unless

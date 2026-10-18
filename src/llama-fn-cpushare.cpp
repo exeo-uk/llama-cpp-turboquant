@@ -1142,6 +1142,16 @@ bool llama_fn_cpushare_zero_expert() {
     return g && g->cfg.mode == 1;
 }
 
+size_t llama_fn_cpushare_reserve_extra(int64_t n_embd, int64_t n_used, int64_t n_tokens) {
+    const cps_state * g = g_cps;
+    if (!g || g->cfg.mode != 1 || n_embd < 1 || n_used < 1 || n_tokens < 1 || n_tokens > g->cfg.max_t) {
+        return 0;
+    }
+    const int64_t cap = std::min<int64_t>(g->cfg.cap, n_tokens);
+    // share copy, rows and sum [n_embd, cap] F32; ids, w and the plan copy [k, T] (+ cap) 4-byte; 1 MiB for alignment
+    return (size_t) (3*n_embd*cap*4 + (3*n_used*n_tokens + cap)*4) + ((size_t) 1 << 20);
+}
+
 llama_fn_cps_sums llama_fn_cpushare_take() {
     cps_state * g = g_cps;
     if (!g) {

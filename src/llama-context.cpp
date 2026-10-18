@@ -7156,8 +7156,14 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
             const size_t cls_full = cbuf_compute_bytes(dev);
             l22p_class_full[l22_class] = cls_full; // [TAG_FN_L22_SMALLKEEP] the park check's FULL size of this class
             // [TAG_FN_L22_SMALLKEEP] SMALLKEEP=2: the kept SMALL reserve's bytes come from the tail too
-            const size_t need = llama_fn_l22_class_need(cls_full, l22p.smallkeep >= 2 ? 0 : cbuf_small_b, cbuf_pool_mib << 20,
+            size_t need = llama_fn_l22_class_need(cls_full, l22p.smallkeep >= 2 ? 0 : cbuf_small_b, cbuf_pool_mib << 20,
                     l20_base_need);
+            // [TAG_FN_L22_CPUSHARE] R-REV-7: the share layers' device tensors are not in the reserve graph (no reserve
+            // streams): their bytes come from the tail too, so the growth inside a share decode finds the room
+            if (l22_cps_mode == 1) {
+                need = std::min(l20_base_need, need + llama_fn_cpushare_reserve_extra(model.hparams.n_embd,
+                        model.hparams.n_expert_used(), l22_class));
+            }
             l22_class_need[l22_class] = need;
             LLAMA_LOG_INFO("%s: [TAG_FN_L22_LENDCLASS] class %u: compute reserve %.0f MiB, its tail need %.0f MiB (the %u-token width "
                     "gives back %.0f MiB)\n", __func__, l22_class, cbuf_compute_bytes(dev)/MiB, need/MiB, l20_base_ub,
