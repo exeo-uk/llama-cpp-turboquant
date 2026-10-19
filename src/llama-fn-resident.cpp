@@ -82,6 +82,12 @@ struct res_table {
     std::atomic<uint64_t>   n_ssd_mark{0};
     std::atomic<uint64_t>   n_ssd_unmark{0};
     std::atomic<double>     share{-1.0}; // resident share of the streamed set at the last sample
+    // [TAG_FN_L22_SSDFIX] the cache probe (fn_res::probe_*): state 0 none, 1 reading the set in, 2 watching; counters
+    std::atomic<int>        probe_state{0};
+    std::atomic<uint64_t>   n_probe{0};
+    std::atomic<uint64_t>   n_probe_ok{0};
+    std::atomic<uint64_t>   n_probe_lost{0};
+    std::atomic<uint64_t>   b_probe{0};
     std::mutex              lmtx;        // the log line's interval state
     uint64_t                dio_b0 = 0;
     uint64_t                dio_r0 = 0;
@@ -583,9 +589,13 @@ void res_ssd_plan(res_table * t, int stage) {
 #endif
 }
 
-// [TAG_FN_L22_REWARM] the streamed set's missing 2 MiB blocks, in stream order (layer order); *share: resident share
-void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share) {
+// [TAG_FN_L22_REWARM] the streamed set's missing 2 MiB blocks, in stream order (layer order); *share: resident share;
+// *miss_b (optional): their bytes
+void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share, size_t * miss_b = nullptr) {
     miss.clear();
+    if (miss_b) {
+        *miss_b = 0;
+    }
 #ifdef _WIN32
     std::vector<range> runs;
     std::vector<uint8_t> sel;
@@ -624,6 +634,9 @@ void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share
         }
     }
     *share = tot ? (double) ok/tot : 1.0;
+    if (miss_b) {
+        *miss_b = tot - ok;
+    }
 #else
     GGML_UNUSED(t);
     *share = 1.0;
@@ -691,13 +704,175 @@ void res_log(res_table * t, const char * when) {
 #endif
     llama_fn_l22_log("res", "when=%s avail_gib=%.2f streamed_gib=%.2f resident_share=%.3f vram_gib=%.2f pin_gib=%.2f ssd_gib=%.2f "
             "drops=%" PRIu64 " drop_gib=%.2f evict_pf_gib=%.2f rewarm_gib=%.2f ssd_marks=%" PRIu64 " ssd_unmarks=%" PRIu64
-            " dio_gib=%.2f dio_reads=%" PRIu64 " dio_fails=%" PRIu64 " gen=%" PRIu64, when, avail/1073741824.0,
+            " dio_gib=%.2f dio_reads=%" PRIu64 " dio_fails=%" PRIu64 " gen=%" PRIu64 " probe=%d probes=%" PRIu64 " probe_kept=%"
+            PRIu64 " probe_lost=%" PRIu64 " probe_gib=%.2f", when, avail/1073741824.0,
             (cls[0] + cls[3])/1073741824.0, t->share.load(), cls[1]/1073741824.0, cls[2]/1073741824.0, cls[3]/1073741824.0,
             t->n_drop.exchange(0), t->b_drop.exchange(0)/1073741824.0, t->b_evpf.exchange(0)/1073741824.0,
             t->b_rewarm.exchange(0)/1073741824.0, t->n_ssd_mark.exchange(0), t->n_ssd_unmark.exchange(0),
-            (db - t->dio_b0)/1073741824.0, dr - t->dio_r0, df, t->gen.load());
+            (db - t->dio_b0)/1073741824.0, dr - t->dio_r0, df, t->gen.load(), t->probe_state.load(), t->n_probe.load(),
+            t->n_probe_ok.load(), t->n_probe_lost.load(), t->b_probe.exchange(0)/1073741824.0);
     t->dio_b0 = db;
     t->dio_r0 = dr;
+}
+
+// [TAG_FN_L22_SSDFIX] the SSD tier's cache probe (fn_res::probe_fits / probe_verdict / probe_backoff), one step per idle
+// tick of the service thread. The marked set is read through the mapping when it fits above PROBE_FREE of available
+// RAM: unmarked (the stream reads it mapped from then on), prefetched and touched at low priority (stops at any
+// activity), then watched: kept when after a prompt or answer the streamed set's missing bytes did not grow; lost when
+// they did (the plan marks the least-routed missing experts again, the next probe waits twice as long, up to 32 min)
+constexpr int64_t PROBE_FIRST_US = 60000000;          // the first probe a minute after the warm pass; kept: the next look
+constexpr int64_t PROBE_BASE_US  = 120000000;         // the wait after a verdict
+constexpr int64_t PROBE_MAX_US   = 32*60000000LL;
+constexpr int64_t PROBE_WATCH_US = 20000000;          // the watch lasts at least this long (and one prompt or answer)
+constexpr size_t  PROBE_FREE     = (size_t) 2 << 30;  // a probe never takes the available RAM below this
+
+struct probe_ctx {
+    int64_t            next   = 0; // 0: armed at the first idle tick after the warm pass
+    int64_t            wait   = PROBE_BASE_US;
+    int64_t            t0     = 0;
+    int64_t            t_samp = 0;
+    int64_t            act0   = 0;
+    size_t             miss0  = 0;
+    size_t             probed = 0;
+    bool               listed = false;
+    std::vector<range> miss;
+    size_t             at     = 0;
+};
+
+void res_probe_end(res_table * t, probe_ctx & p, int64_t now, bool kept, size_t miss1, const char * why) {
+    t->probe_state.store(0);
+    p.wait = probe_backoff(p.wait, kept, PROBE_BASE_US, PROBE_MAX_US);
+    p.next = now + (kept ? PROBE_FIRST_US : p.wait);
+    p.miss.clear();
+    p.at     = 0;
+    p.listed = false;
+    (kept ? t->n_probe_ok : t->n_probe_lost).fetch_add(1);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 " %s (%s): the streamed set misses %.2f GiB (%.2f GiB at the "
+            "watch's start, %.2f GiB probed)%s; next probe in %.0f s\n", __func__, t->n_probe.load(), kept ? "kept" : "lost",
+            why, miss1/1073741824.0, p.miss0/1073741824.0, p.probed/1073741824.0,
+            kept ? ": its experts are read through the mapping" : ": the SSD plan marks again", (p.next - now)/1e6);
+    if (!kept) {
+        res_ssd_plan(t, 1);
+    }
+}
+
+void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
+#ifdef _WIN32
+    const int st = t->probe_state.load();
+    if (st == 0) {
+        if (p.next == 0) {
+            p.next = now + PROBE_FIRST_US;
+            return;
+        }
+        if (now < p.next) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(t->mtx); // no plan meanwhile
+        std::vector<std::pair<int, int>> m;
+        size_t mb = 0;
+        for (int li = 0; li < (int) t->L.size(); ++li) {
+            const res_layer & L = t->L[li];
+            for (int e = 0; e < L.n_exp; ++e) {
+                const uint8_t f = L.fl[e].load();
+                if ((f & F_SSD) && !(f & (F_SLOT | F_PIN))) {
+                    m.push_back({ li, e });
+                    mb += L.eb;
+                }
+            }
+        }
+        if (m.empty()) {
+            p.next = now + PROBE_FIRST_US; // nothing marked: look again later
+            return;
+        }
+        const size_t avail = fn_avail();
+        if (!probe_fits(mb, avail, PROBE_FREE)) {
+            p.next = now + p.wait; // no room for it now
+            return;
+        }
+        for (const auto & x : m) {
+            res_update(t->L[x.first].fl[x.second], [](uint8_t f) { return (uint8_t) (f & ~F_SSD); });
+        }
+        t->n_ssd_unmark.fetch_add(m.size());
+        t->gen.fetch_add(1);
+        t->n_probe.fetch_add(1);
+        p.probed = mb;
+        p.listed = false;
+        p.at     = 0;
+        t->probe_state.store(1);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 ": the %.2f GiB of %zu SSD-marked experts are read through the "
+                "mapping now (%.2f GiB available, the probe keeps %.1f GiB free)\n", __func__, t->n_probe.load(), mb/1073741824.0,
+                m.size(), avail/1073741824.0, PROBE_FREE/1073741824.0);
+        return;
+    }
+    if (st == 1) {
+        if (!p.listed) {
+            double sh = 1.0;
+            res_missing_blocks(t, p.miss, &sh);
+            p.listed = true;
+            p.at     = 0;
+        }
+        if (p.at < p.miss.size()) {
+            const size_t avail = fn_avail();
+            const size_t room  = avail > PROBE_FREE ? avail - PROBE_FREE : 0;
+            std::vector<range> win;
+            size_t b = 0;
+            while (p.at + win.size() < p.miss.size() && b < ((size_t) 256 << 20) && b + p.miss[p.at + win.size()].size() <= room) {
+                b += p.miss[p.at + win.size()].size();
+                win.push_back(p.miss[p.at + win.size()]);
+            }
+            if (win.empty()) {
+                size_t mb = 0;
+                double sh = 1.0;
+                std::vector<range> tmp;
+                res_missing_blocks(t, tmp, &sh, &mb);
+                p.miss0 = mb;
+                res_probe_end(t, p, now, false, mb, "no room left while reading it in");
+                return;
+            }
+            fn_prefetch(win);
+            const int64_t t_end = now + 500000;
+            size_t i = 0;
+            for (; i < win.size() && llama_fn_p5_now_us() < t_end && !t->stop.load(); ++i) {
+                size_t done = 0;
+                const bool all = res_touch({ win[i] }, t->page, act, &done);
+                t->b_probe.fetch_add(done);
+                if (!all) {
+                    break; // activity: this block again at the next idle tick
+                }
+            }
+            p.at += i;
+            return;
+        }
+        double sh = 1.0;
+        std::vector<range> tmp;
+        res_missing_blocks(t, tmp, &sh, &p.miss0);
+        p.miss.clear();
+        p.t0     = now;
+        p.t_samp = now;
+        p.act0   = act;
+        t->probe_state.store(2);
+        return;
+    }
+    // st == 2: the watch, one sample per 5 s of idle time
+    if (now - p.t_samp < 5000000) {
+        return;
+    }
+    p.t_samp = now;
+    double sh = 1.0;
+    size_t mb = 0;
+    std::vector<range> tmp;
+    res_missing_blocks(t, tmp, &sh, &mb);
+    t->share.store(sh);
+    const int v = probe_verdict(p.miss0, mb, p.probed, act != p.act0, now - p.t0, PROBE_WATCH_US);
+    if (v != 0) {
+        res_probe_end(t, p, now, v > 0, mb, v > 0 ? "a prompt or answer later" : "pages left RAM");
+    }
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(now);
+    GGML_UNUSED(act);
+    GGML_UNUSED(p);
+#endif
 }
 
 // the service thread: the hot set's view every second (drops, eviction prefetch), the idle work (eviction touch,
@@ -716,6 +891,7 @@ void res_service(res_table * t) {
     size_t miss_at = 0;
     std::vector<std::pair<int, int>> entered;
     std::vector<std::pair<int, int>> left;
+    probe_ctx probe; // [TAG_FN_L22_SSDFIX]
     while (!t->stop.load()) {
         Sleep(100);
         const int64_t now = llama_fn_p5_now_us();
@@ -781,7 +957,11 @@ void res_service(res_table * t) {
                 t->b_evpf.fetch_add(done);
             }
         }
-        if (t->rewarm) {
+        // [TAG_FN_L22_SSDFIX] the SSD set's cache probe (reading it in replaces the re-warm while it runs)
+        if (t->ssd >= 1) {
+            res_probe_step(t, now, act, probe);
+        }
+        if (t->rewarm && t->probe_state.load() != 1) {
             // a new sample at each idle period, after a table change, and every 10 s of a long one
             if (act != act_samp || gen_samp != t->gen.load() || now - t_samp >= 10000000) {
                 double sh = 1.0;
@@ -827,7 +1007,9 @@ void res_service(res_table * t) {
             if (t->resset) {
                 res_queue_drop(t, res_droppable(t, true, false)); // pages read back since (a refill, a CPU path)
             }
-            res_ssd_plan(t, 1);
+            if (t->probe_state.load() == 0) {
+                res_ssd_plan(t, 1); // [TAG_FN_L22_SSDFIX] not while a probe reads the set in or watches it
+            }
         }
     }
 #else
@@ -850,6 +1032,21 @@ uint8_t llama_fn_res_class(const llama_model * model, int il, int e) {
         return LLAMA_FN_RES_RAM;
     }
     return class_of(L->fl[e].load(std::memory_order_relaxed));
+}
+
+bool llama_fn_res_classes(const llama_model * model, int il, uint8_t * out, int n) {
+    res_ref r(model);
+    if (r.t == nullptr || out == nullptr || n <= 0) {
+        return false;
+    }
+    const res_layer * L = res_find(r.t, il);
+    if (L == nullptr) {
+        return false;
+    }
+    for (int e = 0; e < n; ++e) {
+        out[e] = e < L->n_exp ? class_of(L->fl[e].load(std::memory_order_relaxed)) : (uint8_t) LLAMA_FN_RES_RAM;
+    }
+    return true;
 }
 
 uint64_t llama_fn_res_gen(const llama_model * model) {

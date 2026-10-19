@@ -85,6 +85,9 @@ LLAMA_API uint8_t  llama_fn_res_class(const llama_model * model, int il, int e);
 LLAMA_API uint64_t llama_fn_res_gen(const llama_model * model);
 LLAMA_API void     llama_fn_res_mark_pin(const llama_model * model, int il, int e, bool on);
 LLAMA_API uint64_t llama_fn_res_stream_bytes(const llama_model * model, uint8_t cls);
+// [TAG_FN_L22_SSDFIX] the classes of experts [0, n) of layer il in one call (the stream's samples and read-ahead); false
+// (out untouched) when there is no residency table or the layer is not in it
+LLAMA_API bool     llama_fn_res_classes(const llama_model * model, int il, uint8_t * out, int n);
 
 //
 // expert ranges (P0, src/llama-fn-l22-log.cpp)

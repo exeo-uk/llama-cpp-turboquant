@@ -175,6 +175,34 @@ inline std::vector<size_t> ssd_unpick(const std::vector<ssd_cand> & c, size_t ro
     return out;
 }
 
+// [TAG_FN_L22_SSDFIX] the SSD tier's cache probe. The SSD set is sized against the warm floor (4 GiB of available RAM
+// kept free), and direct reads never bring its pages in, so a set marked once stayed on the disk for good: every prompt
+// pass read it again (2 passes per 10K prompt). The probe reads it through the mapping when the RAM has room for it above
+// the probe's own floor, then watches whether the streamed set stays in RAM; if pages leave, the SSD plan marks again
+// (the least-routed missing ones) and the next probe waits twice as long.
+//   probe_fits: `want` more bytes in RAM leave more than `min_free` available
+inline bool probe_fits(size_t want, size_t avail, size_t min_free) {
+    return avail > min_free && want <= avail - min_free;
+}
+//   probe_verdict: from the streamed set's missing bytes at the watch's start (miss0) and now (miss1): -1 lost (more than
+//   max(256 MiB, a quarter of the probed bytes) left RAM), 1 kept (no loss after a prompt or answer ran and >= min_us
+//   passed), 0 not yet. Missing bytes, not resident ones: an expert that moves into VRAM leaves the set without a loss
+inline int probe_verdict(size_t miss0, size_t miss1, size_t probed, bool activity, int64_t since_us, int64_t min_us) {
+    const size_t lost  = miss1 > miss0 ? miss1 - miss0 : 0;
+    const size_t limit = std::max<size_t>((size_t) 256 << 20, probed/4);
+    if (lost > limit) {
+        return -1;
+    }
+    return activity && since_us >= min_us ? 1 : 0;
+}
+//   probe_backoff: the wait before the next probe after a verdict (kept: the base; lost: twice the last, at most max_us)
+inline int64_t probe_backoff(int64_t last_us, bool kept, int64_t base_us, int64_t max_us) {
+    if (kept) {
+        return base_us;
+    }
+    return std::min(max_us, std::max(base_us, last_us*2));
+}
+
 // [TAG_FN_L22_RESSET] the stream's lend range inside the hot set's device buffer, as llama_moe_hot_lend places it:
 // it ends where the tail starts (or at the buffer's end) and starts `need` bytes below, rounded down to align.
 // false: it does not fit

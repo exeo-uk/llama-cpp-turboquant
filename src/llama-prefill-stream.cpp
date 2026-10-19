@@ -256,23 +256,63 @@ bool pfs_pages_missing(const pfs_layer & L) {
 #endif
 }
 
+// [TAG_FN_L22_SSDFIX] the experts of a layer whose host pages the stream's mapped reads use (1): RAM class in the
+// residency table. VRAM-held experts come from their slots (their host copies go to standby on purpose), SSD-marked ones
+// by direct I/O, pinned ones from their pins: none of their pages says whether a mapped read would wait for the disk.
+// false: no residency table (every expert counts, as before)
+bool pfs_mapped_experts(const pfs_state * s, const pfs_layer & L, std::vector<uint8_t> & sel) {
+    if (!s->model || !L.src[0] || L.src[0]->ne[2] <= 0) {
+        return false;
+    }
+    const int n = (int) L.src[0]->ne[2];
+    sel.resize((size_t) n);
+    if (!llama_fn_res_classes(s->model, L.il, sel.data(), n)) {
+        return false;
+    }
+    for (auto & c : sel) {
+        c = (uint8_t) (c == LLAMA_FN_RES_RAM ? 1 : 0);
+    }
+    return true;
+}
+
 // [TAG_FN_L22_READAHEAD] the same sample as a share (0..1) of the layer's sampled pages that are out of the working set;
-// -1 when the query is not possible
-double pfs_missing_share(const pfs_layer & L) {
+// -1 when the query is not possible. [TAG_FN_L22_SSDFIX] with the residency table only the pages of the experts read
+// through the mapping count (pfs_mapped_experts): the standby copies of VRAM-held experts and the SSD set made layers look
+// mostly missing, so the whole layer went through direct I/O on every pass and its RAM pages were never read again
+double pfs_missing_share(const pfs_state * s, const pfs_layer & L) {
 #ifdef _WIN32
+    std::vector<uint8_t> sel;
+    const bool by_cls = pfs_mapped_experts(s, L, sel);
     std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
     for (int k = 0; k < 3; ++k) {
         if (!L.src[k] || !L.src[k]->data) {
             continue;
         }
         const char * p0 = (const char *) L.src[k]->data;
-        for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
-            PSAPI_WORKING_SET_EX_INFORMATION x = {};
-            x.VirtualAddress = (void *) (p0 + o);
-            q.push_back(x);
+        const size_t nb = L.src[k]->nb[2];
+        if (!by_cls || nb == 0 || nb*sel.size() > L.nbytes[k]) {
+            for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
+                PSAPI_WORKING_SET_EX_INFORMATION x = {};
+                x.VirtualAddress = (void *) (p0 + o);
+                q.push_back(x);
+            }
+            continue;
+        }
+        for (size_t e = 0; e < sel.size(); ++e) {
+            if (!sel[e]) {
+                continue;
+            }
+            for (size_t o = 0; o < nb; o += (size_t) 1 << 20) {
+                PSAPI_WORKING_SET_EX_INFORMATION x = {};
+                x.VirtualAddress = (void *) (p0 + e*nb + o);
+                q.push_back(x);
+            }
         }
     }
-    if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
+    if (q.empty()) {
+        return by_cls ? 0.0 : -1.0; // no expert of this layer is read through the mapping: nothing to wait for
+    }
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
         return -1.0;
     }
     size_t out = 0;
@@ -281,32 +321,39 @@ double pfs_missing_share(const pfs_layer & L) {
     }
     return (double) out / (double) q.size();
 #else
+    GGML_UNUSED(s);
     GGML_UNUSED(L);
     return -1.0;
 #endif
 }
 
-// [TAG_FN_L22_SSDTIER] the experts of a layer that go through direct I/O in this job (empty: none)
-void pfs_dio_experts(const pfs_state * s, const pfs_layer & L, double miss, std::vector<uint8_t> & out) {
+// [TAG_FN_L22_SSDTIER] the experts of a layer that go through direct I/O in this job (empty: none); true: the whole layer.
+// [TAG_FN_L22_SSDFIX] with the residency table a whole layer goes that way only while the warm pass runs (it brings the
+// layer in; the job does not wait for the disk meanwhile). After it a layer with its mapped pages mostly out is read
+// mapped with the read-ahead, so the pages come back and stay; the SSD plan marks what RAM cannot hold. Before, such a
+// layer stayed on direct I/O for good: direct reads never bring a page back
+bool pfs_dio_experts(const pfs_state * s, const pfs_layer & L, double miss, std::vector<uint8_t> & out) {
     out.clear();
     if (s->l22.ssdtier <= 0 || !s->model || !L.src[0]) {
-        return;
+        return false;
     }
     const int64_t n_exp = L.src[0]->ne[2];
-    const bool whole = s->l22.ssdtier >= 2 && miss > 0.5;
+    const bool whole = s->l22.ssdtier >= 2 && miss > 0.5 &&
+                       (llama_fn_res_gen(s->model) == 0 || llama_fn_warm_running());
     bool any = whole;
     out.assign((size_t) n_exp, whole ? 1 : 0);
-    if (!whole) {
-        for (int64_t e = 0; e < n_exp; ++e) {
-            if (llama_fn_res_class(s->model, L.il, (int) e) == LLAMA_FN_RES_SSD) {
-                out[(size_t) e] = 1;
-                any = true;
-            }
+    if (!whole && llama_fn_res_classes(s->model, L.il, out.data(), (int) n_exp)) {
+        for (auto & c : out) {
+            c = (uint8_t) (c == LLAMA_FN_RES_SSD ? 1 : 0);
+            any = any || c != 0;
         }
+    } else if (!whole) {
+        std::fill(out.begin(), out.end(), 0);
     }
     if (!any) {
         out.clear();
     }
+    return whole && any;
 }
 
 // [TAG_FN_L22_READAHEAD] the read-ahead thread: at each new ubatch (gate 0) one sample of every layer, then the layers
@@ -317,6 +364,7 @@ void pfs_ra_run(pfs_state * s) {
     uint64_t done = 0;
     std::vector<int>    miss;
     std::vector<uint8_t> dio;
+    std::vector<uint8_t> sel; // [TAG_FN_L22_SSDFIX]
     for (;;) {
         uint64_t g = 0;
         {
@@ -333,7 +381,7 @@ void pfs_ra_run(pfs_state * s) {
         double sum = 0.0;
         int    n_q = 0;
         for (int p = 0; p < np; ++p) {
-            const double sh = pfs_missing_share(s->layers[p]);
+            const double sh = pfs_missing_share(s, s->layers[p]);
             s->l_miss[p].store((uint16_t) (sh < 0 ? 0 : std::min(1000.0, sh*1000.0 + 0.5)), std::memory_order_relaxed);
             if (sh >= 0) {
                 sum += sh;
@@ -362,12 +410,19 @@ void pfs_ra_run(pfs_state * s) {
             const pfs_layer & L = s->layers[p];
             const double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
             if (s->dio_state.load(std::memory_order_relaxed) == 1) {
-                pfs_dio_experts(s, L, sh, dio);
-                if (s->l22.ssdtier >= 2 && sh > 0.5) {
+                if (pfs_dio_experts(s, L, sh, dio)) {
                     continue; // read by direct I/O as a whole
                 }
             } else {
                 dio.clear(); // direct I/O has not read yet: the mapped pages are what the stream reads
+            }
+            // [TAG_FN_L22_SSDFIX] the experts the stream does not read through the mapping (VRAM-held: device copies, their
+            // host pages on standby on purpose; pinned) are not asked for either: only the mapped experts' pages
+            if (pfs_mapped_experts(s, L, sel)) {
+                dio.resize(sel.size(), 0);
+                for (size_t e = 0; e < sel.size(); ++e) {
+                    dio[e] = (uint8_t) ((dio[e] != 0 || sel[e] == 0) ? 1 : 0);
+                }
             }
             std::vector<std::pair<const void *, size_t>> rr;
             size_t bytes = 0;
@@ -570,7 +625,7 @@ void pfs_run(pfs_state * s) {
             double miss = 0.0;
             if (s->l22.ssdtier >= 2) {
                 miss = s->l_miss && s->l_miss_gen.load(std::memory_order_acquire) != 0 ?
-                       s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(L);
+                       s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(s, L);
             }
             pfs_dio_experts(s, L, miss, dio);
         } else {
