@@ -4157,6 +4157,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (!cbuf_set(want_full, full_w, cls)) {
             return -2;
         }
+        // [TAG_FN_L22_RWIDTH] the thrash pin does not hold the 16K reserve: its borrow takes hot slots from every answer step
+        // after it (decode 36-86 t/s in v0.24.0's 16K pin under the 8 GiB eater, 63 here, ~100 at the base width). The
+        // switch count stays, so the next FULL switch at the base width pins; a big prompt under that pin goes through
+        // SMALL (above)
+        if (cbuf_pinned && cbuf_state == CBUF_FULL && l22p.ubplan && l20_base_ub > 0 && cbuf_full_t > l20_base_ub) {
+            cbuf_pinned = false;
+            if (l22_rw_n_nopin++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] the thrash pin waits for a FULL at the base width (%u tokens): this one is "
+                        "%u tokens wide (its borrow would stay out for the answers)\n", __func__, l20_base_ub, cbuf_full_t);
+            }
+        }
         if (l22p_switch) {
             l22_rw_planned = true; // [TAG_FN_L22_RWIDTH] the switch from SMALL planned this prompt's width
         }
