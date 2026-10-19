@@ -726,7 +726,8 @@ constexpr int64_t PROBE_BASE_US  = 120000000;         // the wait after a verdic
 constexpr int64_t PROBE_MAX_US   = 32*60000000LL;
 constexpr int64_t PROBE_WATCH_US = 20000000;          // the watch lasts at least this long (and one prompt or answer)
 constexpr size_t  PROBE_FREE     = (size_t) 2 << 30;  // a probe never takes the available RAM below this
-constexpr size_t  PROBE_CUSHION  = (size_t) 1 << 30;  // nor the lowest available RAM seen in prompts (pinned reserves)
+constexpr size_t  PROBE_CUSHION  = (size_t) 3 << 30;  // nor the lowest available RAM seen in prompts below this (pinned reserves, store)
+constexpr size_t  PROBE_WATCH_MIN = (size_t) 2 << 30; // a watch that sees less loses
 constexpr int64_t PROBE_LW_US    = 60000000;          // the low-water window (two of them are kept)
 
 struct probe_ctx {
@@ -854,13 +855,13 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
             p.next = now + PROBE_FIRST_US; // no full window with a prompt in it yet: its low-water is not known
             return;
         }
-        if (!probe_fits(mb, avail, PROBE_FREE) || !probe_fits(mb, lw, PROBE_CUSHION)) {
+        if (!probe_fits(mb, avail, std::max(PROBE_FREE, t->floor_b)) || !probe_fits(mb, lw, PROBE_CUSHION)) {
             p.next = now + p.wait; // no room for it now
             if (++p.n_skip <= 3 || p.n_skip % 16 == 0) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe not taken (%" PRIu64 "): the %.2f GiB SSD set does not fit "
                         "(%.2f GiB available, %.2f GiB at the lowest in the last prompts; it keeps %.1f / %.1f GiB): it stays on "
                         "direct I/O\n", __func__, p.n_skip, mb/1073741824.0, avail/1073741824.0, lw/1073741824.0,
-                        PROBE_FREE/1073741824.0, PROBE_CUSHION/1073741824.0);
+                        std::max(PROBE_FREE, t->floor_b)/1073741824.0, PROBE_CUSHION/1073741824.0);
             }
             return;
         }
@@ -878,7 +879,7 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
         t->probe_state.store(1);
         LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 ": the %.2f GiB of %zu SSD-marked experts are read through the "
                 "mapping now (%.2f GiB available, the probe keeps %.1f GiB free)\n", __func__, t->n_probe.load(), mb/1073741824.0,
-                m.size(), avail/1073741824.0, PROBE_FREE/1073741824.0);
+                m.size(), avail/1073741824.0, std::max(PROBE_FREE, t->floor_b)/1073741824.0);
         return;
     }
     if (st == 1) {
@@ -890,7 +891,8 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
         }
         if (p.at < p.miss.size()) {
             const size_t avail = fn_avail();
-            const size_t room  = avail > PROBE_FREE ? avail - PROBE_FREE : 0;
+            const size_t keep  = std::max(PROBE_FREE, t->floor_b);
+            const size_t room  = avail > keep ? avail - keep : 0;
             std::vector<range> win;
             size_t b = 0;
             while (p.at + win.size() < p.miss.size() && b < ((size_t) 256 << 20) && b + p.miss[p.at + win.size()].size() <= room) {
@@ -941,7 +943,7 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
     res_missing_blocks(t, tmp, &sh, &mb);
     t->share.store(sh);
     // the set took the room a prompt's pinned reserve or the conversation store needs: lost as well
-    const bool tight = p.lw_watch != SIZE_MAX && p.lw_watch < PROBE_CUSHION;
+    const bool tight = p.lw_watch != SIZE_MAX && p.lw_watch < PROBE_WATCH_MIN;
     const int  v     = tight ? -1 : probe_verdict(p.miss0, mb, p.probed, act != p.act0, now - p.t0, PROBE_WATCH_US);
     if (v != 0) {
         res_probe_end(t, p, now, v > 0, mb, v > 0 ? "a prompt or answer later" :
@@ -961,8 +963,8 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
 // experts, a layer the stream reads next) and the prompt stalled for seconds (2-8 s at a prompt's end under the 8 GiB
 // eater). The least-routed cold experts that are in RAM then join the SSD set until GIVE_TARGET would be left at that
 // moment; their pages go to standby (available at once), the low-water windows start again and the probe waits
-constexpr size_t GIVE_CUSHION = (size_t) 1 << 30;
-constexpr size_t GIVE_TARGET  = (size_t) 3 << 29; // 1.5 GiB
+constexpr size_t GIVE_CUSHION = (size_t) 2 << 30;
+constexpr size_t GIVE_TARGET  = (size_t) 3 << 30;
 
 size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
 #ifdef _WIN32
