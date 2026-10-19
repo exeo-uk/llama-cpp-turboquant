@@ -610,11 +610,9 @@ private:
     // [TAG_FN_L22_SCHEDBUF] node budget per reserve width (measured)
     mutable std::map<uint32_t, uint32_t> l22_nodes;
     // [TAG_FN_L22_RWIDTH] a prompt that starts while FULL stays (the thrash pin, or a prompt end without an answer step)
-    // gets the width the planner picks at a switch from SMALL: the 16K reserve with the borrow (l22_full_rewidth)
-    bool     l22_rw_big     = false; // FULL went to the 16K width inside the FULL state (the pinned state goes back)
+    // and plans a wider width than FULL has: FULL goes back to SMALL first, then the batch makes the switch from SMALL
     bool     l22_rw_planned = false; // the running prompt's width was planned (reset by a batch with outputs)
-    uint64_t l22_rw_n_up    = 0, l22_rw_n_down = 0;
-    bool     l22_full_rewidth(bool big);
+    uint64_t l22_rw_n       = 0;
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)

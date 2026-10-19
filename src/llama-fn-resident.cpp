@@ -1121,6 +1121,11 @@ void res_service(res_table * t) {
         // [TAG_FN_L22_SSDFIX] the SSD set's cache probe (reading it in replaces the re-warm while it runs)
         if (t->ssd >= 1) {
             res_probe_step(t, now, act, probe);
+            // the give-back at the first idle moment after prompts took the available RAM below the cushion (the 60 s
+            // tick may come minutes later: the first prompts after a start are the tightest)
+            if (t->probe_state.load() == 0 && probe.act_cur && probe.lw_cur < GIVE_CUSHION) {
+                res_give_back(t, probe.lw_cur, probe, now);
+            }
         }
         if (t->rewarm && t->probe_state.load() != 1) {
             // a new sample at each idle period, after a table change, and every 10 s of a long one
