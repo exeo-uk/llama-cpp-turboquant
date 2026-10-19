@@ -20,6 +20,15 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <psapi.h> // [TAG_FN_L22_JOBPF] r22 T5: K32EmptyWorkingSet for the residency probe test
+#endif
+
 static int g_fail   = 0;
 static int g_checks = 0;
 
@@ -221,14 +230,17 @@ std::vector<float> run_pool(const weights & W, const routing & r, const int32_t 
         ggml_cpu_moe_pool_stats st;
         for (int k = 0; k < 400; ++k) {
             ggml_cpu_moe_pool_get_stats(pool, &st, false);
-            if ((cfg.jobpf == 0 || st.jpf_calls >= 1) && (!cfg.pretouch || st.pt_experts >= 1)) {
+            // [TAG_FN_L22_JOBPF] r22 T5: every candidate is either asked for (queued) or left out by the residency probe /
+            // the lazy mode (skipped; heap weights here are in the working set)
+            if ((cfg.jobpf == 0 || st.jpf_queued + st.jpf_skipped >= 1) && (!cfg.pretouch || st.pt_experts >= 1)) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (cfg.jobpf > 0) { // the weights here are heap memory: the OS may refuse the read-ahead, the job must not care
-            TCHECK(st.jpf_queued >= 1 && st.jpf_calls >= 1 && st.jpf_ranges >= 3*st.jpf_calls, "jobpf queued %llu calls %llu ranges %llu",
-                    (unsigned long long) st.jpf_queued, (unsigned long long) st.jpf_calls, (unsigned long long) st.jpf_ranges);
+            TCHECK(st.jpf_queued + st.jpf_skipped >= 1 && (st.jpf_calls == 0 || st.jpf_ranges >= 3*st.jpf_calls),
+                    "jobpf queued %llu skipped %llu calls %llu ranges %llu", (unsigned long long) st.jpf_queued,
+                    (unsigned long long) st.jpf_skipped, (unsigned long long) st.jpf_calls, (unsigned long long) st.jpf_ranges);
         }
         if (cfg.pretouch) {
             TCHECK(st.pt_queued >= 1 && st.pt_experts >= 1 && st.pt_pages >= 3*st.pt_experts, "pretouch queued %llu touched %llu pages %llu",
@@ -414,6 +426,69 @@ void test_sync_op(const weights & W, const char * name) {
     }
 }
 
+// [TAG_FN_L22_JOBPF] r22 T5: the residency probe. Lazy while the weights are in the working set (one job in 8 with
+// candidates probes, no read-ahead); after the working set is emptied the next probe finds pages out: read-ahead requests go
+// out, every job probes for 2 s, and the outputs stay the reference's bit for bit (Windows; elsewhere: the lazy part only)
+void test_jobpf_probe(const weights & W, const char * name) {
+    const std::vector<int32_t> tbl = make_table(41);
+    const routing r = make_routing(3, 4242);
+    pool_cfg ref;
+    ref.nt = 1;
+    const std::vector<float> o_ref = run_pool(W, r, tbl.data(), true, ref, 0, 0.0f);
+    ggml_cpu_moe_pool_params pp = ggml_cpu_moe_pool_params_default(4);
+    pp.split = 2;
+    pp.jobpf = 2; // every cold expert is a candidate in every job
+    ggml_cpu_moe_pool * pool = ggml_cpu_moe_pool_new(&pp);
+    TCHECK(pool != nullptr, "pool_new");
+    if (pool == nullptr) {
+        return;
+    }
+    ggml_cpu_moe_layer L = { W.up, W.gate, W.down, tbl.data(), N_SLOTS };
+    std::vector<float> out((size_t) r.T*N_EMBD, -7.0f);
+    ggml_cpu_moe_job job = {};
+    job.layer    = &L;
+    job.n_tokens = r.T;
+    job.n_used   = N_USED;
+    job.x        = r.x.data();
+    job.ids      = r.ids.data();
+    job.w        = r.w.data();
+    job.out      = out.data();
+    ggml_cpu_moe_pool_stats st;
+    for (int j = 0; j < 7; ++j) { // jobs 1..7: lazy, no probe, no read-ahead
+        TCHECK(ggml_cpu_moe_run(pool, &job) == GGML_STATUS_SUCCESS, "run %d", j);
+        TCHECK(same(out, o_ref), "%s: lazy job %d differs from the reference", name, j);
+    }
+    ggml_cpu_moe_pool_get_stats(pool, &st, false);
+    TCHECK(st.jpf_probes == 0 && st.jpf_calls == 0 && st.jpf_queued == 0 && st.jpf_skipped >= 7,
+            "%s: lazy jobs: probes %llu calls %llu queued %llu skipped %llu", name, (unsigned long long) st.jpf_probes,
+            (unsigned long long) st.jpf_calls, (unsigned long long) st.jpf_queued, (unsigned long long) st.jpf_skipped);
+#if defined(_WIN32)
+    K32EmptyWorkingSet(GetCurrentProcess()); // the weights' pages leave the working set (they stay in RAM, as standby)
+    TCHECK(ggml_cpu_moe_run(pool, &job) == GGML_STATUS_SUCCESS, "run 8");
+    TCHECK(same(out, o_ref), "%s: the probed job differs from the reference", name);
+    ggml_cpu_moe_pool_get_stats(pool, &st, false);
+    TCHECK(st.jpf_probes == 1 && st.jpf_out >= 1 && st.jpf_calls >= 1 && st.jpf_queued >= 1,
+            "%s: after the working set was emptied: probes %llu out %llu calls %llu queued %llu", name,
+            (unsigned long long) st.jpf_probes, (unsigned long long) st.jpf_out, (unsigned long long) st.jpf_calls,
+            (unsigned long long) st.jpf_queued);
+    // urgent now: the next job probes too (its pages are back in the working set: nothing out, nothing asked for)
+    const uint64_t calls = st.jpf_calls;
+    TCHECK(ggml_cpu_moe_run(pool, &job) == GGML_STATUS_SUCCESS, "run 9");
+    TCHECK(same(out, o_ref), "%s: the urgent job differs from the reference", name);
+    ggml_cpu_moe_pool_get_stats(pool, &st, false);
+    TCHECK(st.jpf_probes == 2, "%s: the job after a probe that found pages out did not probe (probes %llu)", name,
+            (unsigned long long) st.jpf_probes);
+    TCHECK(st.jpf_calls == calls, "%s: a read-ahead for resident pages (calls %llu -> %llu)", name, (unsigned long long) calls,
+            (unsigned long long) st.jpf_calls);
+#else
+    TCHECK(ggml_cpu_moe_run(pool, &job) == GGML_STATUS_SUCCESS, "run 8");
+    TCHECK(same(out, o_ref), "%s: the probed job differs from the reference", name);
+    ggml_cpu_moe_pool_get_stats(pool, &st, false);
+    TCHECK(st.jpf_probes <= 1, "%s: probes %llu after 8 lazy jobs", name, (unsigned long long) st.jpf_probes);
+#endif
+    ggml_cpu_moe_pool_free(pool);
+}
+
 void test_set_rows() {
     const int64_t ne00 = 1000;
     const int64_t nr   = 37;
@@ -463,6 +538,7 @@ int main() {
         test_exact(W, "q4_K/q5_1");
         test_tail(W, "q4_K/q5_1");
         test_sync_op(W, "q4_K/q5_1");
+        test_jobpf_probe(W, "q4_K/q5_1");
     }
     test_set_rows();
     printf("test-fn-l22-pool: %d checks, %d failed\n", g_checks, g_fail);
