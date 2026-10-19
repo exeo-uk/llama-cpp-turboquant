@@ -725,6 +725,8 @@ constexpr int64_t PROBE_BASE_US  = 120000000;         // the wait after a verdic
 constexpr int64_t PROBE_MAX_US   = 32*60000000LL;
 constexpr int64_t PROBE_WATCH_US = 20000000;          // the watch lasts at least this long (and one prompt or answer)
 constexpr size_t  PROBE_FREE     = (size_t) 2 << 30;  // a probe never takes the available RAM below this
+constexpr size_t  PROBE_CUSHION  = (size_t) 1 << 30;  // nor the lowest available RAM seen in prompts (pinned reserves)
+constexpr int64_t PROBE_LW_US    = 60000000;          // the low-water window (two of them are kept)
 
 struct probe_ctx {
     int64_t            next   = 0; // 0: armed at the first idle tick after the warm pass
@@ -737,7 +739,42 @@ struct probe_ctx {
     bool               listed = false;
     std::vector<range> miss;
     size_t             at     = 0;
+    // the lowest available RAM over the last two windows of PROBE_LW_US, and whether a prompt or answer ran in them: a
+    // prompt's FULL reserve takes up to 2.4 GiB of pinned host memory for a moment (16K width), the conversation store
+    // more, so the room is what is left at the worst moment, not at the idle tick
+    size_t             lw_cur   = SIZE_MAX;
+    size_t             lw_prev  = SIZE_MAX;
+    bool               act_cur  = false;
+    bool               act_prev = false;
+    int64_t            lw_t0    = 0;
+    uint64_t           n_skip   = 0;
+    size_t             lw_watch = SIZE_MAX;         // the lowest available RAM since the probe began
+    std::vector<std::pair<int, int>> set;           // the probed experts (back to the SSD set when the probe is lost)
 };
+
+void res_probe_sample(probe_ctx & p, int64_t now, bool busy) {
+#ifdef _WIN32
+    const size_t a = fn_avail();
+    p.lw_cur   = std::min(p.lw_cur, a);
+    p.act_cur  = p.act_cur || busy;
+    if (!p.set.empty()) {
+        p.lw_watch = std::min(p.lw_watch, a); // a probe runs: its own low-water
+    }
+    if (p.lw_t0 == 0) {
+        p.lw_t0 = now;
+    } else if (now - p.lw_t0 >= PROBE_LW_US) {
+        p.lw_prev  = p.lw_cur;
+        p.act_prev = p.act_cur;
+        p.lw_cur   = SIZE_MAX;
+        p.act_cur  = false;
+        p.lw_t0    = now;
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(now);
+    GGML_UNUSED(busy);
+#endif
+}
 
 void res_probe_end(res_table * t, probe_ctx & p, int64_t now, bool kept, size_t miss1, const char * why) {
     t->probe_state.store(0);
@@ -748,12 +785,36 @@ void res_probe_end(res_table * t, probe_ctx & p, int64_t now, bool kept, size_t 
     p.listed = false;
     (kept ? t->n_probe_ok : t->n_probe_lost).fetch_add(1);
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 " %s (%s): the streamed set misses %.2f GiB (%.2f GiB at the "
-            "watch's start, %.2f GiB probed)%s; next probe in %.0f s\n", __func__, t->n_probe.load(), kept ? "kept" : "lost",
-            why, miss1/1073741824.0, p.miss0/1073741824.0, p.probed/1073741824.0,
-            kept ? ": its experts are read through the mapping" : ": the SSD plan marks again", (p.next - now)/1e6);
+            "watch's start, %.2f GiB probed, available RAM at the lowest %.2f GiB)%s; next probe in %.0f s\n", __func__,
+            t->n_probe.load(), kept ? "kept" : "lost", why, miss1/1073741824.0, p.miss0/1073741824.0, p.probed/1073741824.0,
+            (p.lw_watch == SIZE_MAX ? 0 : p.lw_watch)/1073741824.0,
+            kept ? ": its experts are read through the mapping" : ": the set goes back to direct I/O", (p.next - now)/1e6);
     if (!kept) {
+        // the probed experts back to the SSD set (not the ones a hot slot or a pin took meanwhile), their pages to the
+        // standby list at the next quiet moment (available again at once); then the plan for what else is missing
+        std::vector<std::pair<int, int>> back;
+        {
+            std::lock_guard<std::mutex> lk(t->mtx);
+            for (const auto & x : p.set) {
+                bool set = false;
+                res_update(t->L[x.first].fl[x.second], [&](uint8_t f) {
+                    set = !(f & (F_SLOT | F_PIN | F_VRAM));
+                    return set ? (uint8_t) (f | F_SSD) : f;
+                });
+                if (set) {
+                    back.push_back(x);
+                }
+            }
+        }
+        if (!back.empty()) {
+            t->n_ssd_mark.fetch_add(back.size());
+            t->gen.fetch_add(1);
+            res_queue_drop(t, back);
+        }
         res_ssd_plan(t, 1);
     }
+    p.set.clear();
+    p.lw_watch = SIZE_MAX;
 }
 
 void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
@@ -785,8 +846,19 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
             return;
         }
         const size_t avail = fn_avail();
-        if (!probe_fits(mb, avail, PROBE_FREE)) {
+        const size_t lw    = std::min(p.lw_cur, p.lw_prev);
+        if (p.lw_prev == SIZE_MAX || !(p.act_prev || p.act_cur)) {
+            p.next = now + PROBE_FIRST_US; // no full window with a prompt in it yet: its low-water is not known
+            return;
+        }
+        if (!probe_fits(mb, avail, PROBE_FREE) || !probe_fits(mb, lw, PROBE_CUSHION)) {
             p.next = now + p.wait; // no room for it now
+            if (++p.n_skip <= 3 || p.n_skip % 16 == 0) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe not taken (%" PRIu64 "): the %.2f GiB SSD set does not fit "
+                        "(%.2f GiB available, %.2f GiB at the lowest in the last prompts; it keeps %.1f / %.1f GiB): it stays on "
+                        "direct I/O\n", __func__, p.n_skip, mb/1073741824.0, avail/1073741824.0, lw/1073741824.0,
+                        PROBE_FREE/1073741824.0, PROBE_CUSHION/1073741824.0);
+            }
             return;
         }
         for (const auto & x : m) {
@@ -795,9 +867,11 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
         t->n_ssd_unmark.fetch_add(m.size());
         t->gen.fetch_add(1);
         t->n_probe.fetch_add(1);
-        p.probed = mb;
-        p.listed = false;
-        p.at     = 0;
+        p.probed   = mb;
+        p.listed   = false;
+        p.at       = 0;
+        p.set      = m;
+        p.lw_watch = SIZE_MAX;
         t->probe_state.store(1);
         LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 ": the %.2f GiB of %zu SSD-marked experts are read through the "
                 "mapping now (%.2f GiB available, the probe keeps %.1f GiB free)\n", __func__, t->n_probe.load(), mb/1073741824.0,
@@ -863,9 +937,12 @@ void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
     std::vector<range> tmp;
     res_missing_blocks(t, tmp, &sh, &mb);
     t->share.store(sh);
-    const int v = probe_verdict(p.miss0, mb, p.probed, act != p.act0, now - p.t0, PROBE_WATCH_US);
+    // the set took the room a prompt's pinned reserve or the conversation store needs: lost as well
+    const bool tight = p.lw_watch != SIZE_MAX && p.lw_watch < PROBE_CUSHION;
+    const int  v     = tight ? -1 : probe_verdict(p.miss0, mb, p.probed, act != p.act0, now - p.t0, PROBE_WATCH_US);
     if (v != 0) {
-        res_probe_end(t, p, now, v > 0, mb, v > 0 ? "a prompt or answer later" : "pages left RAM");
+        res_probe_end(t, p, now, v > 0, mb, v > 0 ? "a prompt or answer later" :
+                tight ? "available RAM fell below the cushion" : "pages left RAM");
     }
 #else
     GGML_UNUSED(t);
@@ -923,6 +1000,9 @@ void res_service(res_table * t) {
         }
         int64_t act = 0;
         const bool busy = llama_fn_p5_busy(&act);
+        if (t->ssd >= 1) {
+            res_probe_sample(probe, now, busy); // [TAG_FN_L22_SSDFIX] the available RAM's low-water, every 100 ms
+        }
         if (!busy && now - act >= 50000) {
             std::vector<std::pair<int, int>> q;
             {
