@@ -9,6 +9,7 @@
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-l22.h"  // [TAG_FN_L22] round 22 hooks
 #include "llama-fn-tbo.h"  // [TAG_FN_L22_TBO] two-chain decode keys
+#include "llama-fn-l22-p16.h" // [TAG_FN_L22_CPUSHARE] llama_prefill_stream_device
 #include "ggml-fn-l3.h"     // [TAG_FN_L3_GPU]
 
 #include "llama-impl.h"
@@ -2618,6 +2619,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             pin_cpu(llama_prefill_stream_build_gate(ctx0, gf, pfs, cur)); // the deferred gate (R-P16-1)
         }
     }
+    // [TAG_FN_L22_CPUSHARE] with the deferred gate the CPU gate split sits right before the expert matmuls, and the
+    // scheduler gave them (and the activation between them) the CPU backend: their src0, the bank in the hot set's
+    // lent range, is not a weights buffer, so nothing pinned them, and an unpinned node takes the backend of the node
+    // before it. They ran on the CPU over 450-600 MiB device-to-host copies of the bank per layer and the logits came out
+    // NaN (CPUSHARE=2 PPL -nan; r22 end test T2, FAULT 2026-10-18 23:21:22). Pinned to the
+    // stream's device here; the gate before the router (no CPUSHARE) leaves the scheduler's choice unchanged
+    ggml_backend_t cs_dev = cs_defer_gate && sched ? llama_prefill_stream_device() : nullptr;
+    auto pin_cs_dev = [&](ggml_tensor * t) {
+        if (cs_dev && t) {
+            ggml_backend_sched_set_tensor_backend(sched, t, cs_dev);
+        }
+    };
 
     // MoE expert cache (see llama-moecache.h): during single-token decode on a
     // layer whose experts live in host memory, run a parallel mul_mat_id chain
@@ -2962,6 +2975,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        pin_cs_dev(gate_up); // [TAG_FN_L22_CPUSHARE]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2982,6 +2996,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, mm_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens] ([TAG_FN_L22_CPUSHARE] mm_ids)
         cb(up, "ffn_moe_up", il);
+        pin_cs_dev(up); // [TAG_FN_L22_CPUSHARE]
 
         set_skip(up);
 
@@ -2997,6 +3012,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, mm_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+            pin_cs_dev(cur); // [TAG_FN_L22_CPUSHARE]
 
             set_skip(cur);
         } else {
@@ -3098,7 +3114,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    pin_cs_dev(cur); // [TAG_FN_L22_CPUSHARE] the activation
     experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    pin_cs_dev(experts); // [TAG_FN_L22_CPUSHARE]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
