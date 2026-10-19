@@ -349,6 +349,11 @@ extern "C" {
         uint64_t jpf_fail;        // requests the OS refused
         double   jpf_mib;         // bytes asked for
         double   jpf_ms;          // the caller's time in them
+        uint64_t jpf_probes;      // [TAG_FN_L22_JOBPF] r22 T5: residency probes (one QueryWorkingSetEx each)
+        uint64_t jpf_probed;      // ... experts they sampled
+        uint64_t jpf_out;         // ... of those with a sampled page outside the working set (asked for)
+        uint64_t jpf_skipped;     // candidates left without a read-ahead (lazy jobs, probed resident)
+        double   jpf_probe_ms;    // the callers' time in the probes
     };
     // copies the means into st (NULL: only reset) and, if reset, starts a new window. Zeros without params.stats.
     GGML_BACKEND_API void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * pool, struct ggml_cpu_moe_pool_stats * st, bool reset);

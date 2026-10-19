@@ -2358,6 +2358,12 @@ bool llama_moe_bridge_end(llama_moe_bridge * br) {
                 ps.pt_experts ? (double) ps.pt_faults/ps.pt_experts : 0.0, ps.jpf_queued, ps.jpf_calls,
                 ps.jpf_calls ? (double) ps.jpf_ranges/ps.jpf_calls : 0.0, ps.jpf_calls ? ps.jpf_mib/ps.jpf_calls : 0.0,
                 ps.jpf_calls ? 1e3*ps.jpf_ms/ps.jpf_calls : 0.0, ps.jpf_fail);
+        if (ps.jpf_probes > 0 || ps.jpf_skipped > 0) { // [TAG_FN_L22_JOBPF] r22 T5: the residency probe
+            LLAMA_LOG_INFO("%s: MoE bridge %d: [TAG_FN_L22_JOBPF] residency probe: %" PRIu64 " probes, %" PRIu64 " experts sampled "
+                    "(%.1f us each probe), %" PRIu64 " with a page out of the working set (asked for), %" PRIu64 " candidates "
+                    "without a read-ahead\n", __func__, br->bid, ps.jpf_probes, ps.jpf_probed,
+                    ps.jpf_probes ? 1e3*ps.jpf_probe_ms/ps.jpf_probes : 0.0, ps.jpf_out, ps.jpf_skipped);
+        }
     }
     if (br->pool_stats && br->pool && br->n_graphs % 256 == 0) {
         // [TAG_FN_L3_CPU_STATS] the window since the last line (the pool resets with the read)

@@ -48,6 +48,13 @@ struct moe_mem_range {
     size_t len;
 };
 
+// [TAG_FN_L22_JOBPF] the layout of PSAPI_WORKING_SET_EX_INFORMATION (psapi.h): an address and its attribute bits (bit 0: Valid,
+// the page is in the process's working set)
+struct moe_ws_ex {
+    void *    va;
+    uintptr_t attr;
+};
+
 namespace {
 
 inline void moe_pool_relax() {
@@ -487,6 +494,18 @@ struct ggml_cpu_moe_pool {
     std::vector<uint8_t>    l22_stale;
     std::vector<int32_t>    jpf_list;  // R-REV-10: a job's read-ahead experts in the workers' walk order (caller thread)
     std::vector<moe_mem_range> jpf_rs; // the caller's ranges of its first read-ahead call
+    // [TAG_FN_L22_JOBPF] r22 T5 fix: a residency probe (one sampled page per slice) decides which experts get a read-ahead;
+    // while the probes find every page in the working set (lazy), only one job in 8 with candidates probes and no read-ahead
+    // goes out (no system call on the other jobs' path); a probe that finds pages out probes every job for 2 s (urgent)
+    uint64_t                jpf_urgent_until = 0;  // tick
+    uint32_t                jpf_lazy_n       = 0;
+    std::vector<uint8_t>    jpf_flag;              // probe result per candidate (1: a sampled page is out)
+    std::vector<moe_ws_ex>  jpf_ws;                // the probe's entries
+    std::atomic<uint64_t>   jpf_probes{0};
+    std::atomic<uint64_t>   jpf_probed{0};
+    std::atomic<uint64_t>   jpf_out{0};
+    std::atomic<uint64_t>   jpf_skipped{0};        // candidates left out: lazy jobs without a probe, probed resident
+    std::atomic<uint64_t>   jpf_probe_ticks{0};
     std::atomic<uint64_t>   jpf_queued{0};
     std::atomic<uint64_t>   jpf_calls{0};
     std::atomic<uint64_t>   jpf_ranges{0};
@@ -1014,6 +1033,66 @@ static bool moe_pool_l22_stale(const ggml_cpu_moe_pool * p, const ggml_cpu_moe_l
     return prev == 0 || it->second.clk - prev >= GGML_MOE_POOL_L22_FRESH;
 }
 
+// [TAG_FN_L22_JOBPF] r22 T5 fix: the residency probe. For each of the experts es[0..n) of layer l, one sampled page per slice
+// (the first page of its gate, up and down slice): out[i] = 1 if one of them is outside the process's working set (its pages
+// may have to come from the standby list or the disk). One QueryWorkingSetEx call (Linux: mincore per page). Returns false
+// when no probe is available (the caller then treats every expert as out, the R-REV-10 behaviour). Reads no weight bytes.
+static bool moe_pool_jpf_probe(ggml_cpu_moe_pool * p, const ggml_cpu_moe_layer * l, const int32_t * es, int n, uint8_t * out) {
+    if (n <= 0) {
+        return true;
+    }
+    const ggml_tensor * ts[3] = { l->gate, l->up, l->down };
+    const uint64_t t0 = ggml_fn_moe_tick();
+#if defined(_WIN32)
+    using qws_t = BOOL (WINAPI *)(HANDLE, PVOID, DWORD);
+    static const qws_t qws = (qws_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx");
+    if (qws == nullptr) {
+        return false;
+    }
+    p->jpf_ws.resize((size_t) 3*n);
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            const uintptr_t a = (uintptr_t) ((const char *) ts[k]->data + (size_t) es[i]*ts[k]->nb[2]);
+            p->jpf_ws[(size_t) 3*i + k].va   = (void *) (a & ~(uintptr_t) 4095);
+            p->jpf_ws[(size_t) 3*i + k].attr = 0;
+        }
+    }
+    if (!qws(GetCurrentProcess(), p->jpf_ws.data(), (DWORD) (p->jpf_ws.size()*sizeof(moe_ws_ex)))) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const moe_ws_ex * w = &p->jpf_ws[(size_t) 3*i];
+        out[i] = ((w[0].attr & 1) && (w[1].attr & 1) && (w[2].attr & 1)) ? 0 : 1;
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    static const uintptr_t pg = (uintptr_t) std::max(4096L, sysconf(_SC_PAGESIZE));
+    for (int i = 0; i < n; ++i) {
+        out[i] = 0;
+        for (int k = 0; k < 3 && !out[i]; ++k) {
+            const uintptr_t a = (uintptr_t) ((const char *) ts[k]->data + (size_t) es[i]*ts[k]->nb[2]) & ~(pg - 1);
+#if defined(__APPLE__)
+            char v = 0;
+#else
+            unsigned char v = 0;
+#endif
+            if (mincore((void *) a, (size_t) pg, &v) != 0) {
+                return false;
+            }
+            out[i] = (v & 1) ? 0 : 1;
+        }
+    }
+#else
+    GGML_UNUSED(ts);
+    GGML_UNUSED(es);
+    GGML_UNUSED(out);
+    return false;
+#endif
+    p->jpf_probe_ticks.fetch_add(ggml_fn_moe_tick() - t0, std::memory_order_relaxed);
+    p->jpf_probes.fetch_add(1, std::memory_order_relaxed);
+    p->jpf_probed.fetch_add((uint64_t) n, std::memory_order_relaxed);
+    return true;
+}
+
 // [TAG_FN_L22_JOBPF] the helper: one read-ahead request for the gate, up and down slices of a batch of experts (Windows:
 // PrefetchVirtualMemory): the memory manager reads each range once, instead of the job's threads faulting the same pages
 // at the same time. Asynchronous; values are never touched
@@ -1127,7 +1206,9 @@ static void moe_pool_pt_main(ggml_cpu_moe_pool * p) {
         if (t == p->pt_head.load(std::memory_order_acquire)) {
             bool got = false;
             const auto t_idle = std::chrono::steady_clock::now();
-            for (uint32_t k = 1; !got; ++k) {
+            // [TAG_FN_L22_JOBPF] r22 T5: with read-ahead requests only (no pre-touch) the helper does not spin: it runs on an SMT
+            // sibling of a worker's core, and a spin there between decode jobs takes issue slots from that worker
+            for (uint32_t k = 1; !got && p->pretouch; ++k) {
                 moe_pool_relax();
                 got = t != p->pt_head.load(std::memory_order_acquire) || p->pt_stop.load(std::memory_order_relaxed);
                 if (!got && (k & 255) == 0 && std::chrono::steady_clock::now() - t_idle > std::chrono::microseconds(200)) {
@@ -1633,6 +1714,42 @@ enum ggml_status ggml_cpu_moe_run(struct ggml_cpu_moe_pool * p, const struct ggm
                 return (int64_t) n_prio + e;
             };
             std::sort(p->jpf_list.begin(), p->jpf_list.end(), [&](int32_t x, int32_t y) { return rank(x) < rank(y); });
+            // r22 T5 fix: the residency probe picks the experts that need a read-ahead. Lazy (the probes found every page in
+            // the working set): one job in 8 probes, the others send nothing (a read-ahead of resident pages is a ~150 us
+            // system call on the job's path, 48 jobs per decode step: +30 % ms per step). Urgent (a probe found pages out
+            // within the last 2 s): every job probes, only the experts with a page out are asked for.
+            if (!p->jpf_list.empty()) {
+                const uint64_t now    = ggml_fn_moe_tick();
+                const bool     urgent = now < p->jpf_urgent_until;
+                const size_t   n_all  = p->jpf_list.size();
+                if (urgent || (++p->jpf_lazy_n & 7) == 0) {
+                    const int n_pr = std::min<int>((int) n_all, 64);
+                    p->jpf_flag.resize((size_t) n_pr);
+                    if (moe_pool_jpf_probe(p, l, p->jpf_list.data(), n_pr, p->jpf_flag.data())) {
+                        size_t w     = 0;
+                        int    n_out = 0;
+                        for (int i = 0; i < n_pr; ++i) {
+                            if (p->jpf_flag[(size_t) i]) {
+                                p->jpf_list[w++] = p->jpf_list[(size_t) i];
+                                n_out++;
+                            }
+                        }
+                        if (urgent || n_out > 0) { // beyond the probe's 64: asked for while pages are going out
+                            for (size_t i = (size_t) n_pr; i < n_all; ++i) {
+                                p->jpf_list[w++] = p->jpf_list[i];
+                            }
+                        }
+                        p->jpf_list.resize(w);
+                        p->jpf_out.fetch_add((uint64_t) n_out, std::memory_order_relaxed);
+                        if (n_out > 0) {
+                            p->jpf_urgent_until = now + (uint64_t) (2.0e6*p->tick_per_us);
+                        }
+                    } // no probe available: every candidate (R-REV-10)
+                } else {
+                    p->jpf_list.clear();
+                }
+                p->jpf_skipped.fetch_add((uint64_t) (n_all - p->jpf_list.size()), std::memory_order_relaxed);
+            }
             constexpr int n_sync_max = 8;
             ggml_cpu_moe_pool::pt_entry first[n_sync_max];
             const int n_sync = std::min<int>(n_sync_max, (int) p->jpf_list.size());
@@ -2034,6 +2151,11 @@ void ggml_cpu_moe_pool_get_stats(struct ggml_cpu_moe_pool * p, struct ggml_cpu_m
         out->jpf_fail   = p->jpf_fail.load();
         out->jpf_mib    = (double) p->jpf_bytes.load()/1048576.0;
         out->jpf_ms     = (double) p->jpf_ticks.load()/tpm;
+        out->jpf_probes   = p->jpf_probes.load(); // [TAG_FN_L22_JOBPF] r22 T5
+        out->jpf_probed   = p->jpf_probed.load();
+        out->jpf_out      = p->jpf_out.load();
+        out->jpf_skipped  = p->jpf_skipped.load();
+        out->jpf_probe_ms = (double) p->jpf_probe_ticks.load()/tpm;
     }
     if (p == nullptr || !p->stats) {
         return;
