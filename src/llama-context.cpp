@@ -3827,6 +3827,12 @@ static void llama_probe_ubatch_add(const llama_context * ctx, const char * arch,
     e.ubatch_max = 0;
 }
 
+// [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L22_RWIDTH] narrow batches in a row that lift the thrash pin: 256, or 16 for a pin at the
+// 16K width (UBPLAN: its borrow keeps hot slots out of the answer steps)
+static uint64_t llama_fn_l22_pin_narrow_max(bool big_pin) {
+    return big_pin ? 16 : 256;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L22_PHASE] the phase flag holds for this decode only: PROMPT again on every return path. [TAG_FN_L22_PIN]
     // P6 R1: the pin watcher sees when a decode runs (stub: no-op)
@@ -4077,10 +4083,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (cbuf_state == CBUF_SMALL) {
                 cbuf_note_full(); // may pin FULL (LLAMA_FN_CBUF_THRASH)
             }
-        } else if (cbuf_pinned && ++cbuf_narrow_run >= 256) {
+        } else if (cbuf_pinned && ++cbuf_narrow_run >= llama_fn_l22_pin_narrow_max(l22p.ubplan && l20_base_ub > 0 &&
+                   cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub)) {
+            // [TAG_FN_L22_RWIDTH] a pin at the 16K width (UBPLAN): its borrow keeps hot slots out of every answer step
+            // (decode 24-63 t/s in the bands under the 8 GiB eater, v0.24.0's 16K pin 21-88, ~100 at the base width), so an
+            // answer of more than 16 steps lifts it; short answers between prompts keep it (no 16K reserve per prompt: the
+            // switches to and from 16K stalled 3-8 s under the eater)
+            if (l22_rw_n_nopin++ < 3 && cbuf_narrow_run < 256) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] %llu narrow batches in a row under the 16K pin: the lend switches again\n",
+                        __func__, (unsigned long long) cbuf_narrow_run);
+            }
             cbuf_pinned = false;
             cbuf_full_at.clear();
-            LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] %llu narrow batches in a row: the lend switches again\n", __func__,
+                    (unsigned long long) cbuf_narrow_run);
         }
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
         // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch. One sequence only
@@ -4156,17 +4172,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (!cbuf_set(want_full, full_w, cls)) {
             return -2;
-        }
-        // [TAG_FN_L22_RWIDTH] the thrash pin does not hold the 16K reserve: its borrow takes hot slots from every answer step
-        // after it (decode 36-86 t/s in v0.24.0's 16K pin under the 8 GiB eater, 63 here, ~100 at the base width). The
-        // switch count stays, so the next FULL switch at the base width pins; a big prompt under that pin goes through
-        // SMALL (above)
-        if (cbuf_pinned && cbuf_state == CBUF_FULL && l22p.ubplan && l20_base_ub > 0 && cbuf_full_t > l20_base_ub) {
-            cbuf_pinned = false;
-            if (l22_rw_n_nopin++ < 3) {
-                LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] the thrash pin waits for a FULL at the base width (%u tokens): this one is "
-                        "%u tokens wide (its borrow would stay out for the answers)\n", __func__, l20_base_ub, cbuf_full_t);
-            }
         }
         if (l22p_switch) {
             l22_rw_planned = true; // [TAG_FN_L22_RWIDTH] the switch from SMALL planned this prompt's width
