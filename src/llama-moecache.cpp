@@ -40,6 +40,13 @@
 void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
 // [TAG_FN_L22_REFILL] M2.4: the calling thread's memory priority to low (Windows; elsewhere a no-op), also at the end
 static void fn_l22_mem_prio_low();
+// [TAG_FN_L22_ENDOVERLAP] r22 T6 fix: the answer's first step sends a lend's or a tail's refill to the upload worker only up
+// to this many bytes; a larger one is refilled at once by the copy threads. The worker is one thread that shares the CPU
+// with the decode's MoE pool: after a 12-screenshot turn its 4 GiB tail took 1.1-1.5 s to land (vs ~0.26 s for the copy
+// threads before the decode), the CPU computed those experts meanwhile and the 256-token answers after image turns ran at
+// 54-90 t/s vs 72-130 t/s on v0.24.0 (r22 end test T6). The first token is out before this step either way.
+constexpr size_t L22_ASYNC_REFILL_MAX = (size_t) 256 << 20;
+
 // [TAG_FN_L22_REFILL] (b) r22 T5 fix: the refill set's read-ahead, bounded (defined at the end: Windows only, elsewhere the
 // old unbounded request). Only ranges whose first page is outside the working set, at most the free RAM above a 4 GiB
 // floor, in requests of 64 ranges, and none after `stop` (set when the unlend / restore starts reading them itself)
@@ -440,6 +447,8 @@ struct moe_cache {
     std::thread           l22_pf_th;             // [TAG_FN_L22_REFILL] (b) the refill set's prefetch
     std::atomic<bool>     l22_pf_busy{false};
     std::atomic<bool>     l22_pf_stop{false};       // [TAG_FN_L22_REFILL] r22 T5: the unlend / restore reads the set itself now
+    uint64_t              l22_sync_ul  = 0;          // [TAG_FN_L22_ENDOVERLAP] r22 T6: big lend refills done synchronously
+    uint64_t              l22_sync_res = 0;          // ... big tail refills
     // [TAG_FN_L22_LENDCLASS] the tail is out with fewer bytes unmapped than layers hidden (a narrow FULL class): the
     // restore refills only the slots that reach into the unmapped part, and the dirty ones
     bool                  l22_part      = false;
@@ -4443,13 +4452,47 @@ void llama_moe_hot_unlend_async(const void * owner) {
     if (owner != mc->owner) {
         return;
     }
-    std::lock_guard<std::mutex> slk(mc->step_mtx);
+    std::unique_lock<std::mutex> slk(mc->step_mtx);
     hot_turn_join(mc); // [TAG_FN_L18_FIRSTANS_OVERLAP] a pass in flight lands first
-    if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
-        mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
-    }
     if (!mc->lent_any) {
         return;
+    }
+    // [TAG_FN_L22_ENDOVERLAP] r22 T6 fix: a refill above L22_ASYNC_REFILL_MAX goes the synchronous way (the copy threads)
+    {
+        size_t need = 0;
+        for (const auto & ls : mc->layers) {
+            if (!ls.lent) {
+                continue;
+            }
+            const ggml_tensor * dsts[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+            const ggml_tensor * srcs[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+            for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+                if (ls.slot_expert[s] < 0 || ls.slot_in_flight[s]) {
+                    continue;
+                }
+                bool reach = false;
+                for (int k = 0; k < 3; ++k) {
+                    reach = reach || (const uint8_t *) dsts[k]->data + (size_t) s*dsts[k]->nb[2] + srcs[k]->nb[2] > g_lend.lo;
+                }
+                if (reach) {
+                    need += srcs[0]->nb[2] + srcs[1]->nb[2] + srcs[2]->nb[2];
+                }
+            }
+        }
+        if (need > L22_ASYNC_REFILL_MAX) {
+            mc->l22_sync_ul++;
+            if (mc->l22_sync_ul <= 2 || mc->l22_sync_ul % 16 == 0) {
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L22_ENDOVERLAP] lend refill of %.2f GiB: by the copy threads now (more than %zu MiB "
+                        "would land through the upload worker for seconds while the CPU computes those experts; %" PRIu64 " so far)\n",
+                        need/1073741824.0, L22_ASYNC_REFILL_MAX >> 20, mc->l22_sync_ul);
+            }
+            slk.unlock();
+            llama_moe_hot_unlend(owner);
+            return;
+        }
+    }
+    if (!mc->l17_burst_start) { // [TAG_FN_L17_START_BURST] the window opens at the start only
+        mc->dc_burst_left = std::max(mc->dc_burst_left, mc->dc_burst_passes); // [TAG_FN_L15_BURST] a big prompt ran
     }
     const int64_t t0 = ggml_time_us();
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_lend.buf);
@@ -5769,7 +5812,7 @@ bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
     // fresh memory: zero slots, padding and empty slots read 0, then the resident experts come back
     ggml_backend_tensor_memset(mc->cb_raw, 0, r0 - mc->cb_lo, n); // [TAG_FN_L20_BIGPROMPT_TAIL] the part mapped again
     size_t bytes = 0;
-    const bool async = mc->adapt && async_req && mc->worker.joinable(); // [TAG_FN_L22_ENDOVERLAP] async_req: also per call
+    bool async = mc->adapt && async_req && mc->worker.joinable(); // [TAG_FN_L22_ENDOVERLAP] async_req: also per call
     // [TAG_FN_L22_LENDCLASS] after a narrow class's release: a hidden layer's slot below the unmapped part kept its bytes
     // (nothing writes an out layer's slots; an upload dropped meanwhile marked its slot dirty), so it needs no refill
     const bool      part    = mc->l22_part;
@@ -5787,6 +5830,31 @@ bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
         }
         return true;
     };
+    // [TAG_FN_L22_ENDOVERLAP] r22 T6 fix: an asked-for asynchronous refill above L22_ASYNC_REFILL_MAX runs synchronously here
+    // (the copy threads, ~0.26 s for 4 GiB) instead of landing through the upload worker for 1-1.5 s during the answer
+    if (async && async_req && !mc->cb_async) {
+        size_t need = 0;
+        for (const auto & ls : mc->layers) {
+            if (!ls.cb_lent) {
+                continue;
+            }
+            const size_t b = ls.pub.up_src->nb[2] + ls.pub.gate_src->nb[2] + ls.pub.down_src->nb[2];
+            for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
+                if (ls.slot_expert[s] >= 0 && !ls.slot_in_flight[s] && !intact(ls, s)) {
+                    need += b;
+                }
+            }
+        }
+        if (need > L22_ASYNC_REFILL_MAX) {
+            async = false;
+            mc->l22_sync_res++;
+            if (mc->l22_sync_res <= 2 || mc->l22_sync_res % 16 == 0) {
+                LLAMA_LOG_INFO("moe-hot: [TAG_FN_L22_ENDOVERLAP] tail refill of %.2f GiB: by the copy threads now (more than %zu MiB "
+                        "would land through the upload worker for seconds while the CPU computes those experts; %" PRIu64 " so far)\n",
+                        need/1073741824.0, L22_ASYNC_REFILL_MAX >> 20, mc->l22_sync_res);
+            }
+        }
+    }
     if (async) {
         // through the upload worker, published at the owner's step boundaries as they land, the CPU computing them until
         // then: every resident slot leaves the tables and goes in flight, as for an admission (evict, upload, publish)
