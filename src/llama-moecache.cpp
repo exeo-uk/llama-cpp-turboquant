@@ -40,6 +40,20 @@
 void fn_l21_dev_memory(const llama_model * model, ggml_backend_dev_t dev, size_t * mem_free, size_t * mem_total);
 // [TAG_FN_L22_REFILL] M2.4: the calling thread's memory priority to low (Windows; elsewhere a no-op), also at the end
 static void fn_l22_mem_prio_low();
+// [TAG_FN_L22_REFILL] (b) r22 T5 fix: the refill set's read-ahead, bounded (defined at the end: Windows only, elsewhere the
+// old unbounded request). Only ranges whose first page is outside the working set, at most the free RAM above a 4 GiB
+// floor, in requests of 64 ranges, and none after `stop` (set when the unlend / restore starts reading them itself)
+struct fn_l22_refill_pf_stats {
+    size_t ranges   = 0; // asked for by the caller
+    size_t resident = 0; // ... whose first page was in the working set (left out)
+    size_t asked_b  = 0; // bytes requested
+    size_t cut_b    = 0; // bytes left out by the RAM budget
+    size_t avail_b  = 0; // available RAM at the start
+    bool   stopped  = false;
+    double ms       = 0.0;
+};
+static void fn_l22_refill_prefetch_run(const std::vector<std::pair<const void *, size_t>> & rr, const std::atomic<bool> & stop,
+                                       fn_l22_refill_pf_stats & st);
 
 namespace {
 
@@ -425,6 +439,7 @@ struct moe_cache {
     size_t                l22_rel_b     = 0;     // [TAG_FN_L22_LENDCLASS] tail bytes unmapped since the last take
     std::thread           l22_pf_th;             // [TAG_FN_L22_REFILL] (b) the refill set's prefetch
     std::atomic<bool>     l22_pf_busy{false};
+    std::atomic<bool>     l22_pf_stop{false};       // [TAG_FN_L22_REFILL] r22 T5: the unlend / restore reads the set itself now
     // [TAG_FN_L22_LENDCLASS] the tail is out with fewer bytes unmapped than layers hidden (a narrow FULL class): the
     // restore refills only the slots that reach into the unmapped part, and the dirty ones
     bool                  l22_part      = false;
@@ -4322,6 +4337,9 @@ bool llama_moe_hot_lend(const void * owner, size_t bytes, ggml_backend_buffer_t 
 
 void llama_moe_hot_unlend(const void * owner) {
     moe_cache * mc = g_cache;
+    if (mc) {
+        mc->l22_pf_stop.store(true); // [TAG_FN_L22_REFILL] r22 T5: the refill set's read-ahead ends here
+    }
     if (!mc || !mc->lent_any) {
         return;
     }
@@ -4412,6 +4430,9 @@ void llama_moe_hot_unlend(const void * owner) {
 // experts in flight meanwhile. Without the adaptive set (no worker) the synchronous unlend runs.
 void llama_moe_hot_unlend_async(const void * owner) {
     moe_cache * mc = g_cache;
+    if (mc) {
+        mc->l22_pf_stop.store(true); // [TAG_FN_L22_REFILL] r22 T5: the refill set's read-ahead ends here
+    }
     if (!mc || !mc->lent_any) {
         return;
     }
@@ -4569,10 +4590,18 @@ size_t llama_moe_hot_prefetch_refill(const void * owner) {
         mc->l22_pf_th.join(); // finished (not busy)
     }
     mc->l22_pf_busy.store(true);
+    mc->l22_pf_stop.store(false);
     mc->l22_pf_th = std::thread([mc, rr = std::move(rr)]() {
         llama_fn_thread_name("hot-refill-prefetch");
         fn_l22_mem_prio_low();
-        llama_fn_prefetch_ranges(rr);
+        // r22 T5 fix: bounded (resident ranges, the RAM budget, the stop at the unlend): the unbounded request of the whole
+        // set (~7.5 GiB at Flash-Next's 16-layer lend) read pages into a full RAM and slowed the first answer by +38 % ms per
+        // step (r22 end test T2, first answer after a streamed prompt while the RAM held no room)
+        fn_l22_refill_pf_stats st;
+        fn_l22_refill_prefetch_run(rr, mc->l22_pf_stop, st);
+        llama_fn_l22_log("switch", "what=refill_prefetch ranges=%zu resident=%zu asked_mib=%.0f cut_mib=%.0f avail_mib=%.0f "
+                "ms=%.1f stopped=%d", st.ranges, st.resident, st.asked_b/1048576.0, st.cut_b/1048576.0, st.avail_b/1048576.0,
+                st.ms, st.stopped ? 1 : 0);
         mc->l22_pf_busy.store(false);
     });
     return bytes;
@@ -5677,7 +5706,8 @@ void llama_moe_hot_stop(const void * owner) {
         mc->fa18_pf_th.join(); // [TAG_FN_L18_FIRSTANS_STATE] its jobs are queued (or dropped) before the worker stops
     }
     if (mc->l22_pf_th.joinable()) {
-        mc->l22_pf_th.join(); // [TAG_FN_L22_REFILL] the refill set's prefetch (one call, bounded)
+        mc->l22_pf_stop.store(true);
+        mc->l22_pf_th.join(); // [TAG_FN_L22_REFILL] the refill set's prefetch (requests of 64 ranges, stops)
     }
     {
         std::lock_guard<std::mutex> lk(mc->wmtx);
@@ -5707,6 +5737,9 @@ bool llama_moe_hot_cbuf_restore(const void * owner) {
 
 bool llama_moe_hot_cbuf_restore_ex(const void * owner, bool async_req) {
     moe_cache * mc = g_cache;
+    if (mc) {
+        mc->l22_pf_stop.store(true); // [TAG_FN_L22_REFILL] r22 T5: the refill set's read-ahead ends here
+    }
     if (!mc || !mc->cb_buf || !mc->cb_out) {
         return true;
     }
@@ -5938,7 +5971,95 @@ static void fn_l22_mem_prio_low() {
     struct { ULONG MemoryPriority; } mpi = { 2 };       // MEMORY_PRIORITY_INFORMATION { MEMORY_PRIORITY_LOW }
     (void) set_info(GetCurrentThread(), 0 /* ThreadMemoryPriority */, &mpi, (DWORD) sizeof(mpi));
 }
+
+// [TAG_FN_L22_REFILL] (b) r22 T5 fix: see the declaration at the top
+struct fn_l22_ws_ex { // PSAPI_WORKING_SET_EX_INFORMATION: bit 0 of attr = Valid (in the working set)
+    void *    va;
+    uintptr_t attr;
+};
+static void fn_l22_refill_prefetch_run(const std::vector<std::pair<const void *, size_t>> & rr, const std::atomic<bool> & stop,
+                                       fn_l22_refill_pf_stats & st) {
+    const int64_t t0 = ggml_time_us();
+    st.ranges = rr.size();
+    using qws_t = BOOL (WINAPI *)(HANDLE, PVOID, DWORD);
+    using pvm_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const qws_t qws = (qws_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx");
+    static const pvm_t pvm = (pvm_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (pvm == nullptr || rr.empty()) {
+        return;
+    }
+    // the ranges whose first page is out of the working set (the rest needs no read)
+    std::vector<std::pair<const void *, size_t>> out;
+    out.reserve(rr.size());
+    if (qws != nullptr) {
+        std::vector<fn_l22_ws_ex> w;
+        for (size_t i0 = 0; i0 < rr.size() && !stop.load(std::memory_order_relaxed); i0 += 2048) {
+            const size_t n = std::min<size_t>(2048, rr.size() - i0);
+            w.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                w[i].va   = (void *) ((uintptr_t) rr[i0 + i].first & ~(uintptr_t) 4095);
+                w[i].attr = 0;
+            }
+            const bool ok = qws(GetCurrentProcess(), w.data(), (DWORD) (n*sizeof(fn_l22_ws_ex))) != 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (ok && (w[i].attr & 1)) {
+                    st.resident++;
+                } else {
+                    out.push_back(rr[i0 + i]);
+                }
+            }
+        }
+    } else {
+        out = rr;
+    }
+    // the RAM budget: reading more than the available RAM above a 4 GiB floor only pushes other pages out (the decode's
+    // CPU experts); the unlend reads what is left itself, as without the switch
+    MEMORYSTATUSEX ms;
+    memset(&ms, 0, sizeof(ms));
+    ms.dwLength = sizeof(ms);
+    size_t budget = SIZE_MAX;
+    if (GlobalMemoryStatusEx(&ms)) {
+        st.avail_b = (size_t) ms.ullAvailPhys;
+        const size_t floor_b = (size_t) 4 << 30;
+        budget = st.avail_b > floor_b ? st.avail_b - floor_b : 0;
+    }
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
+    e.reserve(64);
+    size_t i = 0;
+    for (; i < out.size(); ++i) {
+        if (st.asked_b + out[i].second > budget) {
+            break;
+        }
+        if (stop.load(std::memory_order_relaxed)) {
+            st.stopped = true;
+            break;
+        }
+        e.push_back({ (PVOID) out[i].first, (SIZE_T) out[i].second });
+        st.asked_b += out[i].second;
+        if (e.size() == 64) {
+            pvm(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
+            e.clear();
+        }
+    }
+    if (!e.empty() && !stop.load(std::memory_order_relaxed)) {
+        pvm(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
+    }
+    for (; i < out.size(); ++i) {
+        st.cut_b += out[i].second;
+    }
+    st.stopped = st.stopped || stop.load(std::memory_order_relaxed);
+    st.ms      = (ggml_time_us() - t0)/1000.0;
+}
 #else
 static void fn_l22_mem_prio_low() {
+}
+static void fn_l22_refill_prefetch_run(const std::vector<std::pair<const void *, size_t>> & rr, const std::atomic<bool> & stop,
+                                       fn_l22_refill_pf_stats & st) {
+    (void) stop;
+    st.ranges = rr.size();
+    for (const auto & r : rr) {
+        st.asked_b += r.second;
+    }
+    llama_fn_prefetch_ranges(rr);
 }
 #endif
