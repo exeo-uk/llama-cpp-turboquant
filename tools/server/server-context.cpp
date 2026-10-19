@@ -1253,6 +1253,10 @@ struct server_slot {
     // [TAG_FN_L22_MTP_KEEP] the MTP draft keeps its sequence across media chunks (repair_draft_after_media)
     bool l22_mtp_keep = false;
 
+    // [TAG_FN_L22_MEDIA_ANCHOR] r22 T7: the text batches stop at this task token index (the start of the user message that
+    // holds the next picture), so the merged image batch starts there and takes its checkpoint; -1 = none
+    mutable int64_t l22_anchor_stop = -1;
+
     // [TAG_FN_L22_IMGPASS] [TAG_FN_L22_VLEND_HOLD] the embeddings of this prompt's media chunks, encoded together under one
     // lend hold: chunk start idx -> its rows (owned by the mtmd batches, grouped as process_mtmd_chunk groups them)
     struct l22_media_enc_t {
@@ -3856,8 +3860,24 @@ private:
         // the user message that holds it): a picture-budget cut re-read the whole prompt from the system block (8,290 rows
         // vs 2,253 on v0.24.0). The text batches stop at the picture message's start as on the per-chunk path, and the merged
         // batch then starts there (its checkpoint rule: a user message start)
+        slot.l22_anchor_stop = -1;
         if (segs.size() > 1 && !segs[0].media && segs[0].n_rows >= 512) {
-            return -1;
+            // the start of the user message that holds the first picture (cur + the text run = that picture's index)
+            const int64_t m0 = cur + segs[0].n_rows;
+            int64_t       u  = -1;
+            for (const auto & sp : t.params.message_spans.spans) {
+                if (sp.role == COMMON_CHAT_ROLE_USER && (int64_t) sp.pos <= m0 && m0 < (int64_t) (sp.pos + sp.len)) {
+                    u = (int64_t) sp.pos;
+                }
+            }
+            if (u > cur) {
+                slot.l22_anchor_stop = u; // the text batch ends there; the next plan merges from u (a short text run)
+                return -1;
+            }
+            if (u < 0) {
+                return -1; // no span: the text batches run to the picture and the merged batch starts at it
+            }
+            // u <= cur: the picture message starts here; merge as planned below
         }
 
         // the width the context will use for this turn: hint first, then the getter (P4)
@@ -7804,6 +7824,7 @@ private:
                     // [TAG_FN_L22_IMGPASS] [TAG_FN_L22_VLEND_HOLD] the rest of the prompt's media chunks are encoded together
                     // (one lend); with IMGPASS this batch then holds the turn's text and image rows as embeddings up to l22_end
                     int64_t l22_end  = -1;
+                    slot.l22_anchor_stop = -1; // [TAG_FN_L22_MEDIA_ANCHOR] r22 T7: set again by l22_plan_merged below
                     bool    l22_fail = false;
                     if (slot.mctx && !media_async && (l22.imgpass_ok || l22.vlend_hold) &&
                             !l22_media_starts(input_tokens, slot.prompt.n_tokens()).empty()) {
@@ -8110,6 +8131,12 @@ private:
 
                         // the tail split (tail_split_break above)
                         if (do_checkpoint && tail_split_break()) {
+                            break;
+                        }
+                        // [TAG_FN_L22_MEDIA_ANCHOR] r22 T7: the picture message's start ends the text batch (the merged
+                        // image batch starts there with its checkpoint)
+                        if (l22_end < 0 && slot.l22_anchor_stop > 0 && (int64_t) slot.prompt.n_tokens() == slot.l22_anchor_stop) {
+                            slot.l22_anchor_stop = -1;
                             break;
                         }
                     }
