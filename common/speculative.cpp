@@ -3536,6 +3536,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool     mtp_state      = false;
     uint64_t vis_n_batches  = 0;
     uint64_t vis_n_rows     = 0;
+    uint64_t vis_n_full     = 0; // [TAG_FN_L21_MTP_VISION] r22 T6: image rows the windowed draft cache had no cells for
+    uint64_t vis_n_full_ev  = 0;
+    // [TAG_FN_L21_MTP_VISION] r22 T6: the rest of an image run is left out of the draft (no cell in its windowed cache)
+    void vis_full_skip(int n_rows, int pos) {
+        vis_n_full += (uint64_t) std::max(0, n_rows);
+        if (vis_n_full_ev++ % 64 == 0) {
+            SPC_WRN("[TAG_FN_L21_MTP_VISION] the draft's windowed cache has no cell left for %d image rows from pos %d (image "
+                    "rows share positions, so a window of positions holds more rows than its cells): not decoded on the draft, "
+                    "as with MTP_VISION off (%llu rows in %llu runs so far)\n", n_rows, pos, (unsigned long long) vis_n_full,
+                    (unsigned long long) vis_n_full_ev);
+        }
+    }
 
     // [TAG_FN_L4_HOST_MTPFUSE] LLAMA_FN_L4_HOST_MTPFUSE=1 (qwen4exp, single head): process() keeps the rows of a verify batch
     // instead of decoding them, accept() keeps the accepted ones, and the first draft decode carries them in front of its own
@@ -4458,6 +4470,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                 }
                             }
                             const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                            if (rc == 1 && kind_img) {
+                                // [TAG_FN_L21_MTP_VISION] r22 T6 fix: the windowed draft cache (LLAMA_MTP_ATTN_WINDOW: window +
+                                // n_ubatch cells, evicting by position) has no cell left: image rows share M-RoPE positions,
+                                // so a window of positions can hold more image rows than cells (12 screenshots at ~30K
+                                // context: "failed to find a memory slot", and the request failed). The rest of this image
+                                // run is not decoded on the draft - as with MTP_VISION off, the draft takes the same
+                                // position jump - instead of failing the request
+                                vis_full_skip((int) (end - c), (int) batch_in.tokens[rows[c]].pos[0]);
+                                break;
+                            }
                             if (rc != 0) {
                                 SPC_ERR("llama_process(ctx_dft) merged %s run failed rc=%d (pos=%d n=%d)\n", kind_img ? "image" : "text",
                                         (int) rc, (int) batch_in.tokens[rows[c]].pos[0], (int) n_chunk);
@@ -4486,6 +4508,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (rc == 1 && img) {
+                    vis_full_skip((int) (win_rows.size() - off), (int) batch_in.tokens[win_rows[off]].pos[0]); // r22 T6 fix
+                    break;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) windowed failed rc=%d (pos=%d n=%d)\n", (int) rc,
                             (int) batch_in.tokens[win_rows[off]].pos[0], (int) n_chunk);
@@ -4526,6 +4552,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc == 1 && img) {
+                        vis_full_skip(n_tokens - off, (int) batch_in.tokens[off].pos[0]); // r22 T6 fix
+                        break;
+                    }
                     if (rc != 0) {
                         SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d off=%d n=%d)\n",
                                 head, (int) rc, (int) batch_in.tokens[0].pos[0], (int) off, (int) n_chunk);

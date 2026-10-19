@@ -2809,7 +2809,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     LLAMA_LOG_WARN("%s: [TAG_FN_MTP_ATTN_WINDOW] the MTP block is a QSA layer (compress ratio > 0): "
                                             "LLAMA_MTP_ATTN_WINDOW ignored, the draft KV keeps %u cells\n", __func__, cparams.n_ctx_seq);
                                 } else {
-                                    const uint64_t cells = (uint64_t) w*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
+                                    // [TAG_FN_L21_MTP_VISION] r22 T6 fix: with MTP_VISION the draft holds image rows too, and
+                                    // image rows share M-RoPE positions: a window of w positions then holds more than w rows
+                                    // (12 screenshots at ~30K context needed ~38K cells in a 32K window: no slot, the request
+                                    // failed). Twice the window keeps room for ~w image rows (one MTP layer: +~34 MiB at 32K)
+                                    const char *   mv      = llama_fn_env(*this, "LLAMA_FN_L21_MTP_VISION");
+                                    const uint64_t w_cells = (uint64_t) w*(mv && atoi(mv) > 0 ? 2 : 1);
+                                    const uint64_t cells = w_cells*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
                                     n_swa_attn   = (uint32_t) w;
                                     swa_attn     = LLAMA_SWA_TYPE_STANDARD;
                                     kv_size_attn = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD(cells, 256));
