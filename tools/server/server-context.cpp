@@ -3851,6 +3851,14 @@ private:
         if (i < total) {
             segs.push_back({ false, total - i });
         }
+        // [TAG_FN_L22_MEDIA_ANCHOR] r22 end test T7 fix: a long text run before the first picture goes the text way first. In
+        // the merged batch it had no batch start of its own, so no checkpoint could sit at the picture message (the start of
+        // the user message that holds it): a picture-budget cut re-read the whole prompt from the system block (8,290 rows
+        // vs 2,253 on v0.24.0). The text batches stop at the picture message's start as on the per-chunk path, and the merged
+        // batch then starts there (its checkpoint rule: a user message start)
+        if (segs.size() > 1 && !segs[0].media && segs[0].n_rows >= 512) {
+            return -1;
+        }
 
         // the width the context will use for this turn: hint first, then the getter (P4)
         llama_fn_prompt_after_ext(ctx_tgt, (int32_t) (total - cur));
