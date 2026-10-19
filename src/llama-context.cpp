@@ -4116,8 +4116,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 return -2;
             }
         }
+        // [TAG_FN_L22_RWIDTH] a prompt that starts while FULL stays (the thrash pin: 8 prompts within 64 batches, e.g. short
+        // answers; or a prompt that ended without an answer step) ran at the width FULL had: a 10K prompt in two passes
+        // under an 8K FULL, where the switch from SMALL plans one 16K pass. Its first wide batch now plans as that switch
+        // would and goes to the 16K reserve (the borrow out); the pinned state goes back at its first narrow batch
+        if (cbuf_state == CBUF_FULL && l20_base_ub > 0 && l21_bigub && !l21_big_off && l21_extra > 0 && l22p.ubplan) {
+            if (wide && !l22p_switch && !l22_rw_planned && cbuf_full_t > 0 && cbuf_full_t < cparams.n_ubatch && l22_class == 0 &&
+                !(l22p_bg2_on && l22p_prompt_seqs > 1)) {
+                l22_rw_planned = true;
+                l22p_bucket = llama_fn_l22_depth_bucket(l22p_depth);
+                if (l22p_plan_width((uint32_t) n_tokens_all, after, true) > cbuf_full_t && !l22_full_rewidth(true)) {
+                    return -2;
+                }
+            } else if (!wide && l22_rw_big && cbuf_pinned && !keep_full && !tail_full) {
+                if (!l22_full_rewidth(false)) {
+                    return -2;
+                }
+            }
+        }
         if (!cbuf_set(want_full, full_w, cls)) {
             return -2;
+        }
+        if (l22p_switch) {
+            l22_rw_planned = true; // [TAG_FN_L22_RWIDTH] the switch from SMALL planned this prompt's width
+        }
+        if (n_outputs_all > 0) {
+            l22_rw_planned = false; // [TAG_FN_L22_RWIDTH] a prompt's end or an answer step: the next wide batch is a new prompt
         }
         // [TAG_FN_L22_PASSLOG] the prompt's record: rows and batches of the FULL period
         if (l22_rec_on && cbuf_state == CBUF_FULL && n_tokens_all > cbuf_small_t) {
@@ -7289,6 +7313,7 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
     }
     cbuf_state = CBUF_SMALL;
     cbuf_full_t = 0; // [TAG_FN_L20_BIGPROMPT_UB]
+    l22_rw_big  = false; // [TAG_FN_L22_RWIDTH] the borrow returns below
     // [TAG_FN_L22_SMALLKEEP] a parked SMALL scheduler comes back instead of a new SMALL reserve, unless a reserve outside the
     // cbuf code ran (or is pending) while it was parked: then it goes and today's path runs
     const bool sk_keep = l22_sk_parked && !l22_sk_stale && !sched_need_reserve;
@@ -7639,6 +7664,86 @@ bool llama_context::l22_class_upgrade() {
     if (l22_n_upgrade <= 3 || l22_n_upgrade % 32 == 0) {
         LLAMA_LOG_INFO("%s: [TAG_FN_L22_LENDCLASS] upgrade %" PRIu64 ": class %u -> %u tokens (%.0f MiB more of the tail given back)\n",
                 __func__, l22_n_upgrade, from, cbuf_full_t, rel/MiB);
+    }
+    return true;
+}
+
+// [TAG_FN_L22_RWIDTH] the FULL width inside a FULL state: big = the command's ubatch with the borrow out (what a switch
+// from SMALL does for a 16K prompt: borrow, reserve, the draft's wide reserve), else the base width with the borrow back
+// (what the switch to SMALL does: draft narrow, buffers freed, borrow mapped and its residents queued, then the reserve).
+// The prefill stream's banks go back first (the borrow and the restore change the hot set's tables only with no lend
+// out, as at a switch). A borrow that falls short keeps the width. false: the reserve failed (back to SMALL, the batch fails)
+bool llama_context::l22_full_rewidth(bool big) {
+    constexpr double MiB = 1024.0*1024.0;
+    if (cbuf_state != CBUF_FULL || l20_base_ub == 0 || l21_extra == 0 || big == l22_rw_big) {
+        return true;
+    }
+    llama_l22_flag_scope sk_scope(l22_sk_in_cbuf); // [TAG_FN_L22_SMALLKEEP] a cbuf reserve: a parked SMALL stays valid
+    llama_fn_stall_scope st_scope(big ? "FULL width -> 16K begins" : "FULL width -> base begins", "FULL width change ends");
+    llama_perf_hold hold(n_queued_tokens, t_compute_start_us);
+    const int64_t t0 = ggml_time_us();
+    synchronize();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    llama_moe_gen5_before_ubatch(this, sched.get(), 0); // the stream's banks back (no-op when none are lent)
+    llama_prefill_stream_l22_async_return(this, false);
+    ggml_backend_dev_t dev = llama_moe_hot_device(model);
+    const uint32_t from = cbuf_full_t;
+    size_t got = 0;
+    if (big) {
+        got = llama_moe_hot_cb_borrow(this);
+        if (got < l21_extra) {
+            llama_moe_hot_cb_unborrow(this);
+            if (l21_n_fallback++ < 3) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_RWIDTH] the borrow gave %.0f of %.0f MiB: the prompt keeps %u tokens per ubatch\n",
+                        __func__, got/MiB, l21_extra/MiB, from);
+            }
+            return true;
+        }
+        cbuf_full_t = cparams.n_ubatch;
+        l22_rw_big  = true;
+        cbuf_free_compute();
+    } else {
+        if (l20_dft_extra > 0) {
+            if (llama_context * dft = l20_draft()) {
+                dft->dft_set_wide(false); // [TAG_FN_L20_BIGPROMPT_DFTUB]
+            }
+        }
+        cbuf_full_t = l20_base_ub;
+        l22_rw_big  = false;
+        cbuf_free_compute();
+        llama_moe_hot_cb_unborrow(this); // after the big buffers went: mapped, cleared, its residents queued
+    }
+    if (llama_fn_pin_active()) {
+        l22_oom_pre(big ? cbuf_full_b : (l20_full_base_b > 0 ? l20_full_base_b : cbuf_full_b));
+    }
+    try {
+        sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: [TAG_FN_L22_RWIDTH] the %u-token reserve failed (%s): back to SMALL, this batch fails\n", __func__,
+                cbuf_full_t, err.what());
+        size_t trimmed  = 0;
+        bool   restored = true;
+        cbuf_to_small(dev, trimmed, restored); // the borrow and the draft's width go back there
+        return false;
+    }
+    if (big && l20_dft_extra > 0) {
+        if (llama_context * dft = l20_draft()) {
+            dft->dft_set_wide(true); // [TAG_FN_L20_BIGPROMPT_DFTUB] the draft's prompt ubatches follow the trunk's
+        }
+    }
+    (big ? l22_rw_n_up : l22_rw_n_down)++;
+    const uint64_t n = big ? l22_rw_n_up : l22_rw_n_down;
+    if (n <= 3 || n % 32 == 0) {
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] %s %" PRIu64 ": FULL %u -> %u tokens per ubatch inside the FULL state%s in %.1f ms "
+                "(borrow %s %.0f MiB)\n", __func__, big ? "up" : "down", n, from, cbuf_full_t, cbuf_pinned ? " (pinned)" : "",
+                (ggml_time_us() - t0)/1000.0, big ? "out" : "back", (big ? got : l21_extra)/MiB);
+    }
+    if (l22.passlog >= 1) {
+        llama_fn_l22_log("switch", "what=rewidth dir=%s from=%u to=%u pinned=%d ms=%.1f why=%s est_base=%.0f est_big=%.0f R=%lld",
+                big ? "up" : "down", from, cbuf_full_t, cbuf_pinned ? 1 : 0, (ggml_time_us() - t0)/1000.0, big ? l22p_why : "end",
+                l22p_est_base, l22p_est_big, (long long) l22p_rows_plan);
     }
     return true;
 }
