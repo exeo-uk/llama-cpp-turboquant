@@ -273,6 +273,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_TOKCACHE",              "1",       P_ALL }, // P2 [TAG_FN_L22_TOKCACHE] E11
     { "LLAMA_FN_L22_TOKCACHE_VERIFY",       "1",       P_ALL }, // P2
     { "LLAMA_FN_L22_JSONFLOAT",             "1",       P_ALL }, // P2 [TAG_FN_L22_JSONFLOAT] E8 towards the reference
+    { "LLAMA_FN_L22_PLEQ8",                 "1",       P_ALL }, // [TAG_FN_L22_PLEQ8] <model>.ple.q8_0 n-gram table when present
     { "LLAMA_FN_L22_VLRESIZE",              "0",       P_ALL }, // P2 F7 until an OCR A/B
     { "LLAMA_FN_L22_VLBATCH",               "0",       P_ALL }, // P2b until its encoder KLD
     { "LLAMA_FN_L22_MTP_KEEP",              "1",       P_ALL }, // P3 [TAG_FN_L22_MTP_KEEP] C0

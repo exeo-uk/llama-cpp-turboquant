@@ -5,6 +5,7 @@
 #include "llama-moetrace.h" // [TAG_FN_MOE_TRACE]
 #include "llama-moe-gen5.h" // [TAG_MOE_PREFETCH]
 #include "llama-ple-dio.h"  // [TAG_FN_PLE_DIRECT_IO]
+#include "gguf.h"           // [TAG_FN_L22_PLEQ8] typed table files
 #include "llama-mmap.h"     // [TAG_FN_L11_EMBDLOCK]
 #include "llama-fn-auto.h"  // [TAG_FN_L11_EMBDLOCK] llama_fn_l3_flag
 #include "llama-ext.h"      // [TAG_FN_SHIP1] llama_model_fn_env
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>     // [TAG_FN_SHIP1]
@@ -153,9 +155,134 @@ static bool qwen4exp_ple_auto_room(const llama_ple_dio_params & shard, const std
     return true;
 }
 
+// [TAG_FN_L22_PLEQ8] true when the file starts with the GGUF magic (such a file is never taken for, or made into, a raw copy)
+static bool qwen4exp_file_is_gguf(const std::string & path) {
+    FILE * f = ggml_fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+    char m[4] = {};
+    const bool ok = fread(m, 1, 4, f) == 4 && memcmp(m, "GGUF", 4) == 0;
+    fclose(f);
+    return ok;
+}
+
+// [TAG_FN_L22_PLEQ8] a typed table file: a GGUF file holding the model's PLE table (the tensor of the same name and shape)
+// in another row type, e.g. the q8_0 shard of the source quant as it is. Its header gives the type and the data offset.
+static bool qwen4exp_ple_typed_file(const std::string & path, const ggml_tensor * t, ggml_type & type, uint64_t & offset,
+        std::string & why) {
+    if (!qwen4exp_file_is_gguf(path)) {
+        why = "not a GGUF file";
+        return false;
+    }
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ &meta };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        why = "its GGUF header cannot be read";
+        return false;
+    }
+    bool ok = false;
+    const char * name = ggml_get_name(t);
+    const int64_t id = gguf_find_tensor(g, name);
+    const ggml_tensor * mt = id >= 0 && meta != nullptr ? ggml_get_tensor(meta, name) : nullptr;
+    if (mt == nullptr) {
+        why = std::string("it has no tensor ") + name;
+    } else if (mt->ne[0] != t->ne[0] || mt->ne[1] != t->ne[1] || mt->ne[2] != 1 || mt->ne[3] != 1) {
+        why = format("its %s is %lld x %lld, the model's %lld x %lld", name, (long long) mt->ne[0], (long long) mt->ne[1],
+                (long long) t->ne[0], (long long) t->ne[1]);
+    } else if (mt->type != GGML_TYPE_F32 && ggml_get_type_traits(mt->type)->to_float == nullptr) {
+        why = std::string("type ") + ggml_type_name(mt->type) + " has no to_float";
+    } else {
+        type   = mt->type;
+        offset = (uint64_t) gguf_get_data_offset(g) + (uint64_t) gguf_get_tensor_offset(g, id);
+        const int64_t need = (int64_t) offset + t->ne[1] * (int64_t) ggml_row_size(type, t->ne[0]);
+        const int64_t have = llama_ple_dio_file_size(path);
+        if (have < need) {
+            why = format("the file has %lld bytes, its table ends at %lld", (long long) have, (long long) need);
+        } else {
+            ok = true;
+        }
+    }
+    gguf_free(g);
+    if (meta != nullptr) {
+        ggml_free(meta);
+    }
+    return ok;
+}
+
+// [TAG_FN_L22_PLEQ8] the typed table must be the model's table: 256 rows (128 spread with the first and last, 128
+// scattered) read from both files, as floats, must point the same way (cosine over all of them; the q8_0 table of the
+// source quant vs its iq4_nl table: 0.997, another table: ~0). Unbuffered reads, no LRU; the mapping is not touched.
+static bool qwen4exp_ple_typed_matches(const llama_ple_dio_params & model_p, const llama_ple_dio_params & typed_p,
+        const ggml_tensor * t, double & cosv, std::string & why) {
+    llama_ple_dio_params a = model_p;
+    llama_ple_dio_params b = typed_p;
+    a.cache_bytes = b.cache_bytes = 0;
+    a.stats_every = b.stats_every = 0;
+    a.test_fail_every = b.test_fail_every = 0;
+    std::string err;
+    auto ra = llama_ple_dio::open(a, err);
+    if (!ra) {
+        why = "the model file cannot be read for the check: " + err;
+        return false;
+    }
+    auto rb = llama_ple_dio::open(b, err);
+    if (!rb) {
+        why = "cannot be read: " + err;
+        return false;
+    }
+    const int n = 256;
+    std::vector<int32_t> rows(n);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < n; ++i) {
+        if (i < n/2) {
+            rows[i] = (int32_t) ((a.n_rows - 1) * i / (n/2 - 1));
+        } else {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            rows[i] = (int32_t) (x % (uint64_t) a.n_rows);
+        }
+    }
+    const int64_t ne0 = t->ne[0];
+    std::vector<uint8_t> ba((size_t) n * a.row_bytes), bb((size_t) n * b.row_bytes);
+    std::vector<float>   fa((size_t) ne0), fb((size_t) ne0);
+    try {
+        ra->read_rows(rows.data(), n, ba.data(), 0, nullptr);
+        rb->read_rows(rows.data(), n, bb.data(), 0, nullptr);
+    } catch (const std::exception & e) {
+        why = std::string("check read failed: ") + e.what();
+        return false;
+    }
+    auto to_f = [ne0](ggml_type ty, const uint8_t * src, float * dst) {
+        if (ty == GGML_TYPE_F32) {
+            memcpy(dst, src, ne0*sizeof(float));
+        } else {
+            ggml_get_type_traits(ty)->to_float(src, dst, ne0);
+        }
+    };
+    const ggml_type tb = (ggml_type) b.row_type;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (int i = 0; i < n; ++i) {
+        to_f(t->type, ba.data() + (size_t) i * a.row_bytes, fa.data());
+        to_f(tb,      bb.data() + (size_t) i * b.row_bytes, fb.data());
+        for (int64_t k = 0; k < ne0; ++k) {
+            dot += (double) fa[k] * fb[k];
+            na  += (double) fa[k] * fa[k];
+            nb  += (double) fb[k] * fb[k];
+        }
+    }
+    cosv = na > 0.0 && nb > 0.0 ? dot / std::sqrt(na * nb) : 0.0;
+    if (!(cosv >= 0.98)) {
+        why = format("its rows do not match the model's table (cosine %.4f over %d rows, need >= 0.98)", cosv, n);
+        return false;
+    }
+    return true;
+}
+
 // copy_path: the user's LLAMA_PLE_DIO_FILE, else the qwen4exp profile's <model>.ple (copy_auto), else nullptr
+// typed: [TAG_FN_L22_PLEQ8] look for a typed table file (LLAMA_FN_L22_PLEQ8, qwen4exp profile 1)
 static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_loader & ml, const ggml_tensor * t,
-        const char * copy_path, bool copy_auto) {
+        const char * copy_path, bool copy_auto, bool typed) {
     const char * name = ggml_get_name(t);
     auto off = [&](const std::string & why) {
         LLAMA_LOG_WARN("%s: [TAG_FN_PLE_DIRECT_IO] LLAMA_PLE_DIRECT_IO is set, but %s; %s is read through the mapping\n",
@@ -235,6 +362,62 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
                 "model's %s\n", __func__, name, ty, f, (unsigned long long) p.offset, (long long) p.n_rows, p.row_bytes,
                 ggml_type_name(t->type));
         return std::shared_ptr<llama_ple_dio>(std::move(d));
+    }
+
+    // [TAG_FN_L22_PLEQ8] the n-gram table in a better row type (q8_0: ~0.5 % row error vs 7.6 % for the model's iq4_nl;
+    // KLD between the tables 0.021, perplexity -0.35 %, same speed; r22/pleq8/REPORT.md): the configured LLAMA_PLE_DIO_FILE
+    // when it is a GGUF file, else <model>.ple.q8_0 next to the model (the source quant's GGUF shard that holds the table,
+    // as it is). Its rows are read like the copy's (unbuffered, nothing maps it); a failed read is read again through the
+    // file cache. Not found or not this model's table: the model's table, as before. The choice is logged once.
+    const bool copy_is_gguf = copy_path != nullptr && *copy_path != '\0' && qwen4exp_file_is_gguf(copy_path);
+    if (typed) {
+        const std::string first = ml.files_paths.empty() ? std::string() : ml.files_paths[0];
+        std::string cand;
+        if (copy_is_gguf) {
+            cand = copy_path;
+        } else if (!first.empty() && llama_ple_dio_file_size(first + ".ple.q8_0") >= 0) {
+            cand = first + ".ple.q8_0";
+        }
+        if (cand.empty()) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L22_PLEQ8] %s: the model's %s table (no %s.ple.q8_0)\n", __func__, name,
+                    ggml_type_name(t->type), first.empty() ? "<model>" : first.c_str());
+        } else {
+            ggml_type ty  = GGML_TYPE_COUNT;
+            uint64_t  off = 0;
+            double    cv  = 0.0;
+            std::string why;
+            llama_ple_dio_params q = p;
+            bool ok = qwen4exp_ple_typed_file(cand, t, ty, off, why);
+            if (ok) {
+                q.path      = cand;
+                q.offset    = off;
+                q.row_bytes = ggml_row_size(ty, t->ne[0]);
+                q.row_type  = (int) ty;
+                ok = qwen4exp_ple_typed_matches(p, q, t, cv, why);
+            }
+            std::unique_ptr<llama_ple_dio> d;
+            if (ok) {
+                std::string err;
+                d = llama_ple_dio::open(q, err);
+                if (!d) {
+                    why = "cannot be opened: " + err;
+                }
+            }
+            if (d) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_PLEQ8] %s: the %s table from %s @ %llu (%lld rows x %zu B, unbuffered, "
+                        "row check cosine %.4f vs the model's %s table)\n", __func__, name, ggml_type_name(ty), cand.c_str(),
+                        (unsigned long long) off, (long long) q.n_rows, q.row_bytes, cv, ggml_type_name(t->type));
+                return std::shared_ptr<llama_ple_dio>(std::move(d));
+            }
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PLEQ8] %s: %s is not usable (%s); the model's %s table is read\n", __func__,
+                    name, cand.c_str(), why.c_str(), ggml_type_name(t->type));
+        }
+    }
+    if (copy_is_gguf) {
+        // [TAG_FN_L22_PLEQ8] never taken for a raw copy (which would be made again over it)
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PLEQ8] LLAMA_PLE_DIO_FILE=%s is a GGUF file, not a raw copy of the table; reading the "
+                "model file instead\n", __func__, copy_path);
+        copy_path = nullptr;
     }
 
     // LLAMA_PLE_DIO_FILE: read a copy that nothing maps (Windows serves unbuffered reads of a mapped file one at a time)
@@ -522,7 +705,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             const char * user_copy = getenv("LLAMA_PLE_DIO_FILE");
             const char * copy      = llama_model_fn_env(this, "LLAMA_PLE_DIO_FILE");
             const bool   copy_auto = !(user_copy && user_copy[0]) && copy && copy[0];
-            ple_dio = qwen4exp_open_ple_dio(ml, per_layer_tok_embd, copy, copy_auto);
+            // [TAG_FN_L22_PLEQ8] a typed table file next to the model (LLAMA_FN_L22_PLEQ8, profile 1)
+            const bool typed = llama_fn_l3_int(*this, "LLAMA_FN_L22_PLEQ8", 0) != 0;
+            ple_dio = qwen4exp_open_ple_dio(ml, per_layer_tok_embd, copy, copy_auto, typed);
         }
     }
 

@@ -337,6 +337,7 @@ struct llama_ple_dio::impl {
     unsigned long broken_code = 0;
 
     HANDLE h    = INVALID_HANDLE_VALUE;
+    HANDLE hb   = INVALID_HANDLE_VALUE; // [TAG_FN_L22_PLEQ8] buffered handle for re-reads without a fallback (lazy)
     HANDLE iocp = nullptr;
     uint8_t * bufs = nullptr; // queue_depth * slot_bytes, VirtualAlloc (page aligned)
     std::vector<win_slot>          slots;
@@ -344,6 +345,7 @@ struct llama_ple_dio::impl {
     std::vector<OVERLAPPED_ENTRY>  ents;
 #else
     int fd = -1;
+    int fdb = -1; // [TAG_FN_L22_PLEQ8] buffered descriptor for re-reads without a fallback (lazy)
     std::vector<uint8_t *> tbufs; // one aligned buffer per thread
     dio_pool pool;
 #endif
@@ -389,14 +391,80 @@ struct llama_ple_dio::impl {
         return p.test_fail_every > 0 && ++n_done % (uint64_t) p.test_fail_every == 0;
     }
 
+    // [TAG_FN_L22_PLEQ8] one row read through the file cache (a second, buffered handle opened on first use): the
+    // fallback of a table file that nothing maps. Only called when no read is in flight.
+    bool reread_buffered(int32_t row, uint8_t * dst, std::string & e) {
+        const uint64_t off = p.offset + (uint64_t) row * p.row_bytes;
+#if defined(_WIN32)
+        if (hb == INVALID_HANDLE_VALUE) {
+            const std::wstring wpath = dio_wpath(p.path);
+            hb = wpath.empty() ? INVALID_HANDLE_VALUE :
+                CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hb == INVALID_HANDLE_VALUE) {
+                e = "CreateFileW: " + win_err(GetLastError());
+                return false;
+            }
+        }
+        size_t got = 0;
+        while (got < p.row_bytes) {
+            OVERLAPPED ov {};
+            const uint64_t o = off + got;
+            ov.Offset     = (DWORD) (o & 0xffffffffu);
+            ov.OffsetHigh = (DWORD) (o >> 32);
+            DWORD n = 0;
+            if (!ReadFile(hb, dst + got, (DWORD) (p.row_bytes - got), &n, &ov) || n == 0) {
+                e = "ReadFile: " + win_err(GetLastError());
+                return false;
+            }
+            got += n;
+        }
+        return true;
+#else
+        if (fdb < 0) {
+            int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+            fdb = ::open(p.path.c_str(), flags);
+            if (fdb < 0) {
+                e = std::string("open: ") + strerror(errno);
+                return false;
+            }
+        }
+        size_t got = 0;
+        while (got < p.row_bytes) {
+            const ssize_t n = ::pread(fdb, dst + got, p.row_bytes - got, (off_t) (off + got));
+            if (n <= 0) {
+                e = n == 0 ? std::string("pread: end of file") : std::string("pread: ") + strerror(errno);
+                return false;
+            }
+            got += (size_t) n;
+        }
+        return true;
+#endif
+    }
+
     // only called when no read is in flight: failed rows come from the fallback, or the call throws
     void apply_failures(const uint8_t * fallback) {
         const size_t rb = p.row_bytes;
         for (const fail_rec & f : failed) {
             if (!fallback) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "PLE direct I/O: read of row %d failed (error 0x%lx) and there is no fallback",
-                         urow[f.u], f.code);
+                // [TAG_FN_L22_PLEQ8] a table file nothing maps (another row type): the row is read again through the
+                // file cache (one buffered read), so a failed or cancelled read never fails the ubatch
+                std::string rerr;
+                if (reread_buffered(urow[f.u], ubuf.data() + (size_t) f.u * rb, rerr)) {
+                    if (!warned_fail) {
+                        warned_fail = true;
+                        emit("%s: [TAG_FN_PLE_DIRECT_IO] warning: read of row %d failed (error 0x%lx); such rows are read "
+                             "again through the file cache\n", __func__, urow[f.u], f.code);
+                    }
+                    st.fallbacks++;
+                    continue;
+                }
+                char msg[320];
+                snprintf(msg, sizeof(msg), "PLE direct I/O: read of row %d failed (error 0x%lx) and the buffered read "
+                         "failed too (%s)", urow[f.u], f.code, rerr.c_str());
                 failed.clear();
                 throw std::runtime_error(msg);
             }
@@ -487,6 +555,10 @@ struct llama_ple_dio::impl {
         if (h != INVALID_HANDLE_VALUE) {
             CloseHandle(h);
             h = INVALID_HANDLE_VALUE;
+        }
+        if (hb != INVALID_HANDLE_VALUE) {
+            CloseHandle(hb);
+            hb = INVALID_HANDLE_VALUE;
         }
         if (bufs) {
             // after a port failure a read may still land in the buffers: leave them allocated
@@ -690,6 +762,10 @@ struct llama_ple_dio::impl {
         if (fd >= 0) {
             ::close(fd);
             fd = -1;
+        }
+        if (fdb >= 0) {
+            ::close(fdb);
+            fdb = -1;
         }
         for (uint8_t * b : tbufs) {
             free(b);
