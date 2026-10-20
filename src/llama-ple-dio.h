@@ -42,6 +42,8 @@ struct llama_ple_dio_params {
     int         stats_every = 0;    // 0 = no statistics, 1 = after 256 ubatches + at close, N > 1 = every N ubatches
     int         test_fail_every = 0; // tests only: every Nth read completes as failed (exercises the fallback path)
     int         spin_us     = 0;    // [TAG_FN_L11_DIOSPIN] Windows: poll the completions for up to this long per call, then block
+    int         row_type    = -1;   // [TAG_FN_L22_PLEQ8] tests only: ggml_type of the file's rows when they differ from the
+                                    // model table's (LLAMA_PLE_DIO_TYPE), -1 = the table's; such reads have no fallback
     void     (* log)(const char * line) = nullptr; // one line per call, ends with '\n'; nullptr = stderr
 };
 
