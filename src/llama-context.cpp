@@ -5,6 +5,7 @@
 #include "llama-moe-bridge.h" // [TAG_MOE_BRIDGE]
 #include "llama-moe-gen5.h" // [TAG_MOE_DMA_SHARE] [TAG_FN_PREFILL_STREAM]
 #include "llama-fn-auto.h" // [TAG_FN_AUTO] [TAG_FN_VRAM_FIT]
+#include "llama-fn-l22-p5.h" // [TAG_FN_L22_RWIDTH] llama_fn_p5_ssd_bytes
 #include "llama-fn-tier.h" // [TAG_FN_L15_WARM]
 #include "llama-fn-stall.h" // [TAG_FN_L18_FIRSTANS_STALL]
 #include "llama-fn-l22-p4.h" // [TAG_FN_L22_P4]
@@ -7441,6 +7442,31 @@ void llama_context::cbuf_retry_restore() {
 void llama_context::cbuf_note_full() {
     if (cbuf_thrash <= 0 || cbuf_pinned) {
         return;
+    }
+    // [TAG_FN_L22_RWIDTH] pressure pin (UBPLAN, LLAMA_FN_L22_RWIDTH_PRESS default 1): while the residency plan has an SSD set
+    // (the streamed experts do not fit in RAM above the floor), a switch from SMALL to FULL pins FULL at once, as the thrash
+    // pin does after 8 switches in 64 batches; the same lift rules apply (an answer of more than 16 steps lifts a 16K pin).
+    // Under the 8 GiB eater every FULL <-> SMALL round trip of a 10K-32K prompt cost 0.5-4 s (the 16K reserve's pinned host
+    // memory, the tail's refill, a 4-row last part that waited 3.9 s after its SMALL switch), and the follow-up bands ran
+    // +79 % (10K) / +19 % (fresh 32K) slower than v0.24.0, whose thrash pin landed 4 min earlier in the same series (r22
+    // end test, pre-T8 pressure series). Apps closed the plan has no SSD set: nothing changes there
+    if (l22_rw_press < 0) {
+        l22_rw_press = (l22p.ubplan && model.arch == LLM_ARCH_QWEN4EXP &&
+                        llama_fn_l3_int(model, "LLAMA_FN_L22_RWIDTH_PRESS", 1) != 0) ? 1 : 0;
+    }
+    if (l22_rw_press == 1) {
+        const size_t ssd = llama_fn_p5_ssd_bytes(model);
+        if (ssd > 0) {
+            cbuf_pinned     = true;
+            cbuf_narrow_run = 0;
+            cbuf_full_at.clear();
+            if (l22_rw_n_press++ < 4 || l22_rw_n_press % 64 == 0) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] pressure pin %llu: the residency plan reads %.2f GiB by direct I/O (RAM is "
+                        "short): FULL stays after this prompt (the lift rules apply)\n", __func__,
+                        (unsigned long long) l22_rw_n_press, ssd/1073741824.0);
+            }
+            return;
+        }
     }
     cbuf_full_at.push_back(cbuf_n_batch);
     while (!cbuf_full_at.empty() && cbuf_full_at.front() + 64 <= cbuf_n_batch) {

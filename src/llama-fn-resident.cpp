@@ -1391,6 +1391,21 @@ size_t llama_fn_p5_floor(const llama_model & model) {
     return r.t != nullptr ? r.t->floor_b : 0;
 }
 
+size_t llama_fn_p5_ssd_bytes(const llama_model & model) {
+    res_ref r(&model);
+    if (r.t == nullptr || r.t->ssd <= 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(r.t->lmtx);
+    size_t b = 0;
+    for (const auto & L : r.t->L) {
+        for (int e = 0; e < L.n_exp; ++e) {
+            b += class_of(L.fl[e].load(std::memory_order_relaxed)) == LLAMA_FN_RES_SSD ? L.eb : 0;
+        }
+    }
+    return b;
+}
+
 std::vector<llama_fn_p5_piece> llama_fn_p5_warm_list(const llama_model & model, size_t max_bytes, std::vector<size_t> & layer_end,
         size_t * pin_pending, size_t * skipped) {
     std::vector<llama_fn_p5_piece> out;

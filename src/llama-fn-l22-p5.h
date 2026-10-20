@@ -37,6 +37,10 @@ bool llama_fn_p5_resset(const llama_model & model);
 // pins are planned, R-P6-3); 0 when no table
 size_t llama_fn_p5_floor(const llama_model & model);
 
+// [TAG_FN_L22_RWIDTH] the bytes of the SSD set now (the experts the plan reads by direct I/O because the streamed set does
+// not fit in RAM above the floor): > 0 = the machine is short of RAM; 0 when no table or no SSD set
+size_t llama_fn_p5_ssd_bytes(const llama_model & model);
+
 // one warm piece: experts [e0, e1) of part `part` (0 up, 1 gate, 2 down) of layer il; [p, p + n) their bytes
 struct llama_fn_p5_piece {
     int          il;

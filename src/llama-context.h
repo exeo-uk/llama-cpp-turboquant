@@ -613,6 +613,8 @@ private:
     // and plans a wider width than FULL has: FULL goes back to SMALL first, then the batch makes the switch from SMALL
     bool     l22_rw_planned = false; // the running prompt's width was planned (reset by a batch with outputs)
     uint64_t l22_rw_n       = 0, l22_rw_n_nopin = 0;
+    int      l22_rw_press   = -1; // [TAG_FN_L22_RWIDTH] pressure pin on (1) / off (0) / not read yet (-1)
+    uint64_t l22_rw_n_press = 0;
     // [TAG_FN_L22_ENDOVERLAP] a prompt ended in FULL without the eager switch: the next narrow batch goes SMALL, async
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
