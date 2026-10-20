@@ -82,6 +82,12 @@ struct res_table {
     std::atomic<uint64_t>   n_ssd_mark{0};
     std::atomic<uint64_t>   n_ssd_unmark{0};
     std::atomic<double>     share{-1.0}; // resident share of the streamed set at the last sample
+    // [TAG_FN_L22_SSDFIX] the cache probe (fn_res::probe_*): state 0 none, 1 reading the set in, 2 watching; counters
+    std::atomic<int>        probe_state{0};
+    std::atomic<uint64_t>   n_probe{0};
+    std::atomic<uint64_t>   n_probe_ok{0};
+    std::atomic<uint64_t>   n_probe_lost{0};
+    std::atomic<uint64_t>   b_probe{0};
     std::mutex              lmtx;        // the log line's interval state
     uint64_t                dio_b0 = 0;
     uint64_t                dio_r0 = 0;
@@ -462,7 +468,7 @@ std::vector<std::pair<int, int>> res_streamed(const res_table * t, bool with_ssd
 // stage 0 (ready, before the warm pass): the whole set against resident + room, resident picks go to standby;
 // stage 1 (after the warm pass, and every 60 s when idle): the non-resident part against the room; stage 1 also gives
 // marks back (most routed first) when more than 1 GiB of room is left. Under t->mtx
-void res_ssd_plan(res_table * t, int stage) {
+void res_ssd_plan(res_table * t, int stage, size_t lw_room = SIZE_MAX) {
 #ifdef _WIN32
     if (t->ssd < 1) {
         return;
@@ -518,7 +524,8 @@ void res_ssd_plan(res_table * t, int stage) {
                     }
                 }
             }
-            const auto un = ssd_unpick(m, room - nonres - GIB);
+            // [TAG_FN_L22_SSDFIX] no more than the prompts' lowest available RAM leaves room for (lw_room)
+            const auto un = ssd_unpick(m, std::min(room - nonres - GIB, lw_room));
             for (size_t i : un) {
                 res_update(t->L[mx[i].first].fl[mx[i].second], [](uint8_t x) { return (uint8_t) (x & ~F_SSD); });
             }
@@ -583,9 +590,13 @@ void res_ssd_plan(res_table * t, int stage) {
 #endif
 }
 
-// [TAG_FN_L22_REWARM] the streamed set's missing 2 MiB blocks, in stream order (layer order); *share: resident share
-void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share) {
+// [TAG_FN_L22_REWARM] the streamed set's missing 2 MiB blocks, in stream order (layer order); *share: resident share;
+// *miss_b (optional): their bytes
+void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share, size_t * miss_b = nullptr) {
     miss.clear();
+    if (miss_b) {
+        *miss_b = 0;
+    }
 #ifdef _WIN32
     std::vector<range> runs;
     std::vector<uint8_t> sel;
@@ -624,6 +635,9 @@ void res_missing_blocks(res_table * t, std::vector<range> & miss, double * share
         }
     }
     *share = tot ? (double) ok/tot : 1.0;
+    if (miss_b) {
+        *miss_b = tot - ok;
+    }
 #else
     GGML_UNUSED(t);
     *share = 1.0;
@@ -691,13 +705,332 @@ void res_log(res_table * t, const char * when) {
 #endif
     llama_fn_l22_log("res", "when=%s avail_gib=%.2f streamed_gib=%.2f resident_share=%.3f vram_gib=%.2f pin_gib=%.2f ssd_gib=%.2f "
             "drops=%" PRIu64 " drop_gib=%.2f evict_pf_gib=%.2f rewarm_gib=%.2f ssd_marks=%" PRIu64 " ssd_unmarks=%" PRIu64
-            " dio_gib=%.2f dio_reads=%" PRIu64 " dio_fails=%" PRIu64 " gen=%" PRIu64, when, avail/1073741824.0,
+            " dio_gib=%.2f dio_reads=%" PRIu64 " dio_fails=%" PRIu64 " gen=%" PRIu64 " probe=%d probes=%" PRIu64 " probe_kept=%"
+            PRIu64 " probe_lost=%" PRIu64 " probe_gib=%.2f", when, avail/1073741824.0,
             (cls[0] + cls[3])/1073741824.0, t->share.load(), cls[1]/1073741824.0, cls[2]/1073741824.0, cls[3]/1073741824.0,
             t->n_drop.exchange(0), t->b_drop.exchange(0)/1073741824.0, t->b_evpf.exchange(0)/1073741824.0,
             t->b_rewarm.exchange(0)/1073741824.0, t->n_ssd_mark.exchange(0), t->n_ssd_unmark.exchange(0),
-            (db - t->dio_b0)/1073741824.0, dr - t->dio_r0, df, t->gen.load());
+            (db - t->dio_b0)/1073741824.0, dr - t->dio_r0, df, t->gen.load(), t->probe_state.load(), t->n_probe.load(),
+            t->n_probe_ok.load(), t->n_probe_lost.load(), t->b_probe.exchange(0)/1073741824.0);
     t->dio_b0 = db;
     t->dio_r0 = dr;
+}
+
+// [TAG_FN_L22_SSDFIX] the SSD tier's cache probe (fn_res::probe_fits / probe_verdict / probe_backoff), one step per idle
+// tick of the service thread. The marked set is read through the mapping when it fits above PROBE_FREE of available
+// RAM: unmarked (the stream reads it mapped from then on), prefetched and touched at low priority (stops at any
+// activity), then watched: kept when after a prompt or answer the streamed set's missing bytes did not grow; lost when
+// they did (the plan marks the least-routed missing experts again, the next probe waits twice as long, up to 32 min)
+constexpr int64_t PROBE_FIRST_US = 60000000;          // the first probe a minute after the warm pass; kept: the next look
+constexpr int64_t PROBE_BASE_US  = 120000000;         // the wait after a verdict
+constexpr int64_t PROBE_MAX_US   = 32*60000000LL;
+constexpr int64_t PROBE_WATCH_US = 20000000;          // the watch lasts at least this long (and one prompt or answer)
+constexpr size_t  PROBE_FREE     = (size_t) 2 << 30;  // a probe never takes the available RAM below this
+constexpr size_t  PROBE_CUSHION  = (size_t) 3 << 30;  // nor the lowest available RAM seen in prompts below this (pinned reserves, store)
+constexpr size_t  PROBE_WATCH_MIN = (size_t) 2 << 30; // a watch that sees less loses
+constexpr int64_t PROBE_LW_US    = 60000000;          // the low-water window (two of them are kept)
+
+struct probe_ctx {
+    int64_t            next   = 0; // 0: armed at the first idle tick after the warm pass
+    int64_t            wait   = PROBE_BASE_US;
+    int64_t            t0     = 0;
+    int64_t            t_samp = 0;
+    int64_t            act0   = 0;
+    size_t             miss0  = 0;
+    size_t             probed = 0;
+    bool               listed = false;
+    std::vector<range> miss;
+    size_t             at     = 0;
+    // the lowest available RAM over the last two windows of PROBE_LW_US, and whether a prompt or answer ran in them: a
+    // prompt's FULL reserve takes up to 2.4 GiB of pinned host memory for a moment (16K width), the conversation store
+    // more, so the room is what is left at the worst moment, not at the idle tick
+    size_t             lw_cur   = SIZE_MAX;
+    size_t             lw_prev  = SIZE_MAX;
+    bool               act_cur  = false;
+    bool               act_prev = false;
+    int64_t            lw_t0    = 0;
+    uint64_t           n_skip   = 0;
+    bool               lw_reset = false;            // the windows restarted after a give-back: no marks back until one is full
+    size_t             lw_watch = SIZE_MAX;         // the lowest available RAM since the probe began
+    std::vector<std::pair<int, int>> set;           // the probed experts (back to the SSD set when the probe is lost)
+};
+
+void res_probe_sample(probe_ctx & p, int64_t now, bool busy) {
+#ifdef _WIN32
+    const size_t a = fn_avail();
+    p.lw_cur   = std::min(p.lw_cur, a);
+    p.act_cur  = p.act_cur || busy;
+    if (!p.set.empty()) {
+        p.lw_watch = std::min(p.lw_watch, a); // a probe runs: its own low-water
+    }
+    if (p.lw_t0 == 0) {
+        p.lw_t0 = now;
+    } else if (now - p.lw_t0 >= PROBE_LW_US) {
+        p.lw_prev  = p.lw_cur;
+        p.act_prev = p.act_cur;
+        p.lw_reset = false;
+        p.lw_cur   = SIZE_MAX;
+        p.act_cur  = false;
+        p.lw_t0    = now;
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(now);
+    GGML_UNUSED(busy);
+#endif
+}
+
+void res_probe_end(res_table * t, probe_ctx & p, int64_t now, bool kept, size_t miss1, const char * why) {
+    t->probe_state.store(0);
+    p.wait = probe_backoff(p.wait, kept, PROBE_BASE_US, PROBE_MAX_US);
+    p.next = now + (kept ? PROBE_FIRST_US : p.wait);
+    p.miss.clear();
+    p.at     = 0;
+    p.listed = false;
+    (kept ? t->n_probe_ok : t->n_probe_lost).fetch_add(1);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 " %s (%s): the streamed set misses %.2f GiB (%.2f GiB at the "
+            "watch's start, %.2f GiB probed, available RAM at the lowest %.2f GiB)%s; next probe in %.0f s\n", __func__,
+            t->n_probe.load(), kept ? "kept" : "lost", why, miss1/1073741824.0, p.miss0/1073741824.0, p.probed/1073741824.0,
+            (p.lw_watch == SIZE_MAX ? 0 : p.lw_watch)/1073741824.0,
+            kept ? ": its experts are read through the mapping" : ": the set goes back to direct I/O", (p.next - now)/1e6);
+    if (!kept) {
+        // the probed experts back to the SSD set (not the ones a hot slot or a pin took meanwhile), their pages to the
+        // standby list at the next quiet moment (available again at once); then the plan for what else is missing
+        std::vector<std::pair<int, int>> back;
+        {
+            std::lock_guard<std::mutex> lk(t->mtx);
+            for (const auto & x : p.set) {
+                bool set = false;
+                res_update(t->L[x.first].fl[x.second], [&](uint8_t f) {
+                    set = !(f & (F_SLOT | F_PIN | F_VRAM));
+                    return set ? (uint8_t) (f | F_SSD) : f;
+                });
+                if (set) {
+                    back.push_back(x);
+                }
+            }
+        }
+        if (!back.empty()) {
+            t->n_ssd_mark.fetch_add(back.size());
+            t->gen.fetch_add(1);
+            res_queue_drop(t, back);
+        }
+        res_ssd_plan(t, 1);
+    }
+    p.set.clear();
+    p.lw_watch = SIZE_MAX;
+}
+
+void res_probe_step(res_table * t, int64_t now, int64_t act, probe_ctx & p) {
+#ifdef _WIN32
+    const int st = t->probe_state.load();
+    if (st == 0) {
+        if (p.next == 0) {
+            p.next = now + PROBE_FIRST_US;
+            return;
+        }
+        if (now < p.next) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(t->mtx); // no plan meanwhile
+        std::vector<std::pair<int, int>> m;
+        size_t mb = 0;
+        for (int li = 0; li < (int) t->L.size(); ++li) {
+            const res_layer & L = t->L[li];
+            for (int e = 0; e < L.n_exp; ++e) {
+                const uint8_t f = L.fl[e].load();
+                if ((f & F_SSD) && !(f & (F_SLOT | F_PIN))) {
+                    m.push_back({ li, e });
+                    mb += L.eb;
+                }
+            }
+        }
+        if (m.empty()) {
+            p.next = now + PROBE_FIRST_US; // nothing marked: look again later
+            return;
+        }
+        const size_t avail = fn_avail();
+        const size_t lw    = std::min(p.lw_cur, p.lw_prev);
+        if (p.lw_prev == SIZE_MAX || !(p.act_prev || p.act_cur)) {
+            p.next = now + PROBE_FIRST_US; // no full window with a prompt in it yet: its low-water is not known
+            return;
+        }
+        if (!probe_fits(mb, avail, std::max(PROBE_FREE, t->floor_b)) || !probe_fits(mb, lw, PROBE_CUSHION)) {
+            p.next = now + p.wait; // no room for it now
+            if (++p.n_skip <= 3 || p.n_skip % 16 == 0) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe not taken (%" PRIu64 "): the %.2f GiB SSD set does not fit "
+                        "(%.2f GiB available, %.2f GiB at the lowest in the last prompts; it keeps %.1f / %.1f GiB): it stays on "
+                        "direct I/O\n", __func__, p.n_skip, mb/1073741824.0, avail/1073741824.0, lw/1073741824.0,
+                        std::max(PROBE_FREE, t->floor_b)/1073741824.0, PROBE_CUSHION/1073741824.0);
+            }
+            return;
+        }
+        for (const auto & x : m) {
+            res_update(t->L[x.first].fl[x.second], [](uint8_t f) { return (uint8_t) (f & ~F_SSD); });
+        }
+        t->n_ssd_unmark.fetch_add(m.size());
+        t->gen.fetch_add(1);
+        t->n_probe.fetch_add(1);
+        p.probed   = mb;
+        p.listed   = false;
+        p.at       = 0;
+        p.set      = m;
+        p.lw_watch = SIZE_MAX;
+        t->probe_state.store(1);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] cache probe %" PRIu64 ": the %.2f GiB of %zu SSD-marked experts are read through the "
+                "mapping now (%.2f GiB available, the probe keeps %.1f GiB free)\n", __func__, t->n_probe.load(), mb/1073741824.0,
+                m.size(), avail/1073741824.0, std::max(PROBE_FREE, t->floor_b)/1073741824.0);
+        return;
+    }
+    if (st == 1) {
+        if (!p.listed) {
+            double sh = 1.0;
+            res_missing_blocks(t, p.miss, &sh);
+            p.listed = true;
+            p.at     = 0;
+        }
+        if (p.at < p.miss.size()) {
+            const size_t avail = fn_avail();
+            const size_t keep  = std::max(PROBE_FREE, t->floor_b);
+            const size_t room  = avail > keep ? avail - keep : 0;
+            std::vector<range> win;
+            size_t b = 0;
+            while (p.at + win.size() < p.miss.size() && b < ((size_t) 256 << 20) && b + p.miss[p.at + win.size()].size() <= room) {
+                b += p.miss[p.at + win.size()].size();
+                win.push_back(p.miss[p.at + win.size()]);
+            }
+            if (win.empty()) {
+                size_t mb = 0;
+                double sh = 1.0;
+                std::vector<range> tmp;
+                res_missing_blocks(t, tmp, &sh, &mb);
+                p.miss0 = mb;
+                res_probe_end(t, p, now, false, mb, "no room left while reading it in");
+                return;
+            }
+            fn_prefetch(win);
+            const int64_t t_end = now + 500000;
+            size_t i = 0;
+            for (; i < win.size() && llama_fn_p5_now_us() < t_end && !t->stop.load(); ++i) {
+                size_t done = 0;
+                const bool all = res_touch({ win[i] }, t->page, act, &done);
+                t->b_probe.fetch_add(done);
+                if (!all) {
+                    break; // activity: this block again at the next idle tick
+                }
+            }
+            p.at += i;
+            return;
+        }
+        double sh = 1.0;
+        std::vector<range> tmp;
+        res_missing_blocks(t, tmp, &sh, &p.miss0);
+        p.miss.clear();
+        p.t0     = now;
+        p.t_samp = now;
+        p.act0   = act;
+        t->probe_state.store(2);
+        return;
+    }
+    // st == 2: the watch, one sample per 5 s of idle time
+    if (now - p.t_samp < 5000000) {
+        return;
+    }
+    p.t_samp = now;
+    double sh = 1.0;
+    size_t mb = 0;
+    std::vector<range> tmp;
+    res_missing_blocks(t, tmp, &sh, &mb);
+    t->share.store(sh);
+    // the set took the room a prompt's pinned reserve or the conversation store needs: lost as well
+    const bool tight = p.lw_watch != SIZE_MAX && p.lw_watch < PROBE_WATCH_MIN;
+    const int  v     = tight ? -1 : probe_verdict(p.miss0, mb, p.probed, act != p.act0, now - p.t0, PROBE_WATCH_US);
+    if (v != 0) {
+        res_probe_end(t, p, now, v > 0, mb, v > 0 ? "a prompt or answer later" :
+                tight ? "available RAM fell below the cushion" : "pages left RAM");
+    }
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(now);
+    GGML_UNUSED(act);
+    GGML_UNUSED(p);
+#endif
+}
+
+// [TAG_FN_L22_SSDFIX] the give-back. The plan sizes the SSD set at an idle tick, but a prompt's FULL reserve takes up to
+// 2.4 GiB of pinned host memory for a moment (16K width) and the conversation store more: when the prompts' lowest
+// available RAM falls below GIVE_CUSHION, Windows trimmed working sets to find pages (any page: the MTP head's
+// experts, a layer the stream reads next) and the prompt stalled for seconds (2-8 s at a prompt's end under the 8 GiB
+// eater). The least-routed cold experts that are in RAM then join the SSD set until GIVE_TARGET would be left at that
+// moment; their pages go to standby (available at once), the low-water windows start again and the probe waits
+constexpr size_t GIVE_CUSHION = (size_t) 2 << 30;
+constexpr size_t GIVE_TARGET  = (size_t) 3 << 30;
+
+size_t res_give_back(res_table * t, size_t lw, probe_ctx & p, int64_t now) {
+#ifdef _WIN32
+    const size_t need = lw < GIVE_TARGET ? GIVE_TARGET - lw : 0;
+    if (need == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(t->mtx);
+    std::lock_guard<std::mutex> plk(t->pmtx); // the counts
+    const auto S = res_streamed(t, false);
+    std::vector<float> sh;
+    res_expert_share(t, S, sh);
+    std::vector<ssd_cand> c;
+    std::vector<size_t>   ci;
+    for (size_t i = 0; i < S.size(); ++i) {
+        const res_layer & L = t->L[S[i].first];
+        const int e = S[i].second;
+        const uint8_t f = L.fl[e].load();
+        if ((f & (F_SLOT | F_SSD | F_PIN)) || sh[i] < 0.5f) {
+            continue; // cold experts in RAM only (the missing ones free nothing)
+        }
+        c.push_back({ S[i].first, e, e < (int) L.cnt.size() ? L.cnt[e] : 0.0f, L.eb, true });
+        ci.push_back(i);
+    }
+    const auto pick = ssd_pick(c, need, false);
+    std::vector<std::pair<int, int>> drop;
+    size_t marked = 0;
+    for (size_t k : pick) {
+        const auto & x = S[ci[k]];
+        bool set = false;
+        res_update(t->L[x.first].fl[x.second], [&](uint8_t f) {
+            set = !(f & (F_SLOT | F_PIN));
+            return set ? (uint8_t) (f | F_SSD) : f;
+        });
+        if (set) {
+            drop.push_back(x);
+            marked += t->L[x.first].eb;
+        }
+    }
+    if (!drop.empty()) {
+        t->n_ssd_mark.fetch_add(drop.size());
+        t->gen.fetch_add(1);
+        if (res_quiet()) {
+            res_drop(t, drop);
+        } else {
+            t->dropq.insert(t->dropq.end(), drop.begin(), drop.end()); // t->mtx is held
+        }
+    }
+    p.lw_cur   = SIZE_MAX;
+    p.lw_prev  = SIZE_MAX;
+    p.act_cur  = false;
+    p.act_prev = false;
+    p.lw_t0    = now;
+    p.lw_reset = true;
+    p.next     = std::max(p.next, now + p.wait);
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_SSDFIX] give-back: available RAM fell to %.2f GiB in the last prompts (cushion %.1f GiB): "
+            "%.2f GiB of %zu least-routed cold experts in RAM go to direct I/O, their pages to standby\n", __func__,
+            lw/1073741824.0, GIVE_CUSHION/1073741824.0, marked/1073741824.0, drop.size());
+    return marked;
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(lw);
+    GGML_UNUSED(p);
+    GGML_UNUSED(now);
+    return 0;
+#endif
 }
 
 // the service thread: the hot set's view every second (drops, eviction prefetch), the idle work (eviction touch,
@@ -716,6 +1049,7 @@ void res_service(res_table * t) {
     size_t miss_at = 0;
     std::vector<std::pair<int, int>> entered;
     std::vector<std::pair<int, int>> left;
+    probe_ctx probe; // [TAG_FN_L22_SSDFIX]
     while (!t->stop.load()) {
         Sleep(100);
         const int64_t now = llama_fn_p5_now_us();
@@ -747,6 +1081,9 @@ void res_service(res_table * t) {
         }
         int64_t act = 0;
         const bool busy = llama_fn_p5_busy(&act);
+        if (t->ssd >= 1) {
+            res_probe_sample(probe, now, busy); // [TAG_FN_L22_SSDFIX] the available RAM's low-water, every 100 ms
+        }
         if (!busy && now - act >= 50000) {
             std::vector<std::pair<int, int>> q;
             {
@@ -781,7 +1118,16 @@ void res_service(res_table * t) {
                 t->b_evpf.fetch_add(done);
             }
         }
-        if (t->rewarm) {
+        // [TAG_FN_L22_SSDFIX] the SSD set's cache probe (reading it in replaces the re-warm while it runs)
+        if (t->ssd >= 1) {
+            res_probe_step(t, now, act, probe);
+            // the give-back at the first idle moment after prompts took the available RAM below the cushion (the 60 s
+            // tick may come minutes later: the first prompts after a start are the tightest)
+            if (t->probe_state.load() == 0 && probe.act_cur && probe.lw_cur < GIVE_CUSHION) {
+                res_give_back(t, probe.lw_cur, probe, now);
+            }
+        }
+        if (t->rewarm && t->probe_state.load() != 1) {
             // a new sample at each idle period, after a table change, and every 10 s of a long one
             if (act != act_samp || gen_samp != t->gen.load() || now - t_samp >= 10000000) {
                 double sh = 1.0;
@@ -827,7 +1173,21 @@ void res_service(res_table * t) {
             if (t->resset) {
                 res_queue_drop(t, res_droppable(t, true, false)); // pages read back since (a refill, a CPU path)
             }
-            res_ssd_plan(t, 1);
+            if (t->probe_state.load() == 0) {
+                // [TAG_FN_L22_SSDFIX] not while a probe reads the set in or watches it; the prompts' low-water first (give-
+                // back), and the plan gives marks back only within what that low-water leaves above the cushion
+                size_t lw_room = probe.lw_reset ? 0 : SIZE_MAX; // no window with a prompt yet: the plan as before
+                if (t->ssd >= 1 && probe.lw_prev != SIZE_MAX && (probe.act_prev || probe.act_cur)) {
+                    const size_t lw = std::min(probe.lw_cur, probe.lw_prev);
+                    if (lw < GIVE_CUSHION) {
+                        res_give_back(t, lw, probe, now);
+                        lw_room = 0; // no marks back now; measured again from here
+                    } else {
+                        lw_room = lw > GIVE_TARGET ? lw - GIVE_TARGET : 0; // marks back keep the give-back's target
+                    }
+                }
+                res_ssd_plan(t, 1, lw_room);
+            }
         }
     }
 #else
@@ -850,6 +1210,21 @@ uint8_t llama_fn_res_class(const llama_model * model, int il, int e) {
         return LLAMA_FN_RES_RAM;
     }
     return class_of(L->fl[e].load(std::memory_order_relaxed));
+}
+
+bool llama_fn_res_classes(const llama_model * model, int il, uint8_t * out, int n) {
+    res_ref r(model);
+    if (r.t == nullptr || out == nullptr || n <= 0) {
+        return false;
+    }
+    const res_layer * L = res_find(r.t, il);
+    if (L == nullptr) {
+        return false;
+    }
+    for (int e = 0; e < n; ++e) {
+        out[e] = e < L->n_exp ? class_of(L->fl[e].load(std::memory_order_relaxed)) : (uint8_t) LLAMA_FN_RES_RAM;
+    }
+    return true;
 }
 
 uint64_t llama_fn_res_gen(const llama_model * model) {

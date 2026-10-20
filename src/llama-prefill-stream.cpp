@@ -257,56 +257,108 @@ bool pfs_pages_missing(const pfs_layer & L) {
 }
 
 // [TAG_FN_L22_READAHEAD] the same sample as a share (0..1) of the layer's sampled pages that are out of the working set;
-// -1 when the query is not possible
-double pfs_missing_share(const pfs_layer & L) {
+// -1 when the query is not possible. [TAG_FN_L22_SSDFIX] with the residency table the share returned counts only the
+// experts the stream reads through the mapping (RAM class): VRAM-held experts come from their slots (their host copies go
+// to standby on purpose), the SSD set by direct I/O. Counting them made layers look mostly missing, so the whole layer
+// went through direct I/O on every pass (~2.9 GiB per pass under the 8 GiB eater, its RAM pages read from the disk)
+double pfs_missing_share(const pfs_state * s, const pfs_layer & L, double * all_share = nullptr) {
+    if (all_share) {
+        *all_share = -1.0;
+    }
 #ifdef _WIN32
+    // [TAG_FN_L22_SSDFIX] cls: the residency classes (none: no table, every expert counts as mapped); the SSD set is
+    // never sampled (direct I/O: its pages stay out on purpose). ram[i]: sample i belongs to a mapped (RAM-class) expert.
+    // *all_share: the share over every sampled expert (the VRAM-held standby copies too: the read-ahead's trigger)
+    std::vector<uint8_t> cls;
+    bool by_cls = false;
+    if (s->model && L.src[0] && L.src[0]->ne[2] > 0) {
+        cls.resize((size_t) L.src[0]->ne[2]);
+        by_cls = llama_fn_res_classes(s->model, L.il, cls.data(), (int) cls.size());
+    }
     std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
+    std::vector<uint8_t> ram;
     for (int k = 0; k < 3; ++k) {
         if (!L.src[k] || !L.src[k]->data) {
             continue;
         }
         const char * p0 = (const char *) L.src[k]->data;
-        for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
-            PSAPI_WORKING_SET_EX_INFORMATION x = {};
-            x.VirtualAddress = (void *) (p0 + o);
-            q.push_back(x);
+        const size_t nb = L.src[k]->nb[2];
+        if (!by_cls || nb == 0 || nb*cls.size() > L.nbytes[k]) {
+            for (size_t o = 0; o < L.nbytes[k]; o += (size_t) 1 << 20) {
+                PSAPI_WORKING_SET_EX_INFORMATION x = {};
+                x.VirtualAddress = (void *) (p0 + o);
+                q.push_back(x);
+                ram.push_back(1);
+            }
+            continue;
+        }
+        for (size_t e = 0; e < cls.size(); ++e) {
+            if (cls[e] == LLAMA_FN_RES_SSD) {
+                continue;
+            }
+            for (size_t o = 0; o < nb; o += (size_t) 1 << 20) {
+                PSAPI_WORKING_SET_EX_INFORMATION x = {};
+                x.VirtualAddress = (void *) (p0 + e*nb + o);
+                q.push_back(x);
+                ram.push_back(cls[e] == LLAMA_FN_RES_RAM ? 1 : 0);
+            }
         }
     }
-    if (q.empty() || !K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
+    if (q.empty()) {
+        if (all_share) {
+            *all_share = by_cls ? 0.0 : -1.0;
+        }
+        return by_cls ? 0.0 : -1.0; // no expert of this layer is read through the mapping: nothing to wait for
+    }
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size()*sizeof(q[0])))) {
         return -1.0;
     }
-    size_t out = 0;
-    for (const auto & x : q) {
-        out += x.VirtualAttributes.Valid ? 0 : 1;
+    size_t out = 0, out_ram = 0, n_ram = 0;
+    for (size_t i = 0; i < q.size(); ++i) {
+        const size_t m = q[i].VirtualAttributes.Valid ? 0 : 1;
+        out += m;
+        if (ram[i]) {
+            out_ram += m;
+            n_ram++;
+        }
     }
-    return (double) out / (double) q.size();
+    if (all_share) {
+        *all_share = (double) out / (double) q.size();
+    }
+    return n_ram > 0 ? (double) out_ram / (double) n_ram : 0.0;
 #else
+    GGML_UNUSED(s);
     GGML_UNUSED(L);
     return -1.0;
 #endif
 }
 
-// [TAG_FN_L22_SSDTIER] the experts of a layer that go through direct I/O in this job (empty: none)
-void pfs_dio_experts(const pfs_state * s, const pfs_layer & L, double miss, std::vector<uint8_t> & out) {
+// [TAG_FN_L22_SSDTIER] the experts of a layer that go through direct I/O in this job (empty: none); true: the whole layer.
+// [TAG_FN_L22_SSDFIX] `miss` is the share of the mapped (RAM-class) pages that are out (pfs_missing_share): a layer goes
+// whole only when the pages the stream would map are mostly not in RAM (bringing them in would take RAM the plan did not
+// give them; the SSD probe reads them in when the prompts' low-water has room). Its RAM pages no longer go to the disk
+// because VRAM-held standby copies or the SSD set made the layer look missing
+bool pfs_dio_experts(const pfs_state * s, const pfs_layer & L, double miss, std::vector<uint8_t> & out) {
     out.clear();
     if (s->l22.ssdtier <= 0 || !s->model || !L.src[0]) {
-        return;
+        return false;
     }
     const int64_t n_exp = L.src[0]->ne[2];
     const bool whole = s->l22.ssdtier >= 2 && miss > 0.5;
     bool any = whole;
     out.assign((size_t) n_exp, whole ? 1 : 0);
-    if (!whole) {
-        for (int64_t e = 0; e < n_exp; ++e) {
-            if (llama_fn_res_class(s->model, L.il, (int) e) == LLAMA_FN_RES_SSD) {
-                out[(size_t) e] = 1;
-                any = true;
-            }
+    if (!whole && llama_fn_res_classes(s->model, L.il, out.data(), (int) n_exp)) {
+        for (auto & c : out) {
+            c = (uint8_t) (c == LLAMA_FN_RES_SSD ? 1 : 0);
+            any = any || c != 0;
         }
+    } else if (!whole) {
+        std::fill(out.begin(), out.end(), 0);
     }
     if (!any) {
         out.clear();
     }
+    return whole && any;
 }
 
 // [TAG_FN_L22_READAHEAD] the read-ahead thread: at each new ubatch (gate 0) one sample of every layer, then the layers
@@ -333,13 +385,19 @@ void pfs_ra_run(pfs_state * s) {
         double sum = 0.0;
         int    n_q = 0;
         for (int p = 0; p < np; ++p) {
-            const double sh = pfs_missing_share(s->layers[p]);
+            double all = -1.0;
+            const double sh = pfs_missing_share(s, s->layers[p], &all);
             s->l_miss[p].store((uint16_t) (sh < 0 ? 0 : std::min(1000.0, sh*1000.0 + 0.5)), std::memory_order_relaxed);
             if (sh >= 0) {
                 sum += sh;
                 n_q++;
             }
-            if (sh > 0.02) {
+            // [TAG_FN_L22_SSDFIX] l_miss (the job's whole-layer rule) counts the mapped pages only; the read-ahead fires as
+            // before on the share over every expert but the SSD set (the VRAM-held standby copies too: a prompt-end pass
+            // that evicts experts sends a prompt's narrow last part to the CPU path on their host copies, which then fault
+            // one by one: 2-8 s at the end of a 10K-32K prompt under the 8 GiB eater when they were left out), and on any
+            // mapped page out (Windows trims a scattered share of the set under pressure)
+            if (all > 0.02 || sh > 0.0) {
                 miss.push_back(p);
             }
         }
@@ -362,8 +420,7 @@ void pfs_ra_run(pfs_state * s) {
             const pfs_layer & L = s->layers[p];
             const double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
             if (s->dio_state.load(std::memory_order_relaxed) == 1) {
-                pfs_dio_experts(s, L, sh, dio);
-                if (s->l22.ssdtier >= 2 && sh > 0.5) {
+                if (pfs_dio_experts(s, L, sh, dio)) {
                     continue; // read by direct I/O as a whole
                 }
             } else {
@@ -570,7 +627,7 @@ void pfs_run(pfs_state * s) {
             double miss = 0.0;
             if (s->l22.ssdtier >= 2) {
                 miss = s->l_miss && s->l_miss_gen.load(std::memory_order_acquire) != 0 ?
-                       s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(L);
+                       s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(s, L);
             }
             pfs_dio_experts(s, L, miss, dio);
         } else {

@@ -3827,6 +3827,12 @@ static void llama_probe_ubatch_add(const llama_context * ctx, const char * arch,
     e.ubatch_max = 0;
 }
 
+// [TAG_FN_L3_VRAM_CBUF] [TAG_FN_L22_RWIDTH] narrow batches in a row that lift the thrash pin: 256, or 16 for a pin at the
+// 16K width (UBPLAN: its borrow keeps hot slots out of the answer steps)
+static uint64_t llama_fn_l22_pin_narrow_max(bool big_pin) {
+    return big_pin ? 16 : 256;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L22_PHASE] the phase flag holds for this decode only: PROMPT again on every return path. [TAG_FN_L22_PIN]
     // P6 R1: the pin watcher sees when a decode runs (stub: no-op)
@@ -4034,15 +4040,63 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         (int) n_tokens_all, cbuf_short_max, cbuf_small_t);
             }
         }
+        // [TAG_FN_L22_RWIDTH] a prompt that starts while FULL stays (the thrash pin after 8 prompts within 64 batches, e.g.
+        // short answers; or a prompt that ended without an answer step, as a follow-up's priming request) ran at the width
+        // FULL had: under an 8K FULL a 10K prompt took two passes where the switch from SMALL plans one 16K pass, 32K four
+        // (bands under the 8 GiB eater, steady: 10K 7.5 vs v0.24.0 5.9 s, whose pin happened at 16K). When the planner
+        // (UBPLAN with its VRAM check, as at that switch) picks a wider width for it, FULL goes back to SMALL first (the pin
+        // is lifted) and this batch makes the switch from SMALL: the standard path (tail, borrow, SMALLKEEP, banks, draft)
+        if (wide && cbuf_state == CBUF_FULL && !l22_rw_planned && l20_base_ub > 0 && l21_bigub && !l21_big_off &&
+            l21_extra > 0 && l22p.ubplan && cbuf_full_t > 0 && cbuf_full_t < cparams.n_ubatch) {
+            l22_rw_planned = true;
+            l22p_batch_scan();
+            if (!(l22p_bg2_on && l22p_prompt_seqs > 1)) {
+                l22p_bucket = llama_fn_l22_depth_bucket(l22p_depth);
+                const uint32_t w_now = cbuf_full_t;
+                const uint32_t w     = l22p_plan_width((uint32_t) n_tokens_all, l20_prompt_after, true);
+                if (w > w_now) {
+                    const bool was_pinned = cbuf_pinned;
+                    cbuf_pinned     = false;
+                    cbuf_full_at.clear();
+                    cbuf_narrow_run = 0;
+                    const int64_t t_rw = ggml_time_us();
+                    if (!cbuf_set(false)) {
+                        return -2;
+                    }
+                    l22_rw_n++;
+                    if (l22_rw_n <= 3 || l22_rw_n % 32 == 0) {
+                        LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] %" PRIu64 ": a %d-token prompt batch (%lld rows after it) plans %u-token "
+                                "ubatches under a %u-token FULL%s: back to SMALL in %.1f ms, then the switch from SMALL\n", __func__,
+                                l22_rw_n, (int) n_tokens_all, (long long) l20_prompt_after, w, w_now, was_pinned ? " (pinned)" : "",
+                                (ggml_time_us() - t_rw)/1000.0);
+                    }
+                    if (l22.passlog >= 1) {
+                        llama_fn_l22_log("switch", "what=rewidth from=%u to=%u pinned=%d ms=%.1f why=%s est_base=%.0f est_big=%.0f R=%lld",
+                                w_now, w, was_pinned ? 1 : 0, (ggml_time_us() - t_rw)/1000.0, l22p_why, l22p_est_base, l22p_est_big,
+                                (long long) l22p_rows_plan);
+                    }
+                }
+            }
+        }
         if (wide) {
             cbuf_narrow_run = 0;
             if (cbuf_state == CBUF_SMALL) {
                 cbuf_note_full(); // may pin FULL (LLAMA_FN_CBUF_THRASH)
             }
-        } else if (cbuf_pinned && ++cbuf_narrow_run >= 256) {
+        } else if (cbuf_pinned && ++cbuf_narrow_run >= llama_fn_l22_pin_narrow_max(l22p.ubplan && l20_base_ub > 0 &&
+                   cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub)) {
+            // [TAG_FN_L22_RWIDTH] a pin at the 16K width (UBPLAN): its borrow keeps hot slots out of every answer step
+            // (decode 24-63 t/s in the bands under the 8 GiB eater, v0.24.0's 16K pin 21-88, ~100 at the base width), so an
+            // answer of more than 16 steps lifts it; short answers between prompts keep it (no 16K reserve per prompt: the
+            // switches to and from 16K stalled 3-8 s under the eater)
+            if (l22_rw_n_nopin++ < 3 && cbuf_narrow_run < 256) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_L22_RWIDTH] %llu narrow batches in a row under the 16K pin: the lend switches again\n",
+                        __func__, (unsigned long long) cbuf_narrow_run);
+            }
             cbuf_pinned = false;
             cbuf_full_at.clear();
-            LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] 256 narrow batches in a row: the lend switches again\n", __func__);
+            LLAMA_LOG_INFO("%s: [TAG_FN_L3_VRAM_CBUF] %llu narrow batches in a row: the lend switches again\n", __func__,
+                    (unsigned long long) cbuf_narrow_run);
         }
         // [TAG_FN_L19_TTFT_TAILFULL] the last part of a split short prompt keeps FULL (no switch before the first token)
         // [TAG_FN_L22_ENDOVERLAP] for every prompt size (M3.5): the answer's first step makes the switch. One sequence only
@@ -4118,6 +4172,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (!cbuf_set(want_full, full_w, cls)) {
             return -2;
+        }
+        if (l22p_switch) {
+            l22_rw_planned = true; // [TAG_FN_L22_RWIDTH] the switch from SMALL planned this prompt's width
+        }
+        if (n_outputs_all > 0) {
+            l22_rw_planned = false; // [TAG_FN_L22_RWIDTH] a prompt's end or an answer step: the next wide batch is a new prompt
         }
         // [TAG_FN_L22_PASSLOG] the prompt's record: rows and batches of the FULL period
         if (l22_rec_on && cbuf_state == CBUF_FULL && n_tokens_all > cbuf_small_t) {

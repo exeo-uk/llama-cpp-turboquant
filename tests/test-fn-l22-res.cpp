@@ -129,6 +129,30 @@ static void test_ssd() {
     CHECK(ssd_unpick(c, 5).empty());
 }
 
+// [TAG_FN_L22_SSDFIX] the cache probe's rules
+static void test_probe() {
+    const size_t G = (size_t) 1 << 30;
+    const size_t M = (size_t) 1 << 20;
+    // room: the probed bytes must leave more than the probe's floor available
+    CHECK(probe_fits(G + G/2, 4*G + G/2, 2*G));   // the 8 GiB eater case: 1.5 GiB in 4.5 GiB available
+    CHECK(!probe_fits(3*G, 4*G, 2*G));
+    CHECK(!probe_fits(0, 2*G, 2*G));              // nothing above the floor
+    CHECK(probe_fits(2*G, 4*G, 2*G));             // exactly to the floor
+    // verdict: missing bytes grew by more than max(256 MiB, probed / 4) -> lost
+    CHECK(probe_verdict(100*M, 100*M + 300*M, G, true, 30000000, 20000000) == -1);
+    CHECK(probe_verdict(100*M, 100*M + 200*M, G, true, 30000000, 20000000) == 1);   // 200 MiB < 256 MiB
+    CHECK(probe_verdict(0, 600*M, 4*G, true, 30000000, 20000000) == 1);             // a quarter of 4 GiB = 1 GiB
+    CHECK(probe_verdict(0, 1100*M, 4*G, false, 1000, 20000000) == -1);              // a loss counts at once
+    CHECK(probe_verdict(500*M, 0, G, false, 30000000, 20000000) == 0);              // no prompt yet: not yet
+    CHECK(probe_verdict(500*M, 0, G, true, 10000000, 20000000) == 0);               // too early
+    CHECK(probe_verdict(500*M, 0, G, true, 20000000, 20000000) == 1);
+    // backoff: kept -> the base; lost -> twice the last, at least the base, at most the max
+    CHECK(probe_backoff(480, true, 120, 1920) == 120);
+    CHECK(probe_backoff(120, false, 120, 1920) == 240);
+    CHECK(probe_backoff(60, false, 120, 1920) == 120);
+    CHECK(probe_backoff(1500, false, 120, 1920) == 1920);
+}
+
 static void test_lend() {
     size_t lo = 0;
     size_t hi = 0;
@@ -289,6 +313,7 @@ int main() {
     test_class();
     test_runs();
     test_ssd();
+    test_probe();
     test_lend();
 #ifdef _WIN32
     test_dio(1);
