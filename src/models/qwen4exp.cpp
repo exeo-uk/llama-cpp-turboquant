@@ -378,8 +378,9 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
         } else if (!first.empty() && llama_ple_dio_file_size(first + ".ple.q8_0") >= 0) {
             cand = first + ".ple.q8_0";
         }
+        // the choice is a warning-level line, so the default verbosity (-lv 3) shows it
         if (cand.empty()) {
-            LLAMA_LOG_INFO("%s: [TAG_FN_L22_PLEQ8] %s: the model's %s table (no %s.ple.q8_0)\n", __func__, name,
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PLEQ8] %s: the model's %s table (no %s.ple.q8_0)\n", __func__, name,
                     ggml_type_name(t->type), first.empty() ? "<model>" : first.c_str());
         } else {
             ggml_type ty  = GGML_TYPE_COUNT;
@@ -404,7 +405,7 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
                 }
             }
             if (d) {
-                LLAMA_LOG_INFO("%s: [TAG_FN_L22_PLEQ8] %s: the %s table from %s @ %llu (%lld rows x %zu B, unbuffered, "
+                LLAMA_LOG_WARN("%s: [TAG_FN_L22_PLEQ8] %s: the %s table from %s @ %llu (%lld rows x %zu B, unbuffered, "
                         "row check cosine %.4f vs the model's %s table)\n", __func__, name, ggml_type_name(ty), cand.c_str(),
                         (unsigned long long) off, (long long) q.n_rows, q.row_bytes, cv, ggml_type_name(t->type));
                 return std::shared_ptr<llama_ple_dio>(std::move(d));
