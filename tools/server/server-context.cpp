@@ -4467,6 +4467,9 @@ private:
     // [TAG_FN_L15_GENSHARE] after a batch with prompt rows and generating rows, the prompt rows wait until this time, so
     // the generating slots get decode-only steps for LLAMA_SRV_GEN_SHARE x the batch's time (0 = off)
     int64_t  gen_share_until_us    = 0;
+    // [TAG_FN_L22_GENSHARE2] the window just opened: its first answer-only decode (which pays the switch back to SMALL)
+    // moves its end by that decode's time
+    bool     l22_win_first         = false;
 
     struct pool_dbg_trigger { bool gen; int64_t at; bool nopark; bool done; };
     std::vector<pool_dbg_trigger> pool_dbg;    // TURBO_POOL_DEBUG_FAIL
@@ -6919,6 +6922,21 @@ private:
         // [TAG_FN_L22_GENSHARE2] media passes beside generating rows (decoded in pre_decode) open the window too, the cap
         // scales with the rows of the pass
         const bool l22_media_win = l22two.gs2 > 0 && batch.n_gen_rows > 0 && l22_media_us > 0;
+        // [TAG_FN_L22_GENSHARE2] r22 end test T8: the first answer-only decode of a window pays the stream's switch back to
+        // SMALL (unlend + the tail's refill: 0.55-0.7 s with 2 slots), which took 0.6 s of every 2 s window (the other answer
+        // decoded ~1.4 s per 6.1 s cycle: 23-25 t/s while a 30K prompt was read); the window's end moves by that decode's time
+        if (l22_win_first && batch.n_gen_rows > 0 && batch.size() == batch.n_gen_rows && !l22_media_win) {
+            l22_win_first = false;
+            const int64_t d = ggml_time_us() - t_batch0;
+            if (d > 0 && gen_share_until_us > 0) {
+                gen_share_until_us += d;
+                if (llama_fn_l22_passlog_level() >= 2) {
+                    llama_fn_l22_log("turn", "two=genshare2 first_step_ms=%.0f (the window's end moves by it)", d / 1000.0);
+                }
+            }
+        } else if (batch.size() > batch.n_gen_rows) {
+            l22_win_first = false;
+        }
         if (batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) {
             static const double share = [] {
                 const char * e = getenv("LLAMA_SRV_GEN_SHARE");
@@ -6935,6 +6953,7 @@ private:
                     const int64_t cap_eff = l22_window_cap_us(cap_us, rows, l22two.gs2);
                     const int64_t base    = (t1 - t_batch0) + l22_media_us;
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(base, cap_eff));
+                    l22_win_first      = true; // [TAG_FN_L22_GENSHARE2] the next answer-only decode moves the end
                     if (llama_fn_l22_passlog_level() >= 1) {
                         llama_fn_l22_log("turn", "two=genshare2 rows=%lld cap_rows=%d gen_rows=%d window_ms=%.0f pass_ms=%.0f media_ms=%.0f "
                                          "cap_ms=%.0f", (long long) rows, l22_cap_rows, batch.n_gen_rows, (gen_share_until_us - t1) / 1000.0,
