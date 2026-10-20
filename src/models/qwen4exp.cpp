@@ -197,6 +197,44 @@ static std::shared_ptr<llama_ple_dio> qwen4exp_open_ple_dio(const llama_model_lo
     // tests only: every Nth read fails, so its row comes from the mapped table (must not change any value)
     p.test_fail_every = (int) std::max(0LL, std::min((long long) INT32_MAX, env_ll("LLAMA_PLE_DIO_TEST_FAIL", 0)));
 
+    // [TAG_FN_L22_PLEQ8] tests only: LLAMA_PLE_DIO_TYPE=<ggml type name> reads the rows in that type from LLAMA_PLE_DIO_FILE
+    // (row 0 at LLAMA_PLE_DIO_OFFSET, default 0), e.g. the q8_0 table of another quant of the same model, instead of the
+    // model's own table; no copy is made or checked, and a failed read throws (the mapped table has another row format)
+    if (const char * ty = getenv("LLAMA_PLE_DIO_TYPE"); ty != nullptr && *ty != '\0') {
+        int rt = -1;
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const char * nm = ggml_type_name((ggml_type) i);
+            if (nm != nullptr && strcmp(nm, ty) == 0 && ggml_get_type_traits((ggml_type) i)->to_float != nullptr) {
+                rt = i;
+                break;
+            }
+        }
+        const char * f = getenv("LLAMA_PLE_DIO_FILE");
+        if (rt < 0 || f == nullptr || *f == '\0' || t->ne[0] % ggml_blck_size((ggml_type) rt) != 0) {
+            throw std::runtime_error(std::string("LLAMA_PLE_DIO_TYPE=") + ty +
+                                     " needs a ggml type with to_float that fits the row and LLAMA_PLE_DIO_FILE");
+        }
+        p.path      = f;
+        p.offset    = (uint64_t) std::max(0LL, env_ll("LLAMA_PLE_DIO_OFFSET", 0));
+        p.row_bytes = ggml_row_size((ggml_type) rt, t->ne[0]);
+        p.row_type  = rt;
+        const int64_t need = (int64_t) p.offset + p.n_rows * (int64_t) p.row_bytes;
+        const int64_t have = llama_ple_dio_file_size(p.path);
+        if (have < need) {
+            throw std::runtime_error(format("LLAMA_PLE_DIO_TYPE: %s has %lld bytes, the %s table needs %lld",
+                                            f, (long long) have, ty, (long long) need));
+        }
+        std::string err;
+        auto d = llama_ple_dio::open(p, err);
+        if (!d) {
+            throw std::runtime_error("LLAMA_PLE_DIO_TYPE: " + err);
+        }
+        LLAMA_LOG_WARN("%s: [TAG_FN_L22_PLEQ8] TEST: %s rows are read as %s from %s @ %llu (%lld rows x %zu B), not the "
+                "model's %s\n", __func__, name, ty, f, (unsigned long long) p.offset, (long long) p.n_rows, p.row_bytes,
+                ggml_type_name(t->type));
+        return std::shared_ptr<llama_ple_dio>(std::move(d));
+    }
+
     // LLAMA_PLE_DIO_FILE: read a copy that nothing maps (Windows serves unbuffered reads of a mapped file one at a time)
     // [TAG_FN_SHIP1] the profile's automatic copy (copy_auto) is made only with room to spare on its volume; when it
     // cannot be made or opened, the table is read through the mapping (as without the lever), not from the mapped model
@@ -2579,13 +2617,16 @@ static void qwen4exp_rows_to_float(const ggml_tensor * table, const int32_t * ro
 static void qwen4exp_rows_to_float_dio(llama_ple_dio & dio, const ggml_tensor * table, const int32_t * rows, int64_t n_rows,
         int64_t n_tokens, std::vector<uint8_t> & raw, float * dst) {
     const int64_t n  = table->ne[0];
-    const size_t  rb = table->nb[1];
+    // [TAG_FN_L22_PLEQ8] the file's row format: the table's (rb == table->nb[1]) unless LLAMA_PLE_DIO_TYPE
+    const bool      other = dio.params().row_type >= 0;
+    const ggml_type ty    = other ? (ggml_type) dio.params().row_type : table->type;
+    const size_t    rb    = dio.params().row_bytes;
     raw.resize((size_t) n_rows*rb);
-    dio.read_rows(rows, n_rows, raw.data(), n_tokens, (const uint8_t *) table->data);
-    const ggml_to_float_t to_float = ggml_get_type_traits(table->type)->to_float;
+    dio.read_rows(rows, n_rows, raw.data(), n_tokens, other ? nullptr : (const uint8_t *) table->data);
+    const ggml_to_float_t to_float = ggml_get_type_traits(ty)->to_float;
     for (int64_t r = 0; r < n_rows; ++r) {
         const char * src = (const char *) raw.data() + (size_t) r*rb;
-        if (table->type == GGML_TYPE_F32) {
+        if (ty == GGML_TYPE_F32) {
             memcpy(dst + r*n, src, n*sizeof(float));
         } else {
             to_float(src, dst + r*n, n);
@@ -2652,8 +2693,9 @@ struct llama_model_qwen4exp::ple_prefetcher {
     std::vector<uint8_t>  fill_raw;
 
     ple_prefetcher(std::shared_ptr<llama_ple_dio> d, const ggml_tensor * tbl) : dio(std::move(d)), table(tbl) {
-        fallback  = (const uint8_t *) tbl->data;
-        row_bytes = tbl->nb[1];
+        // [TAG_FN_L22_PLEQ8] rows of another format (LLAMA_PLE_DIO_TYPE) have no fallback
+        fallback  = dio->params().row_type >= 0 ? nullptr : (const uint8_t *) tbl->data;
+        row_bytes = dio->params().row_bytes;
         // [TAG_FN_L16_PLEGATE] the PLE fills are on the GPU's path now: the thread runs at the MoE pool's priority
         th = std::thread([this]() { llama_fn_thread_priority_highest(); llama_fn_thread_name("ple-prefetch"); loop(); }); // [TAG_FN_L18_FIRSTANS_STALL] name
     }
