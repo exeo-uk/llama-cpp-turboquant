@@ -193,6 +193,7 @@ struct pfs_state {
     uint64_t                ra_gen  = 0;
     bool                    ra_stop = false;
     std::unique_ptr<std::atomic<uint16_t>[]> l_miss; // by position: sampled share out of RAM, permille (the read-ahead)
+    std::unique_ptr<std::atomic<uint8_t>[]>  l_map;  // [TAG_FN_L22_RESSET_YIELD] by position: mapped at start-up (gate's RAM plan)
     std::atomic<uint64_t>   l_miss_gen{0};           // the generation l_miss belongs to (0: none yet)
     // [TAG_FN_L22_SSDTIER] direct I/O has read for the stream (1), refused before it ever read (-1), not tried (0): the
     // read-ahead leaves the direct-I/O experts out only once it has read, so a refusing reader costs no read-ahead
@@ -401,14 +402,34 @@ void pfs_ra_run(pfs_state * s) {
                 miss.push_back(p);
             }
         }
+        // [TAG_FN_L22_RESSET_YIELD] start-up (a yielding RESSET warm pass has not ended): the layers the whole-layer rule would
+        // read by direct I/O are mapped, in stream order, while their missing pages fit in the available RAM above the warm
+        // floor (the plan gives them RAM: the warm pass would read them). Direct I/O does not leave them in RAM, so the next
+        // prompt read them from the disk again (2 x 16K after a start: second pass ~16 s by direct I/O vs ~5.8 s from RAM)
+        if (s->l_map) {
+            size_t room = s->model ? llama_fn_warm_startup_room(*s->model) : 0;
+            for (int p = 0; p < np; ++p) {
+                const pfs_layer & L = s->layers[p];
+                const double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
+                uint8_t mp = 0;
+                if (room > 0 && sh > 0.5) {
+                    const size_t need = (size_t) (sh * (double) (L.nbytes[0] + L.nbytes[1] + L.nbytes[2]));
+                    if (need <= room) {
+                        room -= need;
+                        mp = 1;
+                    }
+                }
+                s->l_map[p].store(mp, std::memory_order_relaxed);
+            }
+        }
         s->l_miss_gen.store(g, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(s->mtx);
             s->sums.miss_share  = n_q > 0 ? sum / n_q : 0.0;
             s->sums.miss_layers = (uint32_t) miss.size();
         }
-        if (llama_fn_warm_running()) {
-            continue; // [TAG_FN_L15_WARM] the warm pass brings the pages in itself
+        if (llama_fn_warm_leads()) {
+            continue; // [TAG_FN_L15_WARM] the warm pass brings the pages in itself ([TAG_FN_L22_RESSET_YIELD] not a yielding one)
         }
         for (int p : miss) {
             {
@@ -418,7 +439,10 @@ void pfs_ra_run(pfs_state * s) {
                 }
             }
             const pfs_layer & L = s->layers[p];
-            const double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
+            double sh = s->l_miss[p].load(std::memory_order_relaxed) / 1000.0;
+            if (s->l_map && s->l_map[p].load(std::memory_order_relaxed) != 0) {
+                sh = std::min(sh, 0.5); // [TAG_FN_L22_RESSET_YIELD] mapped at start-up
+            }
             if (s->dio_state.load(std::memory_order_relaxed) == 1) {
                 if (pfs_dio_experts(s, L, sh, dio)) {
                     continue; // read by direct I/O as a whole
@@ -591,7 +615,7 @@ void pfs_run(pfs_state * s) {
         llama_fn_warm_wait_layer(L.il); // [TAG_FN_L15_WARM] the warm pass brings this layer in first
         // [TAG_FN_L15_PFSAHEAD] the next layers' pages: read ahead of the copies (positions wrap to 0 for the next ubatch)
         // [TAG_FN_L22_READAHEAD] not while the round-22 read-ahead thread runs (it covers every layer of the pass)
-        if (s->ahead > 0 && !L.src_pinned && !s->l22.readahead && !llama_fn_warm_running()) {
+        if (s->ahead > 0 && !L.src_pinned && !s->l22.readahead && !llama_fn_warm_leads()) {
             const int np = (int) s->layers.size();
             llama_memory_ranges mr;
             for (int d = 1; d <= s->ahead && d < np; ++d) {
@@ -628,6 +652,18 @@ void pfs_run(pfs_state * s) {
             if (s->l22.ssdtier >= 2) {
                 miss = s->l_miss && s->l_miss_gen.load(std::memory_order_acquire) != 0 ?
                        s->l_miss[job.pos].load(std::memory_order_relaxed) / 1000.0 : pfs_missing_share(s, L);
+                // [TAG_FN_L22_RESSET_YIELD] start-up: mapped when the read-ahead's gate found RAM for it (or, without the
+                // read-ahead, when its missing pages fit in the available RAM above the warm floor now)
+                if (miss > 0.5) {
+                    if (s->l_map && s->l_miss_gen.load(std::memory_order_acquire) != 0) {
+                        if (s->l_map[job.pos].load(std::memory_order_relaxed) != 0) {
+                            miss = 0.5;
+                        }
+                    } else if (s->model && llama_fn_warm_startup_room(*s->model) >=
+                               (size_t) (miss * (double) (L.nbytes[0] + L.nbytes[1] + L.nbytes[2]))) {
+                        miss = 0.5;
+                    }
+                }
             }
             pfs_dio_experts(s, L, miss, dio);
         } else {
@@ -1878,8 +1914,10 @@ void llama_prefill_stream_l22_config(const void * owner, const llama_model * mod
     }
     if (s->l22.readahead && !s->ra_thr.joinable() && !s->layers.empty()) {
         s->l_miss.reset(new std::atomic<uint16_t>[s->layers.size()]);
+        s->l_map.reset(new std::atomic<uint8_t>[s->layers.size()]); // [TAG_FN_L22_RESSET_YIELD]
         for (size_t p = 0; p < s->layers.size(); ++p) {
             s->l_miss[p].store(0);
+            s->l_map[p].store(0);
         }
         s->ra_thr = std::thread(pfs_ra_run, s);
     }

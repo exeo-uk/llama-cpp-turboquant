@@ -3903,6 +3903,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [TAG_FN_L19_TTFT_HUSH] bit 2: a prompt batch makes the warm pass and the saved state's read-ahead wait (its own pages
     // and the driver's allocations first)
     llama_fn_hush_scope hush_prompt((l19_hush & 2) != 0 && !warm_go.small && model.arch == LLM_ARCH_QWEN4EXP);
+    // [TAG_FN_L22_RESSET_YIELD] the same batches make the yielding RESSET warm pass wait, without the hush budget
+    llama_fn_warm_prompt_scope warm_prompt(!warm_go.small && model.arch == LLM_ARCH_QWEN4EXP);
 
     if (llama_host_gap_probe_enabled()) { // [TAG_HOST_GAP_PROBE]
         llama_host_gap_probe_decode(this);

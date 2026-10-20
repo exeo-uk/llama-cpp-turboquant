@@ -47,6 +47,30 @@ void llama_fn_warm_go(bool ready = false);
 void llama_fn_warm_wait_layer(int il);
 bool llama_fn_warm_running();
 
+// [TAG_FN_L22_RESSET_YIELD] the running warm pass leads the stream (the L15 pass: the stream waits for it per layer and the
+// stream's read-ahead leaves the pages to it); false for the yielding RESSET pass, which pauses while prompts run
+bool llama_fn_warm_leads();
+// [TAG_FN_L22_RESSET_YIELD] while a yielding RESSET warm pass is planned and has not ended (start-up): the available RAM above
+// the warm floor (bytes) a prompt may map instead of reading whole layers by direct I/O; 0 otherwise
+size_t llama_fn_warm_startup_room(const llama_model & model);
+// [TAG_FN_L22_RESSET_YIELD] a prompt batch (not an answer step) begins / ends: the yielding warm pass waits while one runs
+void llama_fn_warm_prompt(bool begin);
+struct llama_fn_warm_prompt_scope {
+    bool on;
+    explicit llama_fn_warm_prompt_scope(bool on) : on(on) {
+        if (on) {
+            llama_fn_warm_prompt(true);
+        }
+    }
+    ~llama_fn_warm_prompt_scope() {
+        if (on) {
+            llama_fn_warm_prompt(false);
+        }
+    }
+    llama_fn_warm_prompt_scope(const llama_fn_warm_prompt_scope &) = delete;
+    llama_fn_warm_prompt_scope & operator=(const llama_fn_warm_prompt_scope &) = delete;
+};
+
 // [TAG_FN_L15_WARMYIELD] a decode of small ubatches (answer steps, bridged) begins / ends: the warm pass waits meanwhile
 void llama_fn_warm_small_decode(bool begin);
 
