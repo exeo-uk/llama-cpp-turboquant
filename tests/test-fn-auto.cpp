@@ -211,6 +211,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_TOKCACHE", "1", false },
     { "LLAMA_FN_L22_TOKCACHE_VERIFY", "1", false },
     { "LLAMA_FN_L22_JSONFLOAT", "1", false },
+    { "LLAMA_FN_L22_PLEQ8", "1", false }, // [TAG_FN_L22_PLEQ8]
     { "LLAMA_FN_L22_VLRESIZE", "0", false },
     { "LLAMA_FN_L22_VLBATCH", "0", false },
     { "LLAMA_FN_L22_MTP_KEEP", "1", false },

@@ -13,8 +13,9 @@
 //   6. throughput by queue depth (printed, not checked)
 //   7. llama_ple_dio_copy (LLAMA_PLE_DIO_FILE) of ~64 MB of rows: rows read from the copy vs the mapping, then the
 //      throughput of the copy by queue depth (printed, not checked)
-//   8. injected read failures: with the mapping as fallback nothing changes; without it the call throws, and the
-//      next calls (no stale completions) still return the mapped rows
+//   8. injected read failures: with the mapping as fallback nothing changes; without it the row is read again through
+//      the file cache ([TAG_FN_L22_PLEQ8], same values, no throw), and the next calls (no stale completions) still
+//      return the mapped rows
 // The mapping is touched only for the tested rows (a few MB of pages). Built, not registered with ctest (needs the file).
 
 #include "llama-ple-dio.h"
@@ -400,7 +401,8 @@ int main(int argc, char ** argv) {
             g_fail += ok ? 0 : 1;
         }
         {
-            // 64 reads in flight at once, the 40th completion fails: the call throws after the other 63 completed
+            // 64 reads in flight at once, the 40th completion fails: without a fallback its row is read again through the
+            // file cache after the other 63 completed ([TAG_FN_L22_PLEQ8]; before, the call threw)
             auto d = open_fail(40);
             const std::vector<int32_t> ids1 = distinct(64);
             std::vector<uint8_t> got(ids1.size() * loc.rb);
@@ -411,6 +413,7 @@ int main(int argc, char ** argv) {
                 threw = true;
                 printf("  8. no fallback: threw \"%s\"\n", e.what());
             }
+            const int  bad1 = threw ? -1 : same_as_map(ids1, got);
             // completions 65..74: none fails
             const std::vector<int32_t> ids2 = distinct(10);
             got.assign(ids2.size() * loc.rb, 0xCD);
@@ -427,9 +430,9 @@ int main(int argc, char ** argv) {
             d->read_rows(ids3.data(), (int64_t) ids3.size(), got.data(), 1, fallback);
             const int  bad3 = same_as_map(ids3, got);
             const auto s    = d->stats();
-            const bool ok   = threw && bad2 == 0 && bad3 == 0 && s.fallbacks == 2 && s.reads == 138;
-            printf("  %-44s %5d rows: %s (throw %d, then %d and %d mismatches, %llu fallbacks, %llu reads)\n",
-                    "8. throw without fallback, then clean calls", 138, ok ? "OK" : "FAIL", threw ? 1 : 0, bad2, bad3,
+            const bool ok   = !threw && bad1 == 0 && bad2 == 0 && bad3 == 0 && s.fallbacks == 3 && s.reads == 138;
+            printf("  %-44s %5d rows: %s (throw %d, %d, %d and %d mismatches, %llu fallbacks, %llu reads)\n",
+                    "8. buffered re-read without fallback, clean", 138, ok ? "OK" : "FAIL", threw ? 1 : 0, bad1, bad2, bad3,
                     (unsigned long long) s.fallbacks, (unsigned long long) s.reads);
             g_fail += ok ? 0 : 1;
         }
