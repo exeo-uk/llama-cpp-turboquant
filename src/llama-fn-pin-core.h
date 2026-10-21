@@ -393,37 +393,39 @@ inline uint64_t oom_help_bytes(uint64_t want, const oom_in & o) {
     return def == 0 ? 0 : std::min<uint64_t>(want, def + ((uint64_t) 256 << 20));
 }
 
-// [TAG_FN_L23_PINFIX] R-L23-2 (coordinator 10-21, after the l23p eater runs: 1.5-2.6 GiB free with 61 GiB pinned): the
-// valve keeps the truly available RAM (free + standby: what Windows and other programs get at once; our pinned model pages
-// are not in it) at >= floor. Two samples below the floor release (-1): the model's resident unpinned streamed pages leave
-// the working set first (they stay cached in standby), then pins, least streamed first, each one leaving the working set
-// too, until floor + 1 GiB. Room for re-pins (+1) needs >= floor + repin_gap for 5 samples in a row and cool_us since the
-// last release; a re-pin keeps floor + repin_gap - 1 GiB after it (no flapping between the two bands)
-struct valve_state {
+// [TAG_FN_L23_PINFIX] R-L23-2 (main session 10-21: pins may only ever add speed; under pressure behave exactly like NEW).
+// The gate of the pin thread, one sample per 2 s: with pins, the available RAM (free + standby) below `drop` for `drop_n`
+// samples in a row drops ALL pins (-1; no partial release, nothing leaves the working set: an unpin only unlocks). Without
+// pins (or with released units left), room >= `repin` for `hold_n` samples in a row, `hold_n` samples after the last drop,
+// lets resident units be pinned again (+1; the caller adds the bytes they would bring in to `repin` per unit).
+struct gate_state {
     int     low       = 0;
     int     high      = 0;
-    int64_t t_release = INT64_MIN/2;
+    int64_t since_drop = INT64_MAX/2; // samples since the last drop
 };
 
-inline int valve_step(valve_state & v, uint64_t avail, uint64_t floor, uint64_t repin_gap, int64_t now_us, int64_t cool_us) {
-    if (avail < floor) {
-        v.high = 0;
-        if (++v.low >= 2) {
-            v.low       = 0;
-            v.t_release = now_us;
+inline int gate_step(gate_state & g, uint64_t avail, bool pinned, bool repinnable, uint64_t drop, int drop_n, uint64_t repin, int hold_n) {
+    if (g.since_drop < INT64_MAX/2) {
+        g.since_drop++;
+    }
+    if (pinned && avail < drop) {
+        g.high = 0;
+        if (++g.low >= drop_n) {
+            g.low        = 0;
+            g.since_drop = 0;
             return -1;
         }
         return 0;
     }
-    v.low = 0;
-    if (avail >= floor + repin_gap) {
-        if (++v.high >= 5 && now_us - v.t_release >= cool_us) {
-            v.high = 0;
+    g.low = 0;
+    if (repinnable && avail >= repin) {
+        if (++g.high >= hold_n && g.since_drop >= hold_n) {
+            g.high = 0;
             return 1;
         }
         return 0;
     }
-    v.high = 0;
+    g.high = 0;
     return 0;
 }
 

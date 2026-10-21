@@ -464,33 +464,28 @@ static void test_pinfix() {
     TCHECK(fn_pin::oom_help_bytes(4*G, o) == fn_pin::oom_cap_bytes(4*G, 1*G, false, 0.5), "LOCAL charge: the R-REV-1 cap");
     o.l_head = 5*(int64_t) G;
     TCHECK(fn_pin::oom_help_bytes(4*G, o) == 4*G, "LOCAL charge, headroom shows room: want bytes");
-    // the valve's hysteresis: release after 2 samples below the floor; re-pin after 5 samples >= floor + gap and the cool-down
-    fn_pin::valve_state v;
-    const int64_t S = 1000000;
-    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 0, 60*S) == 0, "one sample below the floor: nothing");
-    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 2*S, 60*S) == -1, "two samples below: release");
-    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 4*S, 60*S) == 0, "the count starts again after a release");
-    int got = 0;
-    for (int k = 0; k < 5; ++k) {
-        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (6 + 2*k)*S, 60*S);
+    // the gate: 3 samples under 4 GiB drop every pin; 30 samples (60 s) >= 10 GiB, 30 samples after the drop, re-pin
+    fn_pin::gate_state gs;
+    const uint64_t D = 4*G, P = 10*G;
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "1 sample under: nothing");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "2 samples under: nothing");
+    TCHECK(fn_pin::gate_step(gs, 5*G, true, false, D, 3, P, 30) == 0, "back over: the count restarts");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "1 again");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == 0, "2 again");
+    TCHECK(fn_pin::gate_step(gs, 3*G, true, false, D, 3, P, 30) == -1, "3 samples under 4 GiB: drop all");
+    TCHECK(fn_pin::gate_step(gs, 1*G, false, true, D, 3, P, 30) == 0, "no pins: no drop under pressure");
+    int got = 0, k = 0;
+    for (k = 0; k < 29; ++k) {
+        got = fn_pin::gate_step(gs, 11*G, false, true, D, 3, P, 30);
+        TCHECK(got == 0, "room for %d samples: not yet", k + 1);
     }
-    TCHECK(got == 0, "room right after a release: no re-pin before the cool-down");
-    got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, 70*S, 60*S);
-    TCHECK(got == 1, "room for 5+ samples, the cool-down over: re-pin");
-    for (int k = 0; k < 4; ++k) {
-        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (72 + 2*k)*S, 60*S);
-        TCHECK(got == 0, "after a re-pin: 5 more samples first (%d)", k);
+    got = fn_pin::gate_step(gs, 11*G, false, true, D, 3, P, 30);
+    TCHECK(got == 1, "room for 30 samples, 30+ after the drop: re-pin");
+    for (k = 0; k < 10; ++k) {
+        got = fn_pin::gate_step(gs, 9*G, true, true, D, 3, P, 30);
+        TCHECK(got == 0, "between 4 and 10 GiB with pins: nothing (%d)", k);
     }
-    for (int k = 0; k < 4; ++k) {
-        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (80 + 2*k)*S, 60*S);
-    }
-    got = fn_pin::valve_step(v, 8*G, 6*G, 4*G, 90*S, 60*S);
-    TCHECK(got == 0, "between the bands: nothing, the room count resets");
-    for (int k = 0; k < 4; ++k) {
-        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (92 + 2*k)*S, 60*S);
-    }
-    TCHECK(got == 0, "4 samples with room after a reset: not yet");
-    TCHECK(fn_pin::valve_step(v, 6*G, 6*G, 4*G, 100*S, 60*S) == 0, "at the floor: no release");
+    TCHECK(fn_pin::gate_step(gs, 11*G, true, false, D, 3, P, 30) == 0, "nothing to re-pin: nothing");
 }
 
 int main() {

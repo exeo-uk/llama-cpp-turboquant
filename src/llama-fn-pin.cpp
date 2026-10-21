@@ -20,17 +20,17 @@
 // reads their mapped copies, which the warm pass keeps.
 // After registration the thread watches every 2 s: LOCAL headroom below the watcher threshold (reserve_need, at most
 // the ready headroom - 512 MiB; LLAMA_FN_L22_PIN_TEST_LOCAL_MIB forces one) or a RAM room below the floor for two
-// samples unpins the last ranges (as the OOM hook). [TAG_FN_L23_PINFIX] The valve keeps the truly available RAM (free +
-// standby) >= the floor: the unpinned streamed pages leave the working set first (still cached), then pins go, least
-// streamed first, their pages leaving the working set too, until floor + 1 GiB; with room again (floor + 4 GiB for 10 s,
-// 60 s after a release) released units are registered again (fn_pin::valve_step). An unpin by the OOM hook or the
-// watcher ends the first registration pass.
+// samples unpins the last ranges (as the OOM hook). [TAG_FN_L23_PINFIX] Pins may only ever add speed: the thread waits for
+// the warm pass and pins only resident ranges (no PIN mark before; a pin never reads the disk); available RAM under 4 GiB for
+// 6 s drops ALL pins (the process then runs as without them; an unpin only unlocks), room >= 10 GiB for 60 s pins the
+// resident units again (fn_pin::gate_step). An unpin by the OOM hook or the watcher ends the first registration pass.
 // llama_fn_pin_on_oom(need): the callers' allocation hook (plan 3.6): drain the last ranges (tickets back to 0, bounded),
 // unregister them until LOCAL headroom >= need + the pre-check margin (512 MiB, at most the watcher threshold), or until
 // the freed bytes reach the cap from the measured LOCAL charge per byte. [TAG_FN_L23_PINFIX] With no measured LOCAL
 // charge it unpins only the NON_LOCAL spill / arena commit deficit, and nothing when an unpin cannot raise the room.
 
 #include "llama-fn-l22.h"
+#include "llama-fn-l22-p5.h" // [TAG_FN_L23_PINFIX] llama_fn_p5_warm_done
 #include "llama-fn-pin-core.h"
 
 #include "llama-fn-arena.h"
@@ -553,28 +553,11 @@ bool fn_model_gone(fn_pin_state * st) {
 }
 
 // unpin the last registered units until done() (checked before each one); timeout per busy unit. Returns bytes freed
-// [TAG_FN_L23_PINFIX] R-L23-2: [p, p + n) leaves this process's working set (clean model pages go to the standby list:
-// still cached, counted as available, the next read is a soft fault). VirtualUnlock on pages that are not locked does that
-// (it returns FALSE, ERROR_NOT_LOCKED); a no-op elsewhere
-void fn_trim_pages(const void * p, size_t n) {
-#if defined(_WIN32)
-    if (p != nullptr && n > 0) {
-        (void) VirtualUnlock((LPVOID) p, n);
-    }
-#else
-    (void) p; (void) n;
-#endif
-}
-
-uint64_t fn_unpin(fn_pin_state * st, const std::function<bool(uint64_t freed)> & done, int64_t timeout_us, bool alive, int * n_units,
-        bool trim = false) {
+uint64_t fn_unpin(fn_pin_state * st, const std::function<bool(uint64_t freed)> & done, int64_t timeout_us, bool alive, int * n_units) {
     uint64_t freed = 0;
     int n = st->reg.unpin_lifo([&]() { return done(freed); }, timeout_us,
             [&](const fn_pin::reg_unit & U) {
                 fn_unreg_unit(st, U, alive);
-                if (trim && !st->arena) {
-                    fn_trim_pages(U.p, U.n); // [TAG_FN_L23_PINFIX] the released pages become available at once
-                }
                 freed += U.n;
             }, nullptr);
     st->unpinned.fetch_add(freed);
@@ -633,42 +616,16 @@ fn_pin::oom_in fn_oom_in(fn_pin_state * st, bool lok, int64_t head) {
     return oi;
 }
 
-// [TAG_FN_L23_PINFIX] R-L23-2: the valve's first step: the planned (streamed host expert) ranges that are not pinned leave
-// the working set, least streamed first (the plan's order backwards), until the available RAM reaches `want`. Returns the
-// bytes of the ranges trimmed (their resident part became standby)
-uint64_t fn_trim_unpinned(fn_pin_state * st, uint64_t want, int * n_rng) {
-    uint64_t b = 0;
-    int n = 0;
-    uint64_t since = 0;
-    for (int ri = (int) st->plan.ranges.size() - 1; ri >= 0 && !st->stop.load(); --ri) {
-        if (!st->arena && ri < st->reg.n_units() &&
-            st->reg.unit_at(ri).state.load(std::memory_order_relaxed) != fn_pin::ST_GONE &&
-            st->reg.unit_at(ri).state.load(std::memory_order_relaxed) != fn_pin::ST_PLANNED) {
-            continue; // registered (or draining): the driver holds those pages
-        }
-        const fn_pin::range & r = st->plan.ranges[ri];
-        fn_trim_pages(r.p, r.n);
-        b     += r.n;
-        since += r.n;
-        n++;
-        if (since >= FN_GIB/2) {
-            since = 0;
-            if (fn_avail_ram() >= want) {
-                break;
-            }
-        }
-    }
-    if (n_rng) {
-        *n_rng = n;
-    }
-    return b;
-}
-
-// [TAG_FN_L23_PINFIX] R-L23-2: room came back: released units are registered again, the most streamed first (the plan's
-// order), each only while the available RAM minus the bytes it will lock (its pages that are not in the working set: a
-// registration may lock them later, at the first copy) stays >= keep, and while the registration's rules allow it
-// (NON_LOCAL / LOCAL budgets, the cap). Mapped mode only. Returns the units registered
+// [TAG_FN_L23_PINFIX] R-L23-2: room came back: units not registered now are registered, the most streamed first (the
+// plan's order), only those whose pages are all in the working set already (a pin never reads the disk), each only while
+// the available RAM minus what it would bring in stays >= keep and the registration's rules allow it (NON_LOCAL / LOCAL
+// budgets, the cap). Mapped mode only. Returns the units registered
 bool fn_register(fn_pin_state * st, void * p, size_t n, uint64_t * dev);
+
+// [TAG_FN_L23_PINFIX] R-L23-4: a range is pinned only when this share of its pages (one sample per 2 MiB) is in the working
+// set: pins lock what the warm pass or the prompts brought in, never more (l23p: with untouched registrations ~10 GiB of the
+// streamed set went to the SSD tier)
+constexpr double FN_RESIDENT_MIN = 0.98;
 
 int fn_repin(fn_pin_state * st, uint64_t keep, uint64_t * bytes) {
     int n = 0;
@@ -688,6 +645,9 @@ int fn_repin(fn_pin_state * st, uint64_t keep, uint64_t * bytes) {
                 continue;
             }
             const double   res = fn_resident_share((const uint8_t *) U.p, U.n);
+            if (res < FN_RESIDENT_MIN) {
+                continue; // not resident yet: no pin brings pages in
+            }
             const uint64_t add = (uint64_t) ((1.0 - res)*(double) U.n);
             fn_pin::budget_in bi = fn_read_budget(st);
             if (bi.avail < pending + add + keep || fn_pin::check(bi, st->cfg, U.n, 0) != fn_pin::RULE_OK) {
@@ -991,6 +951,8 @@ bool fn_ranges_run(fn_pin_state * st) {
     uint64_t next_log = 2*FN_GIB;
     const int64_t t0 = fn_now_us();
     bool first_refused = false;
+    int      n_skip = 0; // [TAG_FN_L23_PINFIX] ranges not resident at registration
+    uint64_t b_skip = 0;
     for (int g = 0; g < st->n_take && !st->stop.load() && !st->frozen.load(); ++g) {
         const fn_pin::group & G = st->plan.groups[g];
         bool ok_group = true;
@@ -1015,6 +977,11 @@ bool fn_ranges_run(fn_pin_state * st) {
             fn_pin::budget_cfg cfg = st->cfg;
             fn_pin::budget_in b = fn_read_budget(st);
             const double res = st->mode == 2 ? 1.0 : fn_resident_share(r.p, r.n);
+            if (res < FN_RESIDENT_MIN) {
+                n_skip++; // [TAG_FN_L23_PINFIX] R-L23-4: not resident: no pin (the re-pin pass may take it later)
+                b_skip += r.n;
+                continue;
+            }
             const uint64_t add_new = (uint64_t) ((1.0 - res)*(double) r.n);
             int rule = fn_pin::check(b, cfg, r.n, add_new);
             if (rule != fn_pin::RULE_OK) {
@@ -1077,6 +1044,12 @@ bool fn_ranges_run(fn_pin_state * st) {
                         st->cfg.l_ratio, fn_gib(b2.avail), res);
             }
         }
+        // [TAG_FN_L23_PINFIX] the group's experts carry the PIN mark once all of its ranges are registered (no mark before:
+        // the warm pass reads them as without pins)
+        if (st->gst[g].n_on >= G.n_rng) {
+            std::lock_guard<std::mutex> op(st->op_mtx);
+            fn_mark_group(st, g, true);
+        }
         (void) ok_group;
     }
     // what did not get registered loses its mark; planned units never tried are dropped
@@ -1094,9 +1067,11 @@ bool fn_ranges_run(fn_pin_state * st) {
         }
     }
     st->reg_secs = (fn_now_us() - t0)/1e6;
-    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s), %.2f GiB of experts registered in %.1f s (%s, stop: %s, refused %d)\n", __func__,
-            n_ok, fn_gib(bytes_ok), st->reg_secs, st->mode == 2 ? "touched" : "before touch", fn_pin::rule_name(st->stop_rule),
-            (int) st->n_refused.load());
+    LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s), %.2f GiB of experts registered in %.1f s (%s, stop: %s, refused %d; %d range(s), "
+            "%.2f GiB not resident: not pinned)\n", __func__, n_ok, fn_gib(bytes_ok), st->reg_secs, st->mode == 2 ? "touched" : "resident only",
+            fn_pin::rule_name(st->stop_rule), (int) st->n_refused.load(), n_skip, fn_gib(b_skip));
+    fn_log("event=registered ranges=%d pinned_gib=%.2f skipped=%d skipped_gib=%.2f secs=%.1f", n_ok, fn_gib(bytes_ok), n_skip, fn_gib(b_skip),
+            st->reg_secs);
     return first_refused;
 }
 
@@ -1110,6 +1085,15 @@ void fn_thread(fn_pin_state * st) {
     llama_fn_l22_log("pin", "event=thread_start mode=%d unit=%d groups=%d", st->mode, st->unit, st->n_take);
     g_query_stamp.store(true);
     st->registering.store(true);
+    // [TAG_FN_L23_PINFIX] R-L23-4: mapped pins wait for the warm pass (at most 300 s): it brings the streamed set into the
+    // working set, the registration pins what is resident then
+    if (st->unit != 2) {
+        const int64_t t_w = fn_now_us();
+        while (!st->stop.load() && !llama_fn_p5_warm_done(*st->model) && fn_now_us() - t_w < 300000000) {
+            fn_sleep_ms(200);
+        }
+        fn_log("event=warm_wait ms=%.0f done=%d", (fn_now_us() - t_w)/1e3, llama_fn_p5_warm_done(*st->model) ? 1 : 0);
+    }
     if (st->unit == 2) {
         fn_arena_run(st);
     } else if (fn_ranges_run(st) && !st->stop.load()) {
@@ -1138,8 +1122,8 @@ void fn_thread(fn_pin_state * st) {
                 fn_gib(b.avail), fn_gib(st->reserve_need), fn_gib(st->watch_local));
     }
     // the watcher and the valve, every 2 s
-    fn_pin::valve_state vst; // [TAG_FN_L23_PINFIX] the valve's hysteresis
-    const uint64_t repin_gap = fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REPIN_GAP_MIB", 4096);
+    fn_pin::gate_state gst8; // [TAG_FN_L23_PINFIX] the drop / re-pin gate
+    const uint64_t repin_b = fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REPIN_MIB", 10240);
     bool watch_noted = false;
     int64_t t_status = fn_now_us();
     while (!st->stop.load()) {
@@ -1204,41 +1188,37 @@ void fn_thread(fn_pin_state * st) {
             fn_log("event=watcher headroom_gib=%.2f thr_gib=%.2f unpinned_gib=%.2f units=%d headroom_after_gib=%.2f pinned_gib=%.2f",
                     head/(double) FN_GIB, fn_gib(thr), fn_gib(b), n, h3/(double) FN_GIB, fn_gib(st->reg.active_bytes()));
         }
-        // [TAG_FN_L23_PINFIX] R-L23-2: the truly available RAM (free + standby) stays >= the floor for Windows and other
-        // programs: below it twice, the unpinned streamed pages leave the working set (still cached), then pins go, least
-        // streamed first, until floor + 1 GiB; with room again (floor + LLAMA_FN_L23_PIN_REPIN_GAP_MIB 4096 for 10 s, 60 s
-        // after the last release) released units come back, each keeping floor + gap - 1 GiB (fn_pin::valve_step)
+        // [TAG_FN_L23_PINFIX] R-L23-2: pins may only ever add speed. With pins, available RAM (free + standby) under the
+        // drop line (LLAMA_FN_L23_PIN_DROP_MIB 4096) for 3 samples (6 s) drops ALL of them: from there on the process runs as
+        // without pins (staged stream, no PIN marks); an unpin only unlocks, no page leaves the working set. Room >=
+        // LLAMA_FN_L23_PIN_REPIN_MIB (10240) for 60 s, 60 s after a drop, pins the resident units again (fn_pin::gate_step)
         const uint64_t avail = fn_avail_ram();
-        const int vs = fn_pin::valve_step(vst, avail, st->cfg.floor, repin_gap, fn_now_us(), 60000000);
-        if (vs < 0) {
+        const bool pinned = st->reg.any_active();
+        const bool repinnable = !st->arena && st->reg.n_active_units() < st->reg.n_units();
+        const int gs = fn_pin::gate_step(gst8, avail, pinned, repinnable, st->cfg.floor, 3, repin_b, 30);
+        if (gs < 0) {
             std::lock_guard<std::mutex> op(st->op_mtx);
             st->n_valve.fetch_add(1);
-            const uint64_t want = st->cfg.floor + FN_GIB;
-            int n_t = 0;
-            const uint64_t t_b = fn_trim_unpinned(st, want, &n_t);
-            const uint64_t a1  = fn_avail_ram();
+            const uint64_t had = st->reg.active_bytes();
             int n = 0;
             uint64_t b = 0;
-            if (a1 < want) {
-                b = fn_unpin(st, [&](uint64_t) { return fn_avail_ram() >= want; }, 200000, true, &n, true);
+            for (int k = 0; k < 8 && st->reg.any_active(); ++k) {
+                int nk = 0;
+                b += fn_unpin(st, [](uint64_t) { return false; }, 200000, true, &nk);
+                n += nk;
             }
-            const uint64_t a2 = fn_avail_ram();
-            if (b > 0 || st->n_valve.load() <= 3 || st->n_valve.load() % 64 == 0) {
-                LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] valve: %.2f GiB of RAM available (floor %.2f GiB): %d unpinned range(s) left the working "
-                        "set (%.2f GiB) -> %.2f GiB, %d pinned range(s) released (%.2f GiB) -> %.2f GiB available, %.2f GiB still pinned\n",
-                        __func__, fn_gib(avail), fn_gib(st->cfg.floor), n_t, fn_gib(t_b), fn_gib(a1), n, fn_gib(b), fn_gib(a2),
-                        fn_gib(st->reg.active_bytes()));
-            }
-            fn_log("event=valve avail_gib=%.2f floor_gib=%.2f trimmed_gib=%.2f trimmed_rng=%d avail_mid_gib=%.2f unpinned_gib=%.2f units=%d "
-                    "avail_after_gib=%.2f pinned_gib=%.2f", fn_gib(avail), fn_gib(st->cfg.floor), fn_gib(t_b), n_t, fn_gib(a1), fn_gib(b), n,
-                    fn_gib(a2), fn_gib(st->reg.active_bytes()));
-        } else if (vs > 0 && repin_gap > 0) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] RAM pressure: %.2f GiB available (< %.2f GiB for 6 s): all pins dropped (%d range(s), %.2f of "
+                    "%.2f GiB; %.2f GiB left busy), running as without pins until room comes back\n", __func__, fn_gib(avail), fn_gib(st->cfg.floor),
+                    n, fn_gib(b), fn_gib(had), fn_gib(st->reg.active_bytes()));
+            fn_log("event=drop avail_gib=%.2f drop_gib=%.2f units=%d unpinned_gib=%.2f left_gib=%.2f", fn_gib(avail), fn_gib(st->cfg.floor), n,
+                    fn_gib(b), fn_gib(st->reg.active_bytes()));
+        } else if (gs > 0) {
             uint64_t b = 0;
-            const int n = fn_repin(st, st->cfg.floor + (repin_gap > FN_GIB ? repin_gap - FN_GIB : 0), &b);
+            const int n = fn_repin(st, repin_b, &b);
             if (n > 0) {
                 st->n_repin.fetch_add(1);
-                LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] room again (%.2f GiB available): %d range(s) pinned again (%.2f GiB), %.2f GiB pinned, "
-                        "%.2f GiB available now\n", __func__, fn_gib(avail), n, fn_gib(b), fn_gib(st->reg.active_bytes()), fn_gib(fn_avail_ram()));
+                LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] room again (%.2f GiB available for 60 s): %d resident range(s) pinned (%.2f GiB), %.2f GiB "
+                        "pinned, %.2f GiB available now\n", __func__, fn_gib(avail), n, fn_gib(b), fn_gib(st->reg.active_bytes()), fn_gib(fn_avail_ram()));
                 fn_log("event=repin avail_gib=%.2f units=%d repinned_gib=%.2f pinned_gib=%.2f avail_after_gib=%.2f", fn_gib(avail), n, fn_gib(b),
                         fn_gib(st->reg.active_bytes()), fn_gib(fn_avail_ram()));
             }
@@ -1358,7 +1338,9 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     }
     st->cfg.nl_margin = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MARGIN_MIB", 8192);
     st->cfg.l_margin  = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", 1024);
-    st->cfg.floor     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_FLOOR_MIB", 6144);
+    // [TAG_FN_L23_PINFIX] R-L23-2: the registration's RAM rule and the drop line are one value (pins add no RAM demand:
+    // they lock resident pages only)
+    st->cfg.floor     = fn_mib_switch(*model, "LLAMA_FN_L23_PIN_DROP_MIB", 4096);
     st->cfg.warm_keep = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_WARM_KEEP_MIB", 0);
     st->cfg.max_pin   = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MAX_MIB", 0);
     st->arena_max     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_ARENA_MIB", 16384);
@@ -1521,10 +1503,8 @@ void llama_fn_pin_on_ready(const llama_model * model) {
         for (int i = 0; i < n_rng; ++i) {
             st->reg.set_unit(i, (void *) st->plan.ranges[i].p, st->plan.ranges[i].n);
         }
-        // the marks before the warm pass starts (it re-reads them per layer)
-        for (int g = 0; g < st->n_take; ++g) {
-            fn_mark_group(st.get(), g, true);
-        }
+        // [TAG_FN_L23_PINFIX] no marks before registration: the warm pass reads every streamed expert as without pins, the
+        // thread pins what is resident after it (fn_ranges_run marks complete groups)
     }
     size_t n_whole = 0;
     for (int g = 0; g < st->n_take; ++g) {

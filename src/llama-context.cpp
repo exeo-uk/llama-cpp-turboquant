@@ -4153,6 +4153,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 full_w = l20_base_ub;
             }
             keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
+            // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+            // GENSHARE2 window while a prompt waits) leaves the FULL reserve: the answer gets the hot set's tail back (~5 GiB of
+            // experts on the GPU), as the staged stream's windows did. With pins FULL stayed through every window of a 30K
+            // prompt and the other answer read 21.8 vs 30.9 t/s (l23p sess4)
+            if (keep_full && n_outputs_all > 0 && n_outputs_all == n_tokens_all) {
+                keep_full = false;
+            }
             if (keep_full && l20_n_keep++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
                         __func__, (int) n_tokens_all, (int) after);
