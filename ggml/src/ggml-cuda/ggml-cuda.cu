@@ -479,6 +479,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         return before - pool_size;
     }
 
+    uint64_t n_flush = 0; // [TAG_UPSTREAM_26771]
+    uint64_t flush_count() const override { return n_flush; }
+
     ~ggml_cuda_pool_leg() {
         clear_pool();
         GGML_ASSERT(pool_size == 0);
@@ -554,6 +557,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
+            // [TAG_UPSTREAM_26771] captured graphs may hold the freed buffers: the next graph_compute drops them
+            n_flush += cached_bytes > 0 ? 1 : 0;
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
@@ -7358,6 +7363,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool fn_l22_eager = ggml_cuda_fn_l22_graph_keep() >= 1 && graph_rows > ggml_cuda_fn_l22_graph_maxrows();
     if (fn_l22_eager) {
         graph_key = GGML_CUDA_FN_L22_EAGER_KEY;
+    }
+
+    // [TAG_UPSTREAM_26771] a legacy-pool flush freed buffers that captured graphs may write: capture them again
+    {
+        uint64_t n_flush = 0;
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                n_flush += cuda_ctx->pools[d][s] ? cuda_ctx->pools[d][s]->flush_count() : 0;
+            }
+        }
+        if (n_flush != cuda_ctx->pool_flush_seen) {
+            cuda_ctx->pool_flush_seen = n_flush;
+            if (!cuda_ctx->cuda_graphs.empty()) {
+                GGML_LOG_WARN("%s: [TAG_UPSTREAM_26771] the CUDA pool gave buffers back to the driver: %zu CUDA graphs captured again\n",
+                        __func__, cuda_ctx->cuda_graphs.size());
+                cuda_ctx->cuda_graphs.clear();
+            }
+        }
     }
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);

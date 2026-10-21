@@ -1212,6 +1212,9 @@ struct ggml_cuda_pool {
     // out since then ((size_t) -1 = this pool does not track it: its graphs cannot survive a trim)
     virtual void   cap_begin() {}
     virtual size_t cap_hwm() const { return (size_t) -1; }
+
+    // [TAG_UPSTREAM_26771] times the pool gave cached buffers back to the driver outside trim() (a failed allocation's flush)
+    virtual uint64_t flush_count() const { return 0; }
 };
 
 template<typename T>
@@ -1653,6 +1656,8 @@ struct ggml_backend_cuda_context {
     int             fn_l22_win_left = 0;                          // calls left in the current log window
     int             fn_l22_win_len  = 0;
     uint64_t        fn_l22_win_base[GGML_CUDA_FN_L22_CNT_COUNT] = {};
+
+    uint64_t        pool_flush_seen = 0; // [TAG_UPSTREAM_26771]
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
