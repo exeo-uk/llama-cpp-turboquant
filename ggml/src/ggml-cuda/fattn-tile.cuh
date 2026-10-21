@@ -980,7 +980,8 @@ static __global__ void flash_attn_tile(
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
-        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+        // [TAG_UPSTREAM_30572] a full last tile needs no out-of-bounds check
+        while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, kv_pos, q_pos, ne01, logit_softcap, slope, KQ, KV_tmp,
