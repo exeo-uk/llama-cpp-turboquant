@@ -2706,7 +2706,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // [TAG_GDN_OUT_FLAT] [TAG_UPSTREAM_30823] 2-D [n_heads * head_dim, n_tokens * n_seqs]: ssm_out is one matmul over all
+    // columns (one sequence: the same shape as 3-D). LLAMA_GDN_OUT_FLAT=0 restores the 3-D form
+    static const bool out_flat = [] {
+        const char * e = getenv("LLAMA_GDN_OUT_FLAT");
+        return !(e && e[0] == '0');
+    }();
+    ggml_tensor * final_output = out_flat
+        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs)
+        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
