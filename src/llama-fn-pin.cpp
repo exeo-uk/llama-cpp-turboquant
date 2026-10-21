@@ -1141,6 +1141,22 @@ bool fn_ranges_run(fn_pin_state * st) {
             }
         }
     }
+    // [TAG_FN_L23_PINFIX] R-L23-7: a refusal means the driver is at its limit for locked host memory; its own pinned staging
+    // (copies with pageable memory) needs room too: LLAMA_FN_L23_PIN_REFUSE_BACK_MIB (4096) of the least streamed pins go
+    if (st->n_refused.load() > 0 && st->reg.any_active()) {
+        std::lock_guard<std::mutex> op(st->op_mtx);
+        const uint64_t back = fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REFUSE_BACK_MIB", 4096);
+        int n = 0;
+        const uint64_t b = fn_unpin(st, [&](uint64_t f) { return f >= back; }, 200000, true, &n);
+        bytes_ok = bytes_ok > b ? bytes_ok - b : 0;
+        const uint64_t cap = st->reg.active_bytes();
+        if (st->cfg.max_pin == 0 || st->cfg.max_pin > cap) {
+            st->cfg.max_pin = cap; // a re-pin stays below the refusal
+        }
+        LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] refused by the driver: %d range(s), %.2f GiB unpinned again for the driver's staging\n",
+                __func__, n, fn_gib(b));
+        fn_log("event=refuse_back units=%d unpinned_gib=%.2f pinned_gib=%.2f", n, fn_gib(b), fn_gib(st->reg.active_bytes()));
+    }
     st->reg_secs = (fn_now_us() - t0)/1e6;
     LLAMA_LOG_INFO("%s: [TAG_FN_L22_PIN] %d range(s), %.2f GiB of experts registered in %.1f s (%s, stop: %s, refused %d; %d range(s), "
             "%.2f GiB not resident: not pinned)\n", __func__, n_ok, fn_gib(bytes_ok), st->reg_secs, st->mode == 2 ? "touched" : "resident only",

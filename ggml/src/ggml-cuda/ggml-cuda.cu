@@ -997,8 +997,22 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 // the registered edges (FAULT 2026-10-21 10:10: a hot-set refill slice of a lend-layer resident through the synchronous
 // set_tensor, LLAMA_FN_L22_REFILL=0) hit it. Such a copy goes again through a pinned bounce buffer (CPU copy, then DMA,
 // 32 MiB pieces, synchronous on the stream); any other error stays fatal. true: the bounce ran (the stream is idle)
+// [TAG_FN_L23_PINFIX] R-L23-7: a copy with pageable host memory needs the driver's pinned staging. With many registered
+// ranges it can fail with out of memory (FAULT 2026-10-21 15:20: a D2H get_tensor during the pin registration, then the
+// abort, then the TDR). The OOM hook drops the pins (code 2, host) and the copy runs once more
+static cudaError_t ggml_cuda_memcpy_oom_retry(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    cudaError_t e = cudaMemcpyAsync(dst, src, size, kind, stream);
+    if (e == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        if (ggml_cuda_fn_l22_oom_retry(size, 2)) {
+            e = cudaMemcpyAsync(dst, src, size, kind, stream);
+        }
+    }
+    return e;
+}
+
 static bool ggml_cuda_h2d_or_bounce(void * dst, const void * src, size_t size, cudaStream_t stream) {
-    const cudaError_t e = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
+    const cudaError_t e = ggml_cuda_memcpy_oom_retry(dst, src, size, cudaMemcpyHostToDevice, stream);
     if (e != cudaErrorInvalidValue || size == 0) {
         CUDA_CHECK(e);
         return false;
@@ -1039,7 +1053,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread)); // [TAG_FN_L23_PINFIX] R-L23-7
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -3410,7 +3424,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream())); // [TAG_FN_L23_PINFIX] R-L23-7
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
