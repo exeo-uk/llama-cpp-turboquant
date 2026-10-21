@@ -569,12 +569,16 @@ uint64_t fn_unpin(fn_pin_state * st, const std::function<bool(uint64_t freed)> &
 
 // waits while a decode runs or ended < 50 ms ago, while a prompt scope hushes the background readers, while the warm
 // pass waits for answer steps, and while the stream queried < 200 ms ago. false: stop
+// [TAG_FN_L23_PINFIX] R-L23-7 (hard rule): pins register only while the server is idle, never while a prompt or an answer runs:
+// no decode for LLAMA_FN_L23_PIN_IDLE_MS (1500; an answer's steps are ms apart). FAULT 15:20:50: 51 GiB registered during an answer
+std::atomic<int64_t> g_pin_idle_us{1500000};
+
 bool fn_wait_quiet(fn_pin_state * st) {
     size_t mark = 0;
     while (!st->stop.load(std::memory_order_relaxed)) {
         const int64_t now = fn_now_us();
         const bool busy = g_dec_running.load(std::memory_order_relaxed) > 0 ||
-                          now - g_dec_end_us.load(std::memory_order_relaxed) < 50000 ||
+                          now - g_dec_end_us.load(std::memory_order_relaxed) < g_pin_idle_us.load(std::memory_order_relaxed) ||
                           now - g_query_us.load(std::memory_order_relaxed) < 200000 ||
                           llama_fn_hushed() || llama_fn_warm_state(&mark) == 2;
         if (!busy) {
@@ -655,6 +659,9 @@ int fn_repin(fn_pin_state * st, uint64_t keep, uint64_t * bytes) {
             }
             uint64_t dev = 0;
             if (!fn_register(st, U.p, U.n, &dev)) {
+                // [TAG_FN_L23_PINFIX] R-L23-7: a refusal stops pinning; later re-pins stay below it
+                st->n_refused.fetch_add(1);
+                st->cfg.max_pin = st->reg.active_bytes();
                 break;
             }
             st->reg.set_unit_dev(u, dev);
@@ -1446,6 +1453,7 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     // [TAG_FN_L23_PINFIX] R-L23-2: the registration's RAM rule and the drop line are one value (pins add no RAM demand:
     // they lock resident pages only)
     st->cfg.floor     = fn_mib_switch(*model, "LLAMA_FN_L23_PIN_DROP_MIB", 4096);
+    g_pin_idle_us.store((int64_t) std::max(50, llama_fn_l3_int(*model, "LLAMA_FN_L23_PIN_IDLE_MS", 1500))*1000);
     st->cfg.warm_keep = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_WARM_KEEP_MIB", 0);
     st->cfg.max_pin   = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MAX_MIB", 0);
     st->arena_max     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_ARENA_MIB", 16384);
