@@ -131,6 +131,8 @@ LLAMA_API bool llama_fn_pin_query(const void * p, size_t n, llama_fn_pin_seg * s
 LLAMA_API void llama_fn_pin_release(int32_t ticket);
 // a device allocation of need_bytes is about to fail: unpin enough (synchronized) and return true to retry. Stub: false
 LLAMA_API bool llama_fn_pin_on_oom(size_t need_bytes);
+// [TAG_FN_L23_PINFIX] R-L23-5: an allocation failed while pins were held: every pin goes (true: some did), the caller retries once
+LLAMA_API bool llama_fn_pin_on_alloc_fail(size_t need_bytes);
 LLAMA_API bool llama_fn_pin_active(void);
 // DXGI QueryVideoMemoryInfo of the adapter with this LUID (non_local 0: LOCAL, 1: NON_LOCAL). Stub: false
 LLAMA_API bool llama_fn_dxgi_query(uint64_t luid, int non_local, uint64_t * budget, uint64_t * usage);

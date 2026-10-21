@@ -7,7 +7,7 @@
 //      spans = one span per fully streamed layer; arena = the fallback copy), marked PIN so the warm pass skips them,
 //      and one background thread registers them range by range (Portable | ReadOnly) on pages this process has not
 //      touched: the driver brings them in. Budget after every range: DXGI NON_LOCAL (budget - usage - charge >=
-//      LLAMA_FN_L22_PIN_MARGIN_MIB 8192), DXGI LOCAL (headroom >= min(reserve_need + LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB
+//      LLAMA_FN_L22_PIN_MARGIN_MIB 16384, at least reserve_need + 2 GiB: [TAG_FN_L23_PINFIX] R-L23-5), DXGI LOCAL (headroom >= min(reserve_need + LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB
 //      1024, headroom before the first pin - 256 MiB)), RAM (available - new bytes >= LLAMA_FN_L22_PIN_FLOOR_MIB 6144 +
 //      LLAMA_FN_L22_PIN_WARM_KEEP_MIB 0), LLAMA_FN_L22_PIN_MAX_MIB (0 = no cap). Stop at the first refusal, CUDA error
 //      or rule; the last range is unregistered on a rule break.
@@ -721,6 +721,41 @@ uint64_t fn_trimmable(fn_pin_state * st) {
     return res;
 }
 
+// [TAG_FN_L23_PINFIX] every pin goes (an unpin only unlocks); the process runs as without pins until the gate pins again.
+// op_mtx held by the caller. Returns the bytes unpinned
+uint64_t fn_drop_all(fn_pin_state * st, int * n_units) {
+    int n = 0;
+    uint64_t b = 0;
+    for (int k = 0; k < 8 && st->reg.any_active(); ++k) {
+        int nk = 0;
+        b += fn_unpin(st, [](uint64_t) { return false; }, 200000, true, &nk);
+        n += nk;
+    }
+    if (n_units) {
+        *n_units = n;
+    }
+    return b;
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-5: a device or pinned-host allocation FAILED while pins were held: they all go first (pins may
+// only ever add speed; the caller retries once). true: something was unpinned
+bool fn_on_alloc_fail(size_t need, const char * site) {
+    fn_pin_state * st = g_pin.load(std::memory_order_acquire);
+    if (st == nullptr || !st->reg.any_active()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> op(st->op_mtx);
+    st->n_oom.fetch_add(1);
+    const uint64_t had = st->reg.active_bytes();
+    int n = 0;
+    const uint64_t b = fn_drop_all(st, &n);
+    LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] an allocation of %.1f MiB failed (%s) with %.2f GiB pinned: all pins dropped (%d range(s), "
+            "%.2f GiB), retry\n", __func__, need/1048576.0, site, fn_gib(had), n, fn_gib(b));
+    fn_log("event=alloc_fail need_mib=%.1f site=%s had_gib=%.2f units=%d unpinned_gib=%.2f left_gib=%.2f", need/1048576.0, site, fn_gib(had), n,
+            fn_gib(b), fn_gib(st->reg.active_bytes()));
+    return b > 0;
+}
+
 // ggml-cuda's allocation hook (R-P7-2), before a graph instantiate, a VMM pool growth or a device buffer: after_failure
 // 0 = pre-check, unpin only when LOCAL headroom < need + the pre-check margin (on_oom unpins for good); 1 = the
 // allocation failed, unpin once
@@ -736,8 +771,9 @@ bool fn_cuda_oom(size_t need, int after_failure, void * ud) {
         if (!ok || head >= (int64_t) need + (int64_t) fn_precheck_margin(st)) {
             return false;
         }
+        return llama_fn_pin_on_oom(need);
     }
-    return llama_fn_pin_on_oom(need);
+    return fn_on_alloc_fail(need, "ggml-cuda"); // [TAG_FN_L23_PINFIX] R-L23-5
 }
 
 // one registration; *dev = the device address when known (0 else)
@@ -1195,17 +1231,26 @@ void fn_thread(fn_pin_state * st) {
         const uint64_t avail = fn_avail_ram();
         const bool pinned = st->reg.any_active();
         const bool repinnable = !st->arena && st->reg.n_active_units() < st->reg.n_units();
-        const int gs = fn_pin::gate_step(gst8, avail, pinned, repinnable, st->cfg.floor, 3, repin_b, 30);
+        // [TAG_FN_L23_PINFIX] R-L23-5: NON_LOCAL room under half the registration margin (other allocations grew) counts as
+        // pressure too: the gate sees "no RAM" and drops every pin after 3 samples
+        uint64_t nl_room = UINT64_MAX;
+        if (pinned) {
+            uint64_t nb = 0, nu = 0;
+            if (llama_fn_dxgi_query(st->luid, 1, &nb, &nu)) {
+                nl_room = nb > nu ? nb - nu : 0;
+            }
+        }
+        const bool nl_low = nl_room < st->cfg.nl_margin/2;
+        const int gs = fn_pin::gate_step(gst8, nl_low ? 0 : avail, pinned, repinnable, st->cfg.floor, 3, repin_b, 30);
         if (gs < 0) {
             std::lock_guard<std::mutex> op(st->op_mtx);
             st->n_valve.fetch_add(1);
             const uint64_t had = st->reg.active_bytes();
             int n = 0;
-            uint64_t b = 0;
-            for (int k = 0; k < 8 && st->reg.any_active(); ++k) {
-                int nk = 0;
-                b += fn_unpin(st, [](uint64_t) { return false; }, 200000, true, &nk);
-                n += nk;
+            const uint64_t b = fn_drop_all(st, &n);
+            if (nl_low) {
+                LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] NON_LOCAL room %.2f GiB < %.2f GiB: dropping the pins\n", __func__, fn_gib(nl_room),
+                        fn_gib(st->cfg.nl_margin/2));
             }
             LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] RAM pressure: %.2f GiB available (< %.2f GiB for 6 s): all pins dropped (%d range(s), %.2f of "
                     "%.2f GiB; %.2f GiB left busy), running as without pins until room comes back\n", __func__, fn_gib(avail), fn_gib(st->cfg.floor),
@@ -1336,7 +1381,7 @@ void llama_fn_pin_on_ready(const llama_model * model) {
         const std::string s = u ? u : "";
         st->unit = s == "spans" ? 1 : s == "arena" ? 2 : 0;
     }
-    st->cfg.nl_margin = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MARGIN_MIB", 8192);
+    st->cfg.nl_margin = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MARGIN_MIB", 16384);
     st->cfg.l_margin  = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", 1024);
     // [TAG_FN_L23_PINFIX] R-L23-2: the registration's RAM rule and the drop line are one value (pins add no RAM demand:
     // they lock resident pages only)
@@ -1458,6 +1503,11 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     st->nl_base = b.nl_usage;
     st->l_base  = b.l_usage;
     st->base_ok = true;
+    // [TAG_FN_L23_PINFIX] R-L23-5 (FAULT 2026-10-21 12:48, nvlddmkm 153): 63.92 GiB of resident pins left NON_LOCAL 8.36 GiB
+    // of room (65.39 / 73.75 GiB) and the first prompt's FULL reserve spilled past it (CUDA out of memory in a stream
+    // synchronize, then a TDR). NON_LOCAL keeps LLAMA_FN_L22_PIN_MARGIN_MIB (now 16384) and at least what a later allocation
+    // may add (reserve_need, 13.8 GiB here) + 2 GiB: the room a VRAM spill and the host allocations of a prompt need
+    st->cfg.nl_margin = std::max<uint64_t>(st->cfg.nl_margin, st->reserve_need + 2*FN_GIB);
     // LOCAL: keep reserve_need + margin, but never less than today's headroom allows (the hot set takes the free VRAM,
     // so today's headroom is what every later allocation already runs with): at most the ready headroom - 256 MiB
     const int64_t l_head = b.have_l ? (int64_t) b.l_budget - (int64_t) b.l_usage : 0;
@@ -1662,6 +1712,10 @@ bool llama_fn_pin_on_oom(size_t need_bytes) {
             need_bytes/1048576.0, fn_gib(freed), n, by_bytes ? 1 : 0, fn_gib(cap), ratio, head0/(double) FN_GIB, head1/(double) FN_GIB,
             fn_gib(st->reg.active_bytes()));
     return freed > 0;
+}
+
+bool llama_fn_pin_on_alloc_fail(size_t need_bytes) {
+    return fn_on_alloc_fail(need_bytes, "libllama");
 }
 
 uint64_t llama_fn_pin_precheck_margin(void) {

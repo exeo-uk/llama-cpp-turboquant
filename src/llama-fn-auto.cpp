@@ -294,7 +294,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_SSDTIER_IO",            "8",       P_ALL }, // P5 I/O threads
     { "LLAMA_FN_L22_PIN",                   "0",       P_ALL }, // P4 P6 [TAG_FN_L22_PIN] GPU-fault class: the pin block sets 1; owner
     { "LLAMA_FN_L22_PIN_UNIT",              "ranges",  P_ALL }, // P6
-    { "LLAMA_FN_L22_PIN_MARGIN_MIB",        "8192",    P_ALL }, // P6 NON_LOCAL margin
+    { "LLAMA_FN_L22_PIN_MARGIN_MIB",        "16384",   P_ALL }, // P6 NON_LOCAL margin ([TAG_FN_L23_PINFIX] R-L23-5: 8192 left 8.4 GiB, TDR)
     { "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB",  "1024",    P_ALL }, // P6 LOCAL margin
     { "LLAMA_FN_L22_PIN_FLOOR_MIB",         "6144",    P_ALL }, // P6
     { "LLAMA_FN_L22_PIN_ARENA_MIB",         "16384",   P_ALL }, // P6 anonymous fallback

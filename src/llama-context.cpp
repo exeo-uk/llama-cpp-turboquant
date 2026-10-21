@@ -7705,7 +7705,7 @@ bool llama_context::l22_oom_retry(size_t need) {
     if (!llama_fn_pin_active()) {
         return false;
     }
-    const bool freed = llama_fn_pin_on_oom(need > 0 ? need : (size_t) 1 << 30);
+    const bool freed = llama_fn_pin_on_alloc_fail(need > 0 ? need : (size_t) 1 << 30); // [TAG_FN_L23_PINFIX] R-L23-5: all pins go
     llama_fn_l22_log("pin", "what=oom_retry need_mib=%.0f freed=%d", need/1048576.0, freed ? 1 : 0);
     return freed;
 }

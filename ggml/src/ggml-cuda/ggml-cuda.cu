@@ -1724,6 +1724,11 @@ static void * ggml_cuda_host_malloc(size_t size) {
 
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    // [TAG_FN_L23_PINFIX] R-L23-5: pinned host memory short while libllama holds pins: they go first, one retry
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size)) {
+        (void) cudaGetLastError();
+        err = cudaMallocHost((void **) &ptr, size);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
