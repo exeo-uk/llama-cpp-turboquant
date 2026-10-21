@@ -989,11 +989,47 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// [TAG_FN_L23_PINFIX] a host -> device copy whose source starts inside a range registered with cudaHostRegister but runs
+// past its end is refused by CUDA (cudaErrorInvalidValue: nothing is queued, the error is not sticky). libllama registers
+// per-expert ranges of the mapped model ([TAG_FN_L22_PIN]) and now keeps them, so a caller that does not split its copy at
+// the registered edges (FAULT 2026-10-21 10:10: a hot-set refill slice of a lend-layer resident through the synchronous
+// set_tensor, LLAMA_FN_L22_REFILL=0) hit it. Such a copy goes again through a pinned bounce buffer (CPU copy, then DMA,
+// 32 MiB pieces, synchronous on the stream); any other error stays fatal. true: the bounce ran (the stream is idle)
+static bool ggml_cuda_h2d_or_bounce(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const cudaError_t e = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
+    if (e != cudaErrorInvalidValue || size == 0) {
+        CUDA_CHECK(e);
+        return false;
+    }
+    (void) cudaGetLastError();
+    static std::mutex       bounce_mtx;
+    static void *           bounce = nullptr;
+    static std::atomic<int> n_notes{0};
+    constexpr size_t        B = (size_t) 32 << 20;
+    std::lock_guard<std::mutex> lk(bounce_mtx);
+    if (bounce == nullptr) {
+        CUDA_CHECK(cudaMallocHost(&bounce, B));
+    }
+    for (size_t o = 0; o < size; o += B) {
+        const size_t k = std::min(B, size - o);
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // the previous piece has left the bounce buffer
+        memcpy(bounce, (const char *) src + o, k);
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst + o, bounce, k, cudaMemcpyHostToDevice, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int k = n_notes.fetch_add(1) + 1;
+    if (k <= 3 || k % 1024 == 0) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] a host copy of %.2f MiB at %p crossed a registered host range's edge: sent "
+                "through the pinned bounce buffer (%d so far)\n", size/1048576.0, src, k);
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cudaStreamPerThread); // [TAG_FN_L23_PINFIX]
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -3106,7 +3142,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cuda_ctx->stream()); // [TAG_FN_L23_PINFIX]
 }
 
 // [TAG_FN_L4_HOST_BATCHCPY] host -> device copies into whole device tensors as one cudaMemcpyBatchAsync on the backend's

@@ -25,6 +25,8 @@
 #include "../../src/llama-fn-pin-core.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <cuda.h>
@@ -856,4 +858,64 @@ int moe_bridge_pin_test(const pin_probe_args & a, pin_say_fn say) {
     }
     return fail ? 1 : 0;
 #endif
+}
+
+// [TAG_FN_L23_PINFIX] --only bounce (FAULT 2026-10-21 10:10): a host -> device copy that starts inside a registered host
+// range and runs past its end. (1) the raw cudaMemcpyAsync: CUDA's answer (expected: invalid argument); (2) the same copy
+// through ggml_backend_tensor_set (ggml-cuda sends it through its pinned bounce buffer): it must land, bytes equal;
+// (3) a copy that starts before the range and runs into it (pageable start), raw. No model; sanitizer-friendly (16 MiB).
+int moe_bridge_bounce_test(pin_say_fn say) {
+    const size_t MB = (size_t) 1 << 20;
+    const size_t N  = 16*MB;
+#if defined(_WIN32)
+    uint8_t * host = (uint8_t *) VirtualAlloc(nullptr, N, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    uint8_t * host = (uint8_t *) aligned_alloc(4096, N);
+#endif
+    if (host == nullptr) {
+        say("bounce: no host memory\n");
+        return 1;
+    }
+    for (size_t i = 0; i < N; ++i) {
+        host[i] = (uint8_t) (i*2654435761u >> 13);
+    }
+    int rc = 0;
+    if (!cuda_ok(cudaHostRegister(host + 4*MB, 8*MB, cudaHostRegisterPortable), "cudaHostRegister (bounce)")) {
+        return 1;
+    }
+    void * d = nullptr;
+    cuda_ok(cudaMalloc(&d, 8*MB), "cudaMalloc (bounce)");
+    const cudaError_t e1 = cudaMemcpy(d, host + 8*MB, 8*MB, cudaMemcpyHostToDevice);   // starts inside, runs past
+    (void) cudaGetLastError();
+    const cudaError_t e3 = cudaMemcpy(d, host + 2*MB, 4*MB, cudaMemcpyHostToDevice);   // starts before, runs into
+    (void) cudaGetLastError();
+    say("bounce: raw copy inside -> past the registered end: %s | outside -> into the range: %s\n", cudaGetErrorName(e1), cudaGetErrorName(e3));
+    cudaFree(d);
+    // through ggml-cuda
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (dev == nullptr) {
+        say("bounce: no GPU device in ggml\n");
+        rc = 1;
+    } else {
+        ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) (8*MB));
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+        ggml_backend_tensor_set(t, host + 8*MB, 0, 8*MB);
+        std::vector<uint8_t> back(8*MB);
+        ggml_backend_tensor_get(t, back.data(), 0, 8*MB);
+        const bool same = memcmp(back.data(), host + 8*MB, 8*MB) == 0;
+        say("bounce: ggml_backend_tensor_set of the same copy: %s\n", same ? "landed, bytes equal" : "BYTES DIFFER");
+        rc = same ? 0 : 1;
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    cuda_ok(cudaHostUnregister(host + 4*MB), "cudaHostUnregister (bounce)");
+#if defined(_WIN32)
+    VirtualFree(host, 0, MEM_RELEASE);
+#else
+    free(host);
+#endif
+    say("bounce verdict: %s (raw inside->past %s)\n", rc == 0 ? "PASS" : "FAIL", cudaGetErrorName(e1));
+    return rc;
 }
