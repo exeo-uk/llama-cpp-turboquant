@@ -138,6 +138,11 @@ public:
     };
     qsa_stats & qsa_stats_mut() const { return qsa_st; }
 
+    // [TAG_FN_L23_TWOSLOT] the pool count a graph reserve sizes for n_seqs sequences (0: n_seq_max), and an upper bound of
+    // the pools once n_add more (token, sequence) pairs are in: (every sequence's cells + n_add) / kpool; 0: no indexer
+    uint64_t kpool_reserve_pools(uint32_t n_seqs) const;
+    uint64_t kpool_bound(uint32_t n_add) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -280,6 +285,10 @@ private:
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
 };
+
+// [TAG_FN_L23_TWOSLOT] the full contexts (graph reserve) this thread makes next size the k-pool lists for n_seqs sequences
+// (0: n_seq_max). The 1-sequence 16K FULL reserve of a 2-slot server sets 1 (its decode keeps the bound, kpool_bound)
+void llama_fn_kpool_reserve_seqs(uint32_t n_seqs);
 
 //
 // [TAG_FN_L22_QSA_SEQPOOLS] [TAG_FN_L22_QSA_SHAREPFX] round 22 P13: pure pieces of the per-sequence pool lists, exported

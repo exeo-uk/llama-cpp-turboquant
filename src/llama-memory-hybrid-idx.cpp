@@ -571,6 +571,38 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
 
+// [TAG_FN_L23_TWOSLOT]
+static thread_local uint32_t g_kpool_reserve_seqs = 0;
+
+void llama_fn_kpool_reserve_seqs(uint32_t n_seqs) {
+    g_kpool_reserve_seqs = n_seqs;
+}
+
+uint64_t llama_memory_hybrid_idx::kpool_reserve_pools(uint32_t n_seqs) const {
+    if (mem_idx == nullptr || get_kpool() == 0) {
+        return 0;
+    }
+    const uint32_t n_max = mem_idx->get_n_seq_max();
+    return uint64_t(mem_idx->get_size() / get_kpool()) * (n_seqs > 0 ? std::min(n_seqs, n_max) : n_max);
+}
+
+uint64_t llama_memory_hybrid_idx::kpool_bound(uint32_t n_add) const {
+    if (mem_idx == nullptr || get_kpool() == 0) {
+        return 0;
+    }
+    // a sequence's pools are whole groups of kpool of its cells (kpool_scan_pools): sum over s of floor(cells_s / kpool)
+    // <= floor((sum of cells_s) / kpool), with the n_add (token, sequence) pairs of the batch counted in
+    const uint32_t n_stream = mem_idx->get_n_stream();
+    uint64_t n = n_add;
+    for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+        if (n_stream > 1 && s >= (llama_seq_id) n_stream) {
+            break;
+        }
+        n += mem_idx->get_cells(n_stream == 1 ? 0 : s).seq_pos_get(s).size();
+    }
+    return n / get_kpool();
+}
+
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
 
@@ -815,8 +847,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     if (kpool_track()) {
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
-        const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        const uint64_t n_pool_max = mem->kpool_reserve_pools(g_kpool_reserve_seqs); // [TAG_FN_L23_TWOSLOT]
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;

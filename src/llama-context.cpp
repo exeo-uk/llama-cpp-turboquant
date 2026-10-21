@@ -23,6 +23,7 @@
 #include "llama-kv-tier.h"            // [TAG_KV_RESOLVE] turbot plan source and match check
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h" // [TAG_FN_L23_TWOSLOT] kpool_bound
 #include "llama-memory-hybrid-iswa.h" // [TAG_TURBOT_ANY_ISWA] llama_turbot_kv_of
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -2106,7 +2107,9 @@ void llama_context::sched_reserve() {
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+        llama_fn_kpool_reserve_seqs(l22_1seq && l23_bg2pools ? 1 : 0); // [TAG_FN_L23_TWOSLOT]
         mctx = memory->init_full();
+        llama_fn_kpool_reserve_seqs(0);
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
         }
@@ -4053,7 +4056,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             l21_extra > 0 && l22p.ubplan && cbuf_full_t > 0 && cbuf_full_t < cparams.n_ubatch) {
             l22_rw_planned = true;
             l22p_batch_scan();
-            if (!(l22p_bg2_on && l22p_prompt_seqs > 1)) {
+            if (!(l22p_bg2_on && l22p_bg2_base(n_tokens_all))) {
                 l22p_bucket = llama_fn_l22_depth_bucket(l22p_depth);
                 const uint32_t w_now = cbuf_full_t;
                 const uint32_t w     = l22p_plan_width((uint32_t) n_tokens_all, l20_prompt_after, true);
@@ -4146,7 +4149,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                          llama_fn_l21_full_width(l20_base_ub, cparams.n_ubatch, (uint32_t) n_tokens_all, after);
             }
             // [TAG_FN_L22_BIGUB2] the big FULL reserve holds one prompt sequence: a batch with two takes the base width
-            if (l22p_bg2_on && l22p_prompt_seqs > 1 && full_w > l20_base_ub) {
+            if (l22p_bg2_on && full_w > l20_base_ub && l22p_bg2_base(n_tokens_all)) {
                 full_w = l20_base_ub;
             }
             keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
@@ -4261,11 +4264,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     // [TAG_FN_L22_BIGUB2] a batch with two prompt sequences under the 1-sequence big FULL reserve: ubatches of the base width
     // (the n_seq_max-sequence base reserve fits inside its buffers, llama_fn_l22_bigub2_ok)
-    if (l22p_bg2_on && !cbuf_short && cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub && l22p_prompt_seqs > 1) {
+    // [TAG_FN_L23_TWOSLOT] or one with more k-pools than that reserve holds
+    if (l22p_bg2_on && !cbuf_short && cbuf_state == CBUF_FULL && cbuf_full_t > l20_base_ub && l22p_bg2_base(n_tokens_all)) {
         n_ubatch_split = std::min(n_ubatch_split, l20_base_ub);
         if (l22p_n_bg2_split++ < 3) {
-            LLAMA_LOG_WARN("%s: [TAG_FN_L22_BIGUB2] %u prompt sequences under the 1-sequence %u-token reserve: ubatches of %u\n",
-                    __func__, l22p_prompt_seqs, cbuf_full_t, l20_base_ub);
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_BIGUB2] %u prompt sequences under the 1-sequence %u-token reserve (or its k-pools, "
+                    "[TAG_FN_L23_TWOSLOT]): ubatches of %u\n", __func__, l22p_prompt_seqs, cbuf_full_t, l20_base_ub);
         }
     }
     const int64_t  t_short0       = cbuf_short ? ggml_time_us() : 0;
@@ -7866,6 +7870,7 @@ void llama_context::l22p_init() {
     l22p.ubplan    = lvl("LLAMA_FN_L22_UBPLAN") > 0;
     l22p.bigub2    = lvl("LLAMA_FN_L22_BIGUB2");
     l22p.smallkeep = std::min(2, lvl("LLAMA_FN_L22_SMALLKEEP"));
+    l23_bg2pools   = l22p.bigub2 > 0 && lvl("LLAMA_FN_L23_BG2POOLS") > 0; // [TAG_FN_L23_TWOSLOT]
     if (l22p.bigub2 >= 2) {
         // R-REV-8: D3's fallback form (a partial borrow and 12K ubatches) is not built: 2 runs as 1, said once
         LLAMA_LOG_WARN("%s: [TAG_FN_L22_BIGUB2] LLAMA_FN_L22_BIGUB2=%d: the partial-borrow 12K form is not built, runs as BIGUB2=1 "
@@ -7887,6 +7892,42 @@ void llama_context::l22p_init() {
                 l22p.bigub2 > 0 ? " BIGUB2" : "", l22p.smallkeep > 0 ? (l22p.smallkeep >= 2 ? " SMALLKEEP=2" : " SMALLKEEP") : "",
                 (long long) l22p_xover_env);
     }
+}
+
+// [TAG_FN_L23_TWOSLOT] the pools after n_add more tokens stay within the 1-sequence reserve's k-pool lists
+bool llama_context::l23_pools_fit(uint32_t n_add) const {
+    if (!l23_bg2pools) {
+        return true;
+    }
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+    if (mem == nullptr) {
+        return true;
+    }
+    const uint64_t cap = mem->kpool_reserve_pools(1);
+    return cap == 0 || mem->kpool_bound(n_add) <= cap;
+}
+
+bool llama_context::l22p_bg2_base(uint32_t n_tokens) {
+    if (l22p_prompt_seqs > 1) {
+        return true;
+    }
+    if (!l23_bg2pools) {
+        return false;
+    }
+    // the batch's (token, sequence) pairs: a token of two sequences adds a cell to each
+    const llama_batch & b = balloc->get_batch();
+    uint32_t n_add = 0;
+    for (int32_t i = 0; i < b.n_tokens; ++i) {
+        n_add += b.n_seq_id ? (uint32_t) std::max(1, b.n_seq_id[i]) : 1u;
+    }
+    if (l23_pools_fit(n_add)) {
+        return false;
+    }
+    if (l23_n_pools_base++ < 3) {
+        LLAMA_LOG_WARN("%s: [TAG_FN_L23_TWOSLOT] a %u-token batch could pass the 1-sequence reserve's k-pools (shared cells): "
+                "the base width\n", __func__, n_tokens);
+    }
+    return true;
 }
 
 // the stream's minimum ubatch now (XOVER's crossover, else the stream's own; INT32_MAX: no stream)

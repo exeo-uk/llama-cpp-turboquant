@@ -329,6 +329,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_XOVER",                 "1",       P_ALL }, // P10 [TAG_FN_L22_XOVER] placement
     { "LLAMA_FN_L22_UBPLAN",                "1",       P_ALL }, // P10 [TAG_FN_L22_UBPLAN] M9 (kld)
     { "LLAMA_FN_L22_BIGUB2",                "1",       P_ALL }, // P10 [TAG_FN_L22_BIGUB2] D3 (kld)
+    { "LLAMA_FN_L23_BG2POOLS",              "1",       P_ALL }, // [TAG_FN_L23_TWOSLOT] O7: BIGUB2's k-pools for one sequence (kld)
     { "LLAMA_FN_L22_SMALLKEEP",             "1",       P_ALL }, // P10 [TAG_FN_L22_SMALLKEEP] G3
     { "LLAMA_FN_L22_X_DEFER",               "0",       P_ALL }, // P11 [TAG_FN_L22_X_DEFER] changes answers: owner
     { "LLAMA_FN_L22_X_DEFER_W",             "0.1",     P_ALL }, // P11

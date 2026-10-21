@@ -267,6 +267,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_XOVER", "1", false },
     { "LLAMA_FN_L22_UBPLAN", "1", false },
     { "LLAMA_FN_L22_BIGUB2", "1", false },
+    { "LLAMA_FN_L23_BG2POOLS", "1", false }, // [TAG_FN_L23_TWOSLOT]
     { "LLAMA_FN_L22_SMALLKEEP", "1", false },
     { "LLAMA_FN_L22_X_DEFER", "0", false },
     { "LLAMA_FN_L22_X_DEFER_W", "0.1", false },

@@ -677,6 +677,12 @@ private:
     uint64_t l22p_n_xover = 0, l22p_n_big = 0, l22p_n_base = 0, l22p_n_bg2_split = 0;
     bool     l22p_bg2_on      = false;      // [TAG_FN_L22_BIGUB2] the big FULL reserve is made for one sequence
     bool     l22p_bg2_force   = false;      // cbuf_prepare's 1-sequence probe
+    // [TAG_FN_L23_TWOSLOT] LLAMA_FN_L23_BG2POOLS: the 1-sequence reserve sizes the k-pool lists for one sequence as well; a
+    // batch whose pools could pass that (a cache shared by both sequences) takes the base width
+    bool     l23_bg2pools     = false;
+    uint64_t l23_n_pools_base = 0;
+    bool     l23_pools_fit(uint32_t n_add) const;
+    bool     l22p_bg2_base(uint32_t n_tokens); // a batch under the 1-sequence reserve that takes the base width
     // [TAG_FN_L22_SMALLKEEP] the SMALL scheduler, its graphs and its expected sizes while a FULL period runs (parked)
     ggml_backend_sched_ptr              l22_sk_sched;
     std::array<llm_graph_result_ptr, 2> l22_sk_prev;
