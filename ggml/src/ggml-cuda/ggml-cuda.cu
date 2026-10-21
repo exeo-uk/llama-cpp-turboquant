@@ -447,7 +447,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // [TAG_FN_L22_OOMHOOK] defined after ggml_cuda_lock_counter: the libllama OOM hook (pins), outside a capture
 static void ggml_cuda_fn_l22_oom_precheck(size_t need);
-static bool ggml_cuda_fn_l22_oom_retry(size_t need);
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code = 1);
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
@@ -674,7 +674,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             ggml_cuda_fn_l22_oom_precheck(reserve_size); // [TAG_FN_L22_OOMHOOK]
             CUresult cr = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size)) { // [TAG_FN_L22_OOMHOOK]
+            // [TAG_FN_L23_PINFIX] R-L23-6: a failed retry aborts here, so the hook gets two attempts (code 3, then 4)
+            for (int k = 0; k < 2 && cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size, 3 + k); ++k) { // [TAG_FN_L22_OOMHOOK]
                 cr = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
             CU_CHECK(cr);
@@ -808,14 +809,15 @@ static void ggml_cuda_fn_l22_oom_precheck(size_t need) {
     }
 }
 
-static bool ggml_cuda_fn_l22_oom_retry(size_t need) {
+// code ([TAG_FN_L23_PINFIX] R-L23-6): 1 = device allocation, 2 = pinned host allocation, 3 / 4 = device allocation whose failed retry aborts (first / second attempt)
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code) {
     const ggml_cuda_fn_l22_oom_fn_t fn = ggml_cuda_fn_l22_oom_fn.load();
     if (fn == nullptr || ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) {
         return false;
     }
-    const bool freed = fn(need, 1, ggml_cuda_fn_l22_oom_ud.load());
-    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] device allocation of %.1f MiB failed: the OOM hook %s, one retry\n",
-            need/1048576.0, freed ? "gave memory back" : "had nothing to give");
+    const bool freed = fn(need, code, ggml_cuda_fn_l22_oom_ud.load());
+    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] %s allocation of %.1f MiB failed (code %d): the OOM hook %s\n", code == 2 ? "pinned host" : "device",
+            need/1048576.0, code, freed ? "gave memory back, retry" : "had nothing to give");
     return freed;
 }
 
@@ -1725,7 +1727,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     // [TAG_FN_L23_PINFIX] R-L23-5: pinned host memory short while libllama holds pins: they go first, one retry
-    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size)) {
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size, 2)) {
         (void) cudaGetLastError();
         err = cudaMallocHost((void **) &ptr, size);
     }
@@ -3855,10 +3857,16 @@ static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_c
         while (ggml_cuda_fn_l22_drop_one_instance(ctx, graph, true)) {
             n_dropped++;
         }
-        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024);
+        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 3);
         GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] graph instantiate out of memory (%d nodes): %d cold instances dropped, "
                 "hook %d, one retry\n", (int) graph->node_props.size(), n_dropped, hook ? 1 : 0);
         err = inst();
+        // [TAG_FN_L23_PINFIX] R-L23-6: a second failure aborts below: the hook's second attempt first
+        if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 4)) {
+            (void) cudaGetLastError();
+            graph->instance = nullptr;
+            err = inst();
+        }
     }
     CUDA_CHECK(err);
 }

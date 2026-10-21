@@ -488,7 +488,35 @@ static void test_pinfix() {
     TCHECK(fn_pin::gate_step(gs, 11*G, true, false, D, 3, P, 30) == 0, "nothing to re-pin: nothing");
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-6: the pins go on a failed allocation only when they can be the cause
+static void test_alloc_fail_reason() {
+    const uint64_t M = 1ull << 20;
+    const uint64_t G = 1ull << 30;
+    fn_pin::af_in a;
+    // l23p B6 14:23:48: 640.9 MiB VRAM, no LOCAL charge, NON_LOCAL room ~16.2 GiB >= 16 GiB margin, LOCAL headroom 2.9 GiB
+    a.kind = fn_pin::AF_DEV; a.need = 641*M; a.have_l = true; a.l_head = (int64_t) (2.9*(double) G); a.l_ratio = 0.0;
+    a.have_nl = true; a.nl_room = (uint64_t) (16.2*(double) G); a.nl_margin = 16*G;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "B6 case: plain VRAM failure, pins stay");
+    a.kind = fn_pin::AF_DEV_FATAL;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "fatal site: reason none (the caller unpins partly)");
+    a.kind = fn_pin::AF_HOST;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_HOST, "pinned host allocation: pins can be the cause");
+    a.kind = fn_pin::AF_DEV; a.l_ratio = 0.2;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_LOCAL_CHARGE, "LOCAL charge per pinned byte");
+    a.l_ratio = 0.0; a.have_nl = false;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_UNKNOWN, "NON_LOCAL unknown: drop (safe)");
+    // FAULT 12:48: NON_LOCAL room 8.36 GiB < 16 GiB margin
+    a.have_nl = true; a.nl_room = (uint64_t) (8.36*(double) G);
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_ROOM, "12:48 case: NON_LOCAL room under the margin");
+    // a spill past LOCAL that NON_LOCAL cannot hold (margin 0)
+    a.nl_margin = 0; a.nl_room = 1*G; a.need = 8*G; a.l_head = 2*(int64_t) G;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NL_SPILL, "spill 6 GiB > NON_LOCAL room 1 GiB");
+    a.need = 2*G + 512*M;
+    TCHECK(fn_pin::alloc_fail_reason(a) == fn_pin::AFR_NONE, "spill 0.5 GiB fits NON_LOCAL room 1 GiB");
+}
+
 int main() {
+    test_alloc_fail_reason();
     test_unit();
     test_order();
     test_rules();

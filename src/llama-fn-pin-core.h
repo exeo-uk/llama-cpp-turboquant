@@ -393,6 +393,51 @@ inline uint64_t oom_help_bytes(uint64_t want, const oom_in & o) {
     return def == 0 ? 0 : std::min<uint64_t>(want, def + ((uint64_t) 256 << 20));
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-6: can the pins be the cause of a failed allocation? A host (pinned / sysmem) allocation, a LOCAL
+// charge per pinned byte, NON_LOCAL unknown, NON_LOCAL room under the margin, or a spill past LOCAL that NON_LOCAL cannot hold.
+// AFR_NONE: a plain VRAM failure, the pins stay (l23p B6: a 640.9 MiB VRAM failure dropped all 55 GiB for the whole run)
+enum { AF_HOST = 0, AF_DEV = 1, AF_DEV_FATAL = 2 };
+enum { AFR_NONE = 0, AFR_HOST, AFR_LOCAL_CHARGE, AFR_NL_UNKNOWN, AFR_NL_ROOM, AFR_NL_SPILL };
+
+struct af_in {
+    int      kind      = AF_DEV;
+    double   l_ratio   = 0.0;
+    bool     have_l    = false;
+    int64_t  l_head    = 0;
+    bool     have_nl   = false;
+    uint64_t nl_room   = 0;
+    uint64_t nl_margin = 0;
+    uint64_t need      = 0;
+};
+
+inline int alloc_fail_reason(const af_in & a) {
+    if (a.kind == AF_HOST) {
+        return AFR_HOST;
+    }
+    if (a.l_ratio >= OOM_RATIO_MIN) {
+        return AFR_LOCAL_CHARGE;
+    }
+    if (!a.have_nl) {
+        return AFR_NL_UNKNOWN;
+    }
+    if (a.nl_room < a.nl_margin) {
+        return AFR_NL_ROOM;
+    }
+    const uint64_t spill = !a.have_l || a.l_head <= 0 ? a.need : (a.need > (uint64_t) a.l_head ? a.need - (uint64_t) a.l_head : 0);
+    return spill > a.nl_room ? AFR_NL_SPILL : AFR_NONE;
+}
+
+inline const char * af_reason_name(int r) {
+    switch (r) {
+        case AFR_HOST:         return "host";
+        case AFR_LOCAL_CHARGE: return "local_charge";
+        case AFR_NL_UNKNOWN:   return "nl_unknown";
+        case AFR_NL_ROOM:      return "nl_room";
+        case AFR_NL_SPILL:     return "nl_spill";
+        default:               return "none";
+    }
+}
+
 // [TAG_FN_L23_PINFIX] R-L23-2 (main session 10-21: pins may only ever add speed; under pressure behave exactly like NEW).
 // The gate of the pin thread, one sample per 2 s: with pins, the available RAM (free + standby) below `drop` for `drop_n`
 // samples in a row drops ALL pins (-1; no partial release, nothing leaves the working set: an unpin only unlocks). Without

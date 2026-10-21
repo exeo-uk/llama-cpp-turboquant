@@ -737,22 +737,58 @@ uint64_t fn_drop_all(fn_pin_state * st, int * n_units) {
     return b;
 }
 
-// [TAG_FN_L23_PINFIX] R-L23-5: a device or pinned-host allocation FAILED while pins were held: they all go first (pins may
-// only ever add speed; the caller retries once). true: something was unpinned
-bool fn_on_alloc_fail(size_t need, const char * site) {
+// [TAG_FN_L23_PINFIX] R-L23-5 / R-L23-6: an allocation FAILED while pins were held (the caller retries). The pins go only when
+// they can be the cause (fn_pin::alloc_fail_reason). A plain VRAM failure leaves them (existing handling), except at a site
+// whose failed retry aborts (AF_DEV_FATAL: VMM pool growth, graph instantiate): attempt 0 unpins need + 1 GiB, the least
+// streamed first, attempt 1 drops all. true: something was unpinned
+bool fn_on_alloc_fail(size_t need, const char * site, int kind, int attempt) {
     fn_pin_state * st = g_pin.load(std::memory_order_acquire);
     if (st == nullptr || !st->reg.any_active()) {
         return false;
     }
     std::lock_guard<std::mutex> op(st->op_mtx);
-    st->n_oom.fetch_add(1);
+    bool lok = false;
+    const int64_t head = fn_local_headroom(st, &lok);
+    const fn_pin::budget_in bi = fn_read_budget(st);
+    fn_pin::af_in a;
+    a.kind      = kind;
+    a.l_ratio   = st->cfg.l_ratio;
+    a.have_l    = lok;
+    a.l_head    = head;
+    a.have_nl   = bi.have_nl;
+    a.nl_room   = bi.nl_budget > bi.nl_usage ? bi.nl_budget - bi.nl_usage : 0;
+    a.nl_margin = st->cfg.nl_margin;
+    a.need      = need;
+    const int r = fn_pin::alloc_fail_reason(a);
     const uint64_t had = st->reg.active_bytes();
+    if (r == fn_pin::AFR_NONE && kind == fn_pin::AF_DEV) {
+        const uint64_t k = st->n_oom_skip.fetch_add(1) + 1;
+        if (k <= 3 || k % 64 == 0) {
+            LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] an allocation of %.1f MiB failed (%s) with %.2f GiB pinned: the pins cannot be the cause "
+                    "(LOCAL headroom %.2f GiB, NON_LOCAL room %.2f GiB >= %.2f): pins kept\n", __func__, need/1048576.0, site, fn_gib(had),
+                    head/(double) FN_GIB, fn_gib(a.nl_room), fn_gib(a.nl_margin));
+        }
+        fn_log("event=alloc_skip need_mib=%.1f site=%s pinned_gib=%.2f headroom_gib=%.2f nl_room_gib=%.2f margin_gib=%.2f n=%d", need/1048576.0,
+                site, fn_gib(had), head/(double) FN_GIB, fn_gib(a.nl_room), fn_gib(a.nl_margin), (int) k);
+        return false;
+    }
+    st->n_oom.fetch_add(1);
     int n = 0;
-    const uint64_t b = fn_drop_all(st, &n);
-    LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] an allocation of %.1f MiB failed (%s) with %.2f GiB pinned: all pins dropped (%d range(s), "
-            "%.2f GiB), retry\n", __func__, need/1048576.0, site, fn_gib(had), n, fn_gib(b));
-    fn_log("event=alloc_fail need_mib=%.1f site=%s had_gib=%.2f units=%d unpinned_gib=%.2f left_gib=%.2f", need/1048576.0, site, fn_gib(had), n,
-            fn_gib(b), fn_gib(st->reg.active_bytes()));
+    uint64_t b = 0;
+    const bool partial = r == fn_pin::AFR_NONE && attempt == 0;
+    if (partial) {
+        const uint64_t cap = (uint64_t) need + FN_GIB;
+        b = fn_unpin(st, [&](uint64_t f) { return f >= cap; }, 200000, true, &n);
+    } else {
+        b = fn_drop_all(st, &n);
+    }
+    LLAMA_LOG_WARN("%s: [TAG_FN_L23_PINFIX] an allocation of %.1f MiB failed (%s, attempt %d, cause %s) with %.2f GiB pinned: %s (%d range(s), "
+            "%.2f GiB), retry\n", __func__, need/1048576.0, site, attempt, fn_pin::af_reason_name(r), fn_gib(had),
+            partial ? "some pins dropped" : "all pins dropped", n, fn_gib(b));
+    fn_log("event=alloc_fail need_mib=%.1f site=%s kind=%d attempt=%d reason=%s mode=%s had_gib=%.2f units=%d unpinned_gib=%.2f left_gib=%.2f "
+            "headroom_gib=%.2f nl_room_gib=%.2f margin_gib=%.2f", need/1048576.0, site, kind, attempt, fn_pin::af_reason_name(r),
+            partial ? "partial" : "all", fn_gib(had), n, fn_gib(b), fn_gib(st->reg.active_bytes()), head/(double) FN_GIB, fn_gib(a.nl_room),
+            fn_gib(a.nl_margin));
     return b > 0;
 }
 
@@ -773,7 +809,10 @@ bool fn_cuda_oom(size_t need, int after_failure, void * ud) {
         }
         return llama_fn_pin_on_oom(need);
     }
-    return fn_on_alloc_fail(need, "ggml-cuda"); // [TAG_FN_L23_PINFIX] R-L23-5
+    // [TAG_FN_L23_PINFIX] R-L23-6: 1 = device, 2 = pinned host, 3 / 4 = device whose failed retry aborts (attempt 0 / 1)
+    const int kind    = after_failure == 2 ? fn_pin::AF_HOST : after_failure == 1 ? fn_pin::AF_DEV : fn_pin::AF_DEV_FATAL;
+    const int attempt = after_failure == 3 ? 0 : after_failure == 4 ? 1 : 0;
+    return fn_on_alloc_fail(need, after_failure == 2 ? "ggml-cuda-host" : "ggml-cuda", kind, attempt);
 }
 
 // one registration; *dev = the device address when known (0 else)
@@ -1159,7 +1198,12 @@ void fn_thread(fn_pin_state * st) {
     }
     // the watcher and the valve, every 2 s
     fn_pin::gate_state gst8; // [TAG_FN_L23_PINFIX] the drop / re-pin gate
-    const uint64_t repin_b = fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REPIN_MIB", 10240);
+    // [TAG_FN_L23_PINFIX] R-L23-6: re-pin at the drop line + LLAMA_FN_L23_PIN_REPIN_GAP_MIB (4096) for 60 s: a re-pin locks resident
+    // pages only (no RAM). The old 10 GiB never came back at 7-10 GiB available (l23p B6). LLAMA_FN_L23_PIN_REPIN_MIB > 0 sets it
+    uint64_t repin_b = fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REPIN_MIB", 0);
+    if (repin_b == 0) {
+        repin_b = st->cfg.floor + fn_mib_switch(*st->model, "LLAMA_FN_L23_PIN_REPIN_GAP_MIB", 4096);
+    }
     bool watch_noted = false;
     int64_t t_status = fn_now_us();
     while (!st->stop.load()) {
@@ -1227,7 +1271,7 @@ void fn_thread(fn_pin_state * st) {
         // [TAG_FN_L23_PINFIX] R-L23-2: pins may only ever add speed. With pins, available RAM (free + standby) under the
         // drop line (LLAMA_FN_L23_PIN_DROP_MIB 4096) for 3 samples (6 s) drops ALL of them: from there on the process runs as
         // without pins (staged stream, no PIN marks); an unpin only unlocks, no page leaves the working set. Room >=
-        // LLAMA_FN_L23_PIN_REPIN_MIB (10240) for 60 s, 60 s after a drop, pins the resident units again (fn_pin::gate_step)
+        // the drop line + 4 GiB (R-L23-6) for 60 s, 60 s after a drop, pins the resident units again (fn_pin::gate_step)
         const uint64_t avail = fn_avail_ram();
         const bool pinned = st->reg.any_active();
         const bool repinnable = !st->arena && st->reg.n_active_units() < st->reg.n_units();
@@ -1715,7 +1759,7 @@ bool llama_fn_pin_on_oom(size_t need_bytes) {
 }
 
 bool llama_fn_pin_on_alloc_fail(size_t need_bytes) {
-    return fn_on_alloc_fail(need_bytes, "libllama");
+    return fn_on_alloc_fail(need_bytes, "libllama", fn_pin::AF_DEV_FATAL, 0); // a failed reserve fails the batch: partial unpin first
 }
 
 uint64_t llama_fn_pin_precheck_margin(void) {
