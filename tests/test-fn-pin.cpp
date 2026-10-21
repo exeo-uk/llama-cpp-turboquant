@@ -464,11 +464,33 @@ static void test_pinfix() {
     TCHECK(fn_pin::oom_help_bytes(4*G, o) == fn_pin::oom_cap_bytes(4*G, 1*G, false, 0.5), "LOCAL charge: the R-REV-1 cap");
     o.l_head = 5*(int64_t) G;
     TCHECK(fn_pin::oom_help_bytes(4*G, o) == 4*G, "LOCAL charge, headroom shows room: want bytes");
-    // the valve: pinned pages are not available, the unpinned resident model pages count
-    TCHECK(fn_pin::valve_short(5*G + 700*M, 0, 6*G) == 324*M, "all pinned, 5.68 GiB available: short");
-    TCHECK(fn_pin::valve_short(5*G + 700*M, 2*G, 6*G) == 0, "2 GiB unpinned resident: no pressure");
-    TCHECK(fn_pin::valve_short(1*G, 1*G, 6*G) == 4*G, "an 8 GiB eater: 4 GiB short");
-    TCHECK(fn_pin::valve_short(0, 0, 0) == 0, "floor 0: never short");
+    // the valve's hysteresis: release after 2 samples below the floor; re-pin after 5 samples >= floor + gap and the cool-down
+    fn_pin::valve_state v;
+    const int64_t S = 1000000;
+    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 0, 60*S) == 0, "one sample below the floor: nothing");
+    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 2*S, 60*S) == -1, "two samples below: release");
+    TCHECK(fn_pin::valve_step(v, 5*G, 6*G, 4*G, 4*S, 60*S) == 0, "the count starts again after a release");
+    int got = 0;
+    for (int k = 0; k < 5; ++k) {
+        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (6 + 2*k)*S, 60*S);
+    }
+    TCHECK(got == 0, "room right after a release: no re-pin before the cool-down");
+    got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, 70*S, 60*S);
+    TCHECK(got == 1, "room for 5+ samples, the cool-down over: re-pin");
+    for (int k = 0; k < 4; ++k) {
+        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (72 + 2*k)*S, 60*S);
+        TCHECK(got == 0, "after a re-pin: 5 more samples first (%d)", k);
+    }
+    for (int k = 0; k < 4; ++k) {
+        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (80 + 2*k)*S, 60*S);
+    }
+    got = fn_pin::valve_step(v, 8*G, 6*G, 4*G, 90*S, 60*S);
+    TCHECK(got == 0, "between the bands: nothing, the room count resets");
+    for (int k = 0; k < 4; ++k) {
+        got = fn_pin::valve_step(v, 11*G, 6*G, 4*G, (92 + 2*k)*S, 60*S);
+    }
+    TCHECK(got == 0, "4 samples with room after a reset: not yet");
+    TCHECK(fn_pin::valve_step(v, 6*G, 6*G, 4*G, 100*S, 60*S) == 0, "at the floor: no release");
 }
 
 int main() {

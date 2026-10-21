@@ -4515,7 +4515,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t left = (int64_t) n_tokens_all - n_tokens_prev - (int64_t) ubatch.n_tokens;
             l22_last_ub = left <= 0 && l22_after >= 0 && l22_after <= (int64_t) cbuf_small_t;
             if (l22.keeplend || l22.endoverlap) {
-                llama_prefill_stream_l22_set_after(this, std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left), l22_tail);
+                // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+                // GENSHARE2 window while a prompt waits) does not keep the banks (KEEPLEND): the answer decodes on the whole hot
+                // set, as the staged stream's windows did. With pins the stream kept them through every window (keeps=219) and
+                // the other answer fell from 27.5 to 17.7 t/s while a 30K prompt was read (l23p two-connection run)
+                const bool ans_only = n_outputs_all > 0 && n_outputs_all == n_tokens_all && l22_after > 0;
+                llama_prefill_stream_l22_set_after(this, ans_only ? 0 : std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left),
+                        l22_tail);
             }
         }
         // [TAG_FN_L22_XOVER] [TAG_FN_L22_UBPLAN] a prompt ubatch of a FULL period is observed (host time, the stream's record)

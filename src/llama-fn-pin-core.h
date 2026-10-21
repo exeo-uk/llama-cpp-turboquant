@@ -393,15 +393,38 @@ inline uint64_t oom_help_bytes(uint64_t want, const oom_in & o) {
     return def == 0 ? 0 : std::min<uint64_t>(want, def + ((uint64_t) 256 << 20));
 }
 
-// [TAG_FN_L23_PINFIX] R-L23-2 (r22 T13): the valve's room. Pinned model pages are the model's own residency: every prompt
-// streams all host experts, so unpinned they sit in the working set just the same (T13: 6.7 GiB available without pins,
-// 5.1-5.7 with them; the old valve compared the available RAM alone with the 6 GiB floor and unpinned everything ~50 s
-// after every start). What other programs can still get is the available RAM plus the model's resident pages that are
-// not pinned (clean file pages the memory manager trims under pressure; pinned ones it cannot). Returns the bytes the
-// room is short of `floor` (0: no pressure)
-inline uint64_t valve_short(uint64_t avail, uint64_t trimmable, uint64_t floor) {
-    const uint64_t room = avail + trimmable;
-    return room < floor ? floor - room : 0;
+// [TAG_FN_L23_PINFIX] R-L23-2 (coordinator 10-21, after the l23p eater runs: 1.5-2.6 GiB free with 61 GiB pinned): the
+// valve keeps the truly available RAM (free + standby: what Windows and other programs get at once; our pinned model pages
+// are not in it) at >= floor. Two samples below the floor release (-1): the model's resident unpinned streamed pages leave
+// the working set first (they stay cached in standby), then pins, least streamed first, each one leaving the working set
+// too, until floor + 1 GiB. Room for re-pins (+1) needs >= floor + repin_gap for 5 samples in a row and cool_us since the
+// last release; a re-pin keeps floor + repin_gap - 1 GiB after it (no flapping between the two bands)
+struct valve_state {
+    int     low       = 0;
+    int     high      = 0;
+    int64_t t_release = INT64_MIN/2;
+};
+
+inline int valve_step(valve_state & v, uint64_t avail, uint64_t floor, uint64_t repin_gap, int64_t now_us, int64_t cool_us) {
+    if (avail < floor) {
+        v.high = 0;
+        if (++v.low >= 2) {
+            v.low       = 0;
+            v.t_release = now_us;
+            return -1;
+        }
+        return 0;
+    }
+    v.low = 0;
+    if (avail >= floor + repin_gap) {
+        if (++v.high >= 5 && now_us - v.t_release >= cool_us) {
+            v.high = 0;
+            return 1;
+        }
+        return 0;
+    }
+    v.high = 0;
+    return 0;
 }
 
 // the groups of the plan that fit in `bytes`, in plan order: a group that does not fit ends the list (whole experts,
