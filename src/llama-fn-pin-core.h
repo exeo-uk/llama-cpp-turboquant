@@ -354,6 +354,56 @@ inline uint64_t oom_cap_bytes(uint64_t want, int64_t head0, bool by_bytes, doubl
     return cap >= 1.8e19 ? UINT64_MAX : std::max(want, (uint64_t) cap);
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-1 (r22 T13): what an unpin can give an allocation. Unpinning frees host pages only: it raises
+// DXGI LOCAL headroom by the charge per registered byte that the registration measured (l_ratio). Without that charge
+// (< OOM_RATIO_MIN; this box: 0.000) it helps only an allocation whose part above the LOCAL headroom may land in shared
+// system memory (NON_LOCAL budget - usage < that part) or one short of commit (commit room < want; only arena chunks give
+// commit back: have_commit). Returns
+// the bytes to unpin: oom_cap_bytes with a LOCAL charge or when DXGI LOCAL cannot be read (as before), else the larger
+// NON_LOCAL / commit deficit + 256 MiB (at most want); 0 = an unpin cannot help, nothing goes (r22 T13: the 16K prompt
+// buffer's pre-check unpinned 7.9 GiB at the first prompt of every PIN run, LOCAL headroom 6.85 -> 6.85 GiB).
+struct oom_in {
+    bool     have_l      = false;
+    int64_t  l_head      = 0;
+    double   l_ratio     = 0.0;
+    bool     have_nl     = false;
+    uint64_t nl_budget   = 0;
+    uint64_t nl_usage    = 0;
+    bool     have_commit = false;
+    uint64_t commit_room = 0;
+};
+
+inline uint64_t oom_help_bytes(uint64_t want, const oom_in & o) {
+    if (!o.have_l) {
+        return want;
+    }
+    if (o.l_ratio >= OOM_RATIO_MIN) {
+        return oom_cap_bytes(want, o.l_head, o.l_head >= (int64_t) want, o.l_ratio);
+    }
+    uint64_t def = 0;
+    if (o.have_nl) {
+        // only the part LOCAL cannot hold may spill into system memory
+        const uint64_t spill = o.l_head > 0 ? (want > (uint64_t) o.l_head ? want - (uint64_t) o.l_head : 0) : want;
+        const uint64_t room  = o.nl_budget > o.nl_usage ? o.nl_budget - o.nl_usage : 0;
+        def = std::max<uint64_t>(def, spill > room ? spill - room : 0);
+    }
+    if (o.have_commit) {
+        def = std::max<uint64_t>(def, want > o.commit_room ? want - o.commit_room : 0);
+    }
+    return def == 0 ? 0 : std::min<uint64_t>(want, def + ((uint64_t) 256 << 20));
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-2 (r22 T13): the valve's room. Pinned model pages are the model's own residency: every prompt
+// streams all host experts, so unpinned they sit in the working set just the same (T13: 6.7 GiB available without pins,
+// 5.1-5.7 with them; the old valve compared the available RAM alone with the 6 GiB floor and unpinned everything ~50 s
+// after every start). What other programs can still get is the available RAM plus the model's resident pages that are
+// not pinned (clean file pages the memory manager trims under pressure; pinned ones it cannot). Returns the bytes the
+// room is short of `floor` (0: no pressure)
+inline uint64_t valve_short(uint64_t avail, uint64_t trimmable, uint64_t floor) {
+    const uint64_t room = avail + trimmable;
+    return room < floor ? floor - room : 0;
+}
+
 // the groups of the plan that fit in `bytes`, in plan order: a group that does not fit ends the list (whole experts,
 // the order kept)
 inline int plan_take(const plan & p, uint64_t bytes) {

@@ -481,6 +481,37 @@ bool dma_check(const uint8_t * p, size_t n, double * gbs) {
         }
         same = memcmp(h, p + o, k) == 0;
     }
+    // [TAG_FN_L23_PINFIX] the stream's way: asynchronous H2D straight from the registered pages, one copy stream, in
+    // 32 MiB copies (LLAMA_PREFILL_STREAM_CHUNK_MIB) and in 256 MiB copies, 4 rounds over the range each; the same
+    // bytes from the pinned bounce buffer (cudaMallocHost) for the PCIe ceiling
+    if (same && !g_sticky) {
+        cudaStream_t s = nullptr;
+        if (cuda_ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream (dma async)")) {
+            auto run = [&](const uint8_t * src, size_t len, size_t ck) {
+                const double t0 = now_s();
+                size_t moved = 0;
+                for (int rep = 0; rep < 4 && !g_sticky; ++rep) {
+                    for (size_t o = 0; o < len; o += ck) {
+                        const size_t k = std::min(ck, len - o);
+                        if (!cuda_ok(cudaMemcpyAsync(d, src + o, k, cudaMemcpyHostToDevice, s), "H2D async")) {
+                            return 0.0;
+                        }
+                        moved += k;
+                    }
+                }
+                if (!cuda_ok(cudaStreamSynchronize(s), "sync (dma async)")) {
+                    return 0.0;
+                }
+                return (double) moved/(now_s() - t0)/1e9;
+            };
+            const double g32  = run(p, n, (size_t) 32 << 20);
+            const double g256 = run(p, n, chunk);
+            const double gb32 = run((const uint8_t *) h, chunk, (size_t) 32 << 20);
+            SAY("  DMA async from the registered pages: %.1f GB/s in 32 MiB copies, %.1f GB/s in %zu MiB copies | pinned bounce buffer "
+                "%.1f GB/s (32 MiB copies)\n", g32, g256, chunk >> 20, gb32);
+            cudaStreamDestroy(s);
+        }
+    }
     cudaFreeHost(h);
     cudaFree(d);
     if (gbs) {

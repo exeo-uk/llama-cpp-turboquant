@@ -19,11 +19,15 @@
 // mapping; llama_fn_pin_query answers the copy's address. Arena experts are not marked PIN: the decode CPU path still
 // reads their mapped copies, which the warm pass keeps.
 // After registration the thread watches every 2 s: LOCAL headroom below the watcher threshold (reserve_need, at most
-// the ready headroom - 512 MiB; LLAMA_FN_L22_PIN_TEST_LOCAL_MIB forces one) or available RAM below the floor for two
-// samples unpins the last ranges (as the OOM hook). Any unpin ends registration for the process (no relock).
+// the ready headroom - 512 MiB; LLAMA_FN_L22_PIN_TEST_LOCAL_MIB forces one) or a RAM room below the floor for two
+// samples unpins the last ranges (as the OOM hook). [TAG_FN_L23_PINFIX] The room is the available RAM plus the model's
+// resident streamed pages that are not pinned (pinned pages are the model's own residency; the memory manager trims the
+// unpinned ones for other programs), the valve unpins until room >= floor + 1 GiB. Any unpin ends registration for the
+// process (no relock).
 // llama_fn_pin_on_oom(need): the callers' allocation hook (plan 3.6): drain the last ranges (tickets back to 0, bounded),
 // unregister them until LOCAL headroom >= need + the pre-check margin (512 MiB, at most the watcher threshold), or until
-// the freed bytes reach the cap from the measured LOCAL charge per byte (that many bytes when DXGI shows no charge), unmark.
+// the freed bytes reach the cap from the measured LOCAL charge per byte. [TAG_FN_L23_PINFIX] With no measured LOCAL
+// charge it unpins only the NON_LOCAL spill / arena commit deficit, and nothing when an unpin cannot raise the room.
 
 #include "llama-fn-l22.h"
 #include "llama-fn-pin-core.h"
@@ -394,6 +398,7 @@ struct fn_pin_state {
     // counters
     std::atomic<uint64_t> n_refused{0};
     std::atomic<uint64_t> n_oom{0};
+    std::atomic<uint64_t> n_oom_skip{0}; // [TAG_FN_L23_PINFIX] OOM hook calls an unpin could not help
     std::atomic<uint64_t> n_valve{0};
     std::atomic<uint64_t> n_watch{0};
     std::atomic<uint64_t> unpinned{0};
@@ -589,6 +594,68 @@ bool fn_touch(fn_pin_state * st, const uint8_t * p, size_t n) {
         (void) *(volatile const uint8_t *) (p + o);
     }
     return true;
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-1: the inputs of fn_pin::oom_help_bytes now (NON_LOCAL and commit read only when there is
+// no LOCAL charge; commit counts only for the arena, whose chunks are private memory)
+fn_pin::oom_in fn_oom_in(fn_pin_state * st, bool lok, int64_t head) {
+    fn_pin::oom_in oi;
+    oi.have_l  = lok;
+    oi.l_head  = head;
+    oi.l_ratio = st->cfg.l_ratio;
+    if (lok && oi.l_ratio < fn_pin::OOM_RATIO_MIN) {
+        const fn_pin::budget_in b = fn_read_budget(st);
+        oi.have_nl     = b.have_nl;
+        oi.nl_budget   = b.nl_budget;
+        oi.nl_usage    = b.nl_usage;
+        oi.have_commit = st->arena;
+        oi.commit_room = st->arena ? fn_commit_room() : 0;
+    }
+    return oi;
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-2: the resident bytes of the planned (streamed host expert) ranges that are not registered
+// now: what the memory manager can trim from the model for other programs (fn_pin::valve_short). One page per 4 MiB,
+// one QueryWorkingSetEx call (~16K samples for 64 GiB). Mapped mode: unit index == plan range index; the arena pins its
+// own copies, so there every mapped range counts
+uint64_t fn_trimmable(fn_pin_state * st) {
+    const size_t step = (size_t) 4 << 20;
+    std::vector<const uint8_t *> at;
+    std::vector<uint32_t>        len;
+    for (int ri = 0; ri < (int) st->plan.ranges.size(); ++ri) {
+        if (!st->arena && ri < st->reg.n_units() &&
+            st->reg.unit_at(ri).state.load(std::memory_order_relaxed) == fn_pin::ST_ACTIVE) {
+            continue;
+        }
+        const fn_pin::range & r = st->plan.ranges[ri];
+        for (size_t o = 0; o < r.n; o += step) {
+            at.push_back(r.p + o);
+            len.push_back((uint32_t) std::min(step, r.n - o));
+        }
+    }
+    if (at.empty()) {
+        return 0;
+    }
+    uint64_t res = 0;
+#if defined(_WIN32)
+    const size_t page = fn_page_size();
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> w(at.size());
+    for (size_t i = 0; i < at.size(); ++i) {
+        w[i] = {};
+        w[i].VirtualAddress = (PVOID) ((uintptr_t) at[i]/page*page);
+    }
+    if (!QueryWorkingSetEx(GetCurrentProcess(), w.data(), (DWORD) (w.size()*sizeof(w[0])))) {
+        return 0; // unknown: nothing counts (the valve stays as strict as the available RAM alone)
+    }
+    for (size_t i = 0; i < w.size(); ++i) {
+        res += w[i].VirtualAttributes.Valid ? len[i] : 0;
+    }
+#else
+    for (size_t i = 0; i < at.size(); ++i) {
+        res += (uint64_t) (fn_resident_share(at[i], 1)*(double) len[i]);
+    }
+#endif
+    return res;
 }
 
 // ggml-cuda's allocation hook (R-P7-2), before a graph instantiate, a VMM pool growth or a device buffer: after_failure
@@ -969,6 +1036,7 @@ void fn_thread(fn_pin_state * st) {
     }
     // the watcher and the valve, every 2 s
     int low = 0;
+    bool watch_noted = false;
     int64_t t_status = fn_now_us();
     while (!st->stop.load()) {
         {
@@ -996,15 +1064,27 @@ void fn_thread(fn_pin_state * st) {
         bool lok = false;
         const int64_t head = fn_local_headroom(st, &lok);
         const uint64_t thr = st->watch_local;
+        // [TAG_FN_L23_PINFIX] R-L23-1: as the OOM hook, nothing goes when an unpin cannot raise the room (no LOCAL charge
+        // and no NON_LOCAL spill): one note per low-headroom episode
+        uint64_t cap_w = 0;
+        const uint64_t want_w = thr + 512*FN_MIB;
         if (lok && head < (int64_t) thr) {
+            cap_w = fn_pin::oom_help_bytes(want_w, fn_oom_in(st, true, head));
+            if (cap_w == 0 && !watch_noted) {
+                watch_noted = true;
+                fn_log("event=watcher_skip headroom_gib=%.2f thr_gib=%.2f l_ratio=%.4f pinned_gib=%.2f", head/(double) FN_GIB, fn_gib(thr),
+                        st->cfg.l_ratio, fn_gib(st->reg.active_bytes()));
+            }
+        } else {
+            watch_noted = false;
+        }
+        if (cap_w > 0) {
             std::lock_guard<std::mutex> op(st->op_mtx);
             st->n_watch.fetch_add(1);
             int n = 0;
             // R-REV-1: as the OOM hook, at most the bytes whose measured LOCAL charge covers the deficit per check (no visible
             // charge: the target's bytes), so one check never unpins every range for headroom it cannot raise
-            const uint64_t want_w = thr + 512*FN_MIB;
-            const double   ratio  = st->cfg.l_ratio;
-            const uint64_t cap    = fn_pin::oom_cap_bytes(want_w, head, ratio < fn_pin::OOM_RATIO_MIN, ratio);
+            const uint64_t cap = cap_w;
             const uint64_t b = fn_unpin(st, [&](uint64_t f) {
                 if (f >= cap) {
                     return true;
@@ -1020,27 +1100,38 @@ void fn_thread(fn_pin_state * st) {
             fn_log("event=watcher headroom_gib=%.2f thr_gib=%.2f unpinned_gib=%.2f units=%d headroom_after_gib=%.2f pinned_gib=%.2f",
                     head/(double) FN_GIB, fn_gib(thr), fn_gib(b), n, h3/(double) FN_GIB, fn_gib(st->reg.active_bytes()));
         }
+        // [TAG_FN_L23_PINFIX] R-L23-2: the room = available RAM + the model's resident pages that are not pinned
+        // (fn_pin::valve_short); the working-set sample only below the floor
         const uint64_t avail = fn_avail_ram();
-        low = avail < st->cfg.floor ? low + 1 : 0;
+        uint64_t trim = 0;
+        bool short_now = false;
+        if (avail < st->cfg.floor) {
+            trim      = fn_trimmable(st);
+            short_now = fn_pin::valve_short(avail, trim, st->cfg.floor) > 0;
+        }
+        low = short_now ? low + 1 : 0;
         if (low >= 2) {
             low = 0;
             std::lock_guard<std::mutex> op(st->op_mtx);
             st->n_valve.fetch_add(1);
             int n = 0;
             const uint64_t want = st->cfg.floor + FN_GIB;
-            const uint64_t b = fn_unpin(st, [&](uint64_t) { return fn_avail_ram() >= want; }, 200000, true, &n);
-            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] valve: %.2f GiB of RAM available (floor %.2f GiB): %d range(s), %.2f GiB unpinned, %.2f GiB available now\n",
-                    __func__, fn_gib(avail), fn_gib(st->cfg.floor), n, fn_gib(b), fn_gib(fn_avail_ram()));
-            fn_log("event=valve avail_gib=%.2f floor_gib=%.2f unpinned_gib=%.2f units=%d pinned_gib=%.2f", fn_gib(avail),
-                    fn_gib(st->cfg.floor), fn_gib(b), n, fn_gib(st->reg.active_bytes()));
+            // an unregistered unit's pages stay resident (probe: Valid 1.00 after registration) and become trimmable
+            const uint64_t b = fn_unpin(st, [&](uint64_t freed) { return fn_avail_ram() + trim + freed >= want; }, 200000, true, &n);
+            LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] valve: %.2f GiB of RAM available + %.2f GiB trimmable model pages (floor %.2f GiB): %d range(s), "
+                    "%.2f GiB unpinned, %.2f GiB available now, %.2f GiB still pinned\n", __func__, fn_gib(avail), fn_gib(trim),
+                    fn_gib(st->cfg.floor), n, fn_gib(b), fn_gib(fn_avail_ram()), fn_gib(st->reg.active_bytes()));
+            fn_log("event=valve avail_gib=%.2f trim_gib=%.2f floor_gib=%.2f unpinned_gib=%.2f units=%d pinned_gib=%.2f", fn_gib(avail),
+                    fn_gib(trim), fn_gib(st->cfg.floor), fn_gib(b), n, fn_gib(st->reg.active_bytes()));
         }
         if (fn_now_us() - t_status > 60000000) {
             t_status = fn_now_us();
             const fn_pin::budget_in b = fn_read_budget(st);
-            fn_log("event=status pinned_gib=%.2f units=%d users=%d nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f oom=%d valve=%d watcher=%d "
-                    "unpinned_gib=%.2f", fn_gib(st->reg.active_bytes()), st->reg.n_active_units(), st->reg.users_total(), fn_gib(b.nl_usage),
-                    fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(b.avail), (int) st->n_oom.load(),
-                    (int) st->n_valve.load(), (int) st->n_watch.load(), fn_gib(st->unpinned.load()));
+            fn_log("event=status pinned_gib=%.2f units=%d users=%d nl_gib=%.2f/%.2f l_gib=%.2f/%.2f avail_gib=%.2f trim_gib=%.2f oom=%d oom_skip=%d "
+                    "valve=%d watcher=%d unpinned_gib=%.2f", fn_gib(st->reg.active_bytes()), st->reg.n_active_units(), st->reg.users_total(),
+                    fn_gib(b.nl_usage), fn_gib(b.nl_budget), fn_gib(b.l_usage), fn_gib(b.l_budget), fn_gib(b.avail), fn_gib(fn_trimmable(st)),
+                    (int) st->n_oom.load(), (int) st->n_oom_skip.load(), (int) st->n_valve.load(), (int) st->n_watch.load(),
+                    fn_gib(st->unpinned.load()));
         }
     }
 }
@@ -1422,7 +1513,6 @@ bool llama_fn_pin_on_oom(size_t need_bytes) {
         return false;
     }
     std::lock_guard<std::mutex> op(st->op_mtx);
-    st->n_oom.fetch_add(1);
     const uint64_t want = (uint64_t) need_bytes + fn_precheck_margin(st);
     bool lok = false;
     const int64_t head0 = fn_local_headroom(st, &lok);
@@ -1431,7 +1521,23 @@ bool llama_fn_pin_on_oom(size_t need_bytes) {
     // unpinning does not raise the headroom there, so `want` bytes go and no more (never every range in one call)
     const double ratio = st->cfg.l_ratio;
     const bool   by_bytes = !lok || head0 >= (int64_t) want || ratio < fn_pin::OOM_RATIO_MIN;
-    const uint64_t cap = fn_pin::oom_cap_bytes(want, lok ? head0 : 0, by_bytes, ratio);
+    // [TAG_FN_L23_PINFIX] R-L23-1: with no LOCAL charge an unpin only helps a NON_LOCAL spill or an arena's commit;
+    // otherwise nothing is unpinned (fn_pin::oom_help_bytes)
+    const fn_pin::oom_in oi = fn_oom_in(st, lok, head0);
+    const uint64_t nl_room = oi.nl_budget > oi.nl_usage ? oi.nl_budget - oi.nl_usage : 0;
+    const uint64_t cap = fn_pin::oom_help_bytes(want, oi);
+    if (cap == 0) {
+        const uint64_t k = st->n_oom_skip.fetch_add(1) + 1;
+        if (k <= 3 || k % 64 == 0) {
+            LLAMA_LOG_INFO("%s: [TAG_FN_L23_PINFIX] OOM hook (need %.1f MiB): no unpin, it cannot raise the room (LOCAL headroom %.2f GiB, "
+                    "LOCAL charge %.3f per byte, NON_LOCAL room %.2f GiB, pinned %.2f GiB; call %d)\n", __func__, need_bytes/1048576.0,
+                    head0/(double) FN_GIB, ratio, fn_gib(nl_room), fn_gib(st->reg.active_bytes()), (int) k);
+        }
+        fn_log("event=oom_skip need_mib=%.1f headroom_gib=%.2f l_ratio=%.4f nl_room_gib=%.2f pinned_gib=%.2f n=%d", need_bytes/1048576.0,
+                head0/(double) FN_GIB, ratio, fn_gib(nl_room), fn_gib(st->reg.active_bytes()), (int) k);
+        return false;
+    }
+    st->n_oom.fetch_add(1);
     const int64_t t_end = fn_now_us() + 3000000;
     int n = 0;
     const uint64_t freed = fn_unpin(st, [&](uint64_t f) {

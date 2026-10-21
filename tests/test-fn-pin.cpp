@@ -433,11 +433,50 @@ static void test_oom_cap() {
     TCHECK(fn_pin::oom_cap_bytes(4*G, -1*(int64_t) G, false, 2.0) >= 4*G, "negative headroom");
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-1: the OOM hook unpins only what can raise the room; R-L23-2: the valve's room
+static void test_pinfix() {
+    const uint64_t M = 1ull << 20;
+    const uint64_t G = 1ull << 30;
+    fn_pin::oom_in o;
+    TCHECK(fn_pin::oom_help_bytes(8*G, o) == 8*G, "DXGI LOCAL unknown: want bytes (as before)");
+    // r22 T13: 7573 MiB + 512 MiB, LOCAL headroom 6.85 GiB, charge 0, NON_LOCAL 65.39 / 73.75 GiB: nothing helps
+    o.have_l = true; o.l_head = (int64_t) (6.85*(double) G); o.l_ratio = 0.0;
+    o.have_nl = true; o.nl_budget = (uint64_t) (73.75*(double) G); o.nl_usage = (uint64_t) (65.39*(double) G);
+    const uint64_t want = 7573*M + 512*M;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == 0, "T13 case: no charge, NON_LOCAL holds the spill: no unpin");
+    o.have_nl = false;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == 0, "no charge, NON_LOCAL unknown, no commit: no unpin");
+    // NON_LOCAL short of the spill: the deficit + 256 MiB, at most want
+    o.have_nl = true; o.nl_usage = o.nl_budget - 512*M;
+    const uint64_t spill = want - (uint64_t) o.l_head;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == spill - 512*M + 256*M, "NON_LOCAL deficit + 256 MiB (%.0f MiB)",
+            fn_pin::oom_help_bytes(want, o)/(double) M);
+    o.l_head = -1;
+    o.nl_usage = o.nl_budget;
+    TCHECK(fn_pin::oom_help_bytes(want, o) == want, "no LOCAL room, NON_LOCAL full: want (capped)");
+    // the arena: commit short
+    o.l_head = 20*(int64_t) G; o.nl_usage = 0; o.have_commit = true; o.commit_room = 1*G;
+    TCHECK(fn_pin::oom_help_bytes(2*G, o) == 1*G + 256*M, "arena commit deficit + 256 MiB");
+    o.commit_room = 4*G;
+    TCHECK(fn_pin::oom_help_bytes(2*G, o) == 0, "arena with commit room: no unpin");
+    // a measured LOCAL charge: as oom_cap_bytes
+    o.have_commit = false; o.l_ratio = 0.5; o.l_head = 1*(int64_t) G;
+    TCHECK(fn_pin::oom_help_bytes(4*G, o) == fn_pin::oom_cap_bytes(4*G, 1*G, false, 0.5), "LOCAL charge: the R-REV-1 cap");
+    o.l_head = 5*(int64_t) G;
+    TCHECK(fn_pin::oom_help_bytes(4*G, o) == 4*G, "LOCAL charge, headroom shows room: want bytes");
+    // the valve: pinned pages are not available, the unpinned resident model pages count
+    TCHECK(fn_pin::valve_short(5*G + 700*M, 0, 6*G) == 324*M, "all pinned, 5.68 GiB available: short");
+    TCHECK(fn_pin::valve_short(5*G + 700*M, 2*G, 6*G) == 0, "2 GiB unpinned resident: no pressure");
+    TCHECK(fn_pin::valve_short(1*G, 1*G, 6*G) == 4*G, "an 8 GiB eater: 4 GiB short");
+    TCHECK(fn_pin::valve_short(0, 0, 0) == 0, "floor 0: never short");
+}
+
 int main() {
     test_unit();
     test_order();
     test_rules();
     test_oom_cap();
+    test_pinfix();
     test_registry();
     test_arena_copy();
     test_lifo();
