@@ -191,4 +191,7 @@ llama_model_flint::graph::graph(const llama_model & model, const llm_graph_param
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    // fork: the graph is not expanded from res->t_logits centrally (upstream is), every model file ends with this
+    ggml_build_forward_expand(gf, cur);
 }
