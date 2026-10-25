@@ -10409,6 +10409,7 @@ struct test_flash_attn_ext_turbot : public test_case {
     const int64_t            hkv;
     const int64_t            hq;
     const bool               fn_l3;          // [TAG_FN_L3_GPU_COMPACT] the qwen4exp mark on the FA node
+    const bool               fa_seq;         // [TAG_FN_V0254_SEQFA] the multi-sequence mark: list walk, list of min(nb, ncols1) x n_kv_max
     turbot_test_cache        cache;
 
     bool default_geom() const {
@@ -10421,7 +10422,7 @@ struct test_flash_attn_ext_turbot : public test_case {
 
     std::string vars() override {
         return std::string(perf ? "turbot_perf=" : "turbot=") + wname + "," + geom_vars() + VARS_TO_STR6(kv, nb, mix, mask_mode, sinks, logit_softcap) +
-               (fn_l3 ? ",fn_l3=1" : "");
+               (fn_l3 ? ",fn_l3=1" : "") + (fa_seq ? ",fa_seq=1" : "");
     }
 
     double max_nmse_err() override {
@@ -10435,10 +10436,10 @@ struct test_flash_attn_ext_turbot : public test_case {
 
     test_flash_attn_ext_turbot(turbot_test_widths widths, int64_t kv, int64_t nb, turbot_test_mix mix_id, int mask_mode,
                                bool sinks, float logit_softcap, bool perf, int64_t d = 256, int64_t hkv = 4, int64_t hq = 24,
-                               bool fn_l3 = false)
+                               bool fn_l3 = false, bool fa_seq = false)
         : widths(widths), kv(kv), nb(nb), mix_id(mix_id), mask_mode(mask_mode), sinks(sinks), logit_softcap(logit_softcap),
           perf(perf), wname(turbot_test_widths_name(widths)), mix(turbot_test_mix_name(mix_id)), d(d), hkv(hkv), hq(hq),
-          fn_l3(fn_l3) {}
+          fn_l3(fn_l3), fa_seq(fa_seq) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         cache.layer   = turbot_test_layer_geom(widths, turbot_test_flags(d, hkv));
@@ -10490,6 +10491,9 @@ struct test_flash_attn_ext_turbot : public test_case {
         ggml_flash_attn_ext_set_turbot(out, pool, gtab, &p);
         if (fn_l3) {
             ggml_fn_l3_set(out, GGML_FN_L3_COMPACT);
+        }
+        if (fa_seq) {
+            ggml_fn_l4_qsa_add(out, GGML_FN_L4_QSA_FA_SEQ);   // [TAG_FN_V0254_SEQFA] as build_attn_qsa marks it on 2+ slots
         }
         ggml_set_name(out, "out");
 
@@ -16291,6 +16295,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nb : { 3, 32, 64, 128 }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 65536, nb, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24));
         }
+        // [TAG_FN_V0254_SEQFA] the multi-sequence mark (2 slots, --kv-unified): the list walk at every kv, also below the
+        // n_kv gate (kv < 2 x min(nb, ncols1) x 2051, which ran dense), with lists longer than the cache (-1 past the count):
+        // decode / verify (1, 3), the 8-row tile, a 26-row prompt tail and a 512-row prompt chunk (fn_l3: the COMPACT lists).
+        // -p "fa_seq=1"
+        for (int64_t kv : { 256, 2048, 4096, 9216 }) {
+            for (int64_t nb : { 1, 3, 8, 26, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, kv, nb, TURBOT_MIX_YOUNG, 3, false, 0.0f, false, 256, 2, 24,
+                                                                       nb >= 26, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, 3, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext_turbot(TURBOT_TW_NR2_Q8, 32768, 64, TURBOT_MIX_BAND16K, 3, false, 0.0f, false, 256, 2, 24, true, true));
         // the other NR 2 widths (float old path b 6, the int8 old paths) through the gather loader
         for (turbot_test_widths w : { TURBOT_TW_NR2_A, TURBOT_TW_NR2_B, TURBOT_TW_NR2_L }) {
             test_cases.emplace_back(new test_flash_attn_ext_turbot(w, 65536, 2, TURBOT_MIX_ALT, 3, false, 0.0f, false, 256, 2, 24));
