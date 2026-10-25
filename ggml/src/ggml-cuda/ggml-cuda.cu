@@ -3703,7 +3703,7 @@ static int32_t ggml_cuda_fn_l22_graph_maxrows() {
 }
 
 static bool ggml_cuda_fn_l22_hot(const ggml_cuda_graph & g) {
-    return g.instance != nullptr && g.n_replay >= 2;
+    return g.has_instance() && g.n_replay >= 2;
 }
 
 void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void * key) {
@@ -3731,9 +3731,9 @@ void ggml_cuda_fn_l22_evict_for_new(ggml_backend_cuda_context * ctx, const void 
 static int ggml_cuda_fn_l22_count_instances(const ggml_backend_cuda_context * ctx) {
     int n = 0;
     for (const auto & [k, g] : ctx->cuda_graphs) {
-        n += g->instance != nullptr ? 1 : 0;
+        n += g->has_instance() ? 1 : 0; // [TAG_UPSTREAM_30804] one per chunk list
         for (const auto & v : g->fn_l22_alt) {
-            n += v.instance != nullptr ? 1 : 0;
+            n += v.has_instance() ? 1 : 0;
         }
     }
     return n;
@@ -3759,11 +3759,11 @@ static bool ggml_cuda_fn_l22_drop_one_instance(ggml_backend_cuda_context * ctx, 
                 best_g = g; best_v = v; best_t = t; best_hot = hot;
             }
         };
-        if (g->instance != nullptr) {
+        if (g->has_instance()) {
             consider(-1, g->last_used_time, g->n_replay);
         }
         for (int v = 0; v < (int) g->fn_l22_alt.size(); ++v) {
-            if (g->fn_l22_alt[v].instance != nullptr) {
+            if (g->fn_l22_alt[v].has_instance()) {
                 consider(v, g->fn_l22_alt[v].last_used, g->fn_l22_alt[v].n_replay);
             }
         }
@@ -3795,21 +3795,25 @@ static void ggml_cuda_fn_l22_instance_cap(ggml_backend_cuda_context * ctx, const
     }
 }
 
-// cudaGraphInstantiate with the instance cap first and, on an out-of-memory error, the cold instances dropped and the
-// OOM hook asked once before one retry [TAG_FN_L22_OOMHOOK]
-static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph) {
-    ggml_cuda_fn_l22_instance_cap(ctx, graph);
+// cudaGraphInstantiate of one chunk of graph [TAG_UPSTREAM_30804] with the instance cap first (for the first chunk of an
+// object without instances: the cap counts chunk lists) and, on an out-of-memory error, the cold instances dropped and the
+// OOM hook asked once before one retry [TAG_FN_L22_OOMHOOK]. The OOM hook runs only outside a capture (the last chunk).
+static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_cuda_graph * graph, cudaGraphExec_t * instance,
+                                         cudaGraph_t cuda_graph) {
+    if (!graph->has_instance()) {
+        ggml_cuda_fn_l22_instance_cap(ctx, graph);
+    }
     ggml_cuda_fn_l22_oom_precheck(64u*1024*1024); // [TAG_FN_L22_OOMHOOK] an instance of a large graph: tens of MiB
     const auto inst = [&]() {
         if (ctx->fn_l4_prio) { // [TAG_FN_L4_QSA_STREAMS]
-            return cudaGraphInstantiateWithFlags(&graph->instance, graph->graph, cudaGraphInstantiateFlagUseNodePriority);
+            return cudaGraphInstantiateWithFlags(instance, cuda_graph, cudaGraphInstantiateFlagUseNodePriority);
         }
-        return cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        return cudaGraphInstantiate(instance, cuda_graph, NULL, NULL, 0);
     };
     cudaError_t err = inst();
     if (err == cudaErrorMemoryAllocation) {
         (void) cudaGetLastError();
-        graph->instance = nullptr;
+        *instance = nullptr;
         int n_dropped = 0;
         while (ggml_cuda_fn_l22_drop_one_instance(ctx, graph, true)) {
             n_dropped++;
@@ -3914,7 +3918,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // [TAG_FN_L22_GRAPH2] an instance that replayed a few times and is about to change goes aside with its properties: a key
     // that alternates between two buffer layouts then swaps instances instead of re-warming at every switch. A graph
     // that replayed long (a KV bucket change) keeps the RECAP update in place.
-    const bool g2 = ggml_cuda_fn_l22_graph2() && graph->instance != nullptr && graph->n_replay_cap >= 1 &&
+    const bool g2 = ggml_cuda_fn_l22_graph2() && graph->has_instance() && graph->n_replay_cap >= 1 &&
         graph->n_replay_cap <= 32 && (int) graph->node_props.size() == cgraph->n_nodes;
     std::vector<ggml_cuda_graph::node_properties> g2_old;
 
@@ -3979,8 +3983,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // [TAG_FN_L22_GRAPH2] swap in a kept instance of this layout, else put the current one aside (at most 2 kept)
     if (res && !g2_old.empty()) {
         ggml_cuda_graph::fn_l22_variant cur;
-        cur.graph          = graph->graph;
-        cur.instance       = graph->instance;
+        cur.instances      = std::move(graph->instances); // [TAG_UPSTREAM_30804] the chunk list
+        graph->instances.clear();
         cur.node_props     = std::move(g2_old);
         cur.pool_top_known = graph->pool_top_known;
         memcpy(cur.pool_top, graph->pool_top, sizeof(cur.pool_top));
@@ -3989,8 +3993,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         for (ggml_cuda_graph::fn_l22_variant & v : graph->fn_l22_alt) {
             if (ggml_cuda_fn_l22_props_equal(v.node_props, graph->node_props)) {
-                graph->graph          = v.graph;
-                graph->instance       = v.instance;
+                graph->instances      = std::move(v.instances);
                 graph->pool_top_known = v.pool_top_known;
                 memcpy(graph->pool_top, v.pool_top, sizeof(graph->pool_top));
                 graph->n_replay_cap    = 1;
@@ -4012,8 +4015,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             graph->fn_l22_alt[oldest].destroy();
             graph->fn_l22_alt.erase(graph->fn_l22_alt.begin() + oldest);
         }
-        graph->graph                  = nullptr;
-        graph->instance               = nullptr;
+        graph->instances.clear();
         graph->replayed_since_capture = false;
         graph->n_replay_cap           = 0;
         graph->pool_top_known         = false;
@@ -4022,16 +4024,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-
+// [TAG_UPSTREAM_30804] update one chunk's executable from its new capture (re-instantiate when the topology changed)
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+                                              cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
@@ -4042,11 +4044,54 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-        graph->instance = nullptr;
-        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] instance cap, OOM hook
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance = nullptr;
+        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph, &instance, cuda_graph); // [TAG_FN_L22_GRAPHKEEP] OOM hook
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+    }
+}
+
+// [TAG_UPSTREAM_30804] (#30804 + #31053) ggml nodes per CUDA graph chunk; 0 captures the whole ggml graph as one CUDA graph
+static int ggml_cuda_graph_chunk_size() {
+    static const int chunk_size = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_SIZE");
+        return env != nullptr ? atoi(env) : 512;
+    }();
+    return chunk_size;
+}
+
+// [TAG_UPSTREAM_30804] chunk idx of graph was captured into cuda_graph: update its executable (or create it) and launch it
+static void ggml_cuda_graph_exec_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx,
+                                       cudaGraph_t cuda_graph) {
+    if (idx < graph->instances.size()) {
+        ggml_cuda_graph_update_executable(cuda_ctx, graph, graph->instances[idx], cuda_graph);
+    } else {
+        GGML_ASSERT(idx == graph->instances.size());
+        cudaGraphExec_t instance = nullptr;
+        ggml_cuda_fn_l22_instantiate(cuda_ctx, graph, &instance, cuda_graph); // [TAG_FN_L22_GRAPHKEEP] cap, OOM hook
+        graph->instances.push_back(instance);
+    }
+    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+}
+
+// [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after a launch flushes WDDM's batched submission, so the
+// GPU starts the graph now rather than at the next driver call, and host work that should overlap it (a CPU split, the
+// MoE bridge's executor, the capture of the next chunk) does. Strata R4.2d measured 17 of 10,562 layers overlapped
+// without it and 9,190 with it. The query changes no result; "not ready" is its normal answer here. Never inside a capture.
+static void ggml_cuda_graph_poke(ggml_backend_cuda_context * cuda_ctx) {
+    static const bool graph_poke = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_POKE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (graph_poke) {
+        const cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
+        if (q == cudaErrorNotReady) {
+            (void) cudaGetLastError(); // not an error: clear it, as torch's stream query does
+        } else if (q != cudaSuccess) {
+            CUDA_CHECK(q);
+        }
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -4076,9 +4121,10 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    // Only norm/neox shaders have the fusion code
+    // Only norm/neox/multi shaders have the fusion code
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+        mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
 
@@ -6971,6 +7017,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+#ifdef USE_CUDA_GRAPH
+    // [TAG_UPSTREAM_30804] a capture ends a chunk every chunk_size nodes and launches it, so the GPU runs the first chunks
+    // while the rest is captured; a replay launches the chunks one after the other (same kernels, same order, one stream).
+    // Not with a hostfunc-mode MoE bridge: its post forks an aux stream that only a later wait node joins.
+    ggml_cuda_graph * chunk_graph = use_cuda_graph && cuda_graph_update_required ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+    const int         chunk_size  = chunk_graph != nullptr && !ggml_cuda_moe_bridge_hostfunc_any() ? ggml_cuda_graph_chunk_size() : 0;
+    int               chunk_end   = chunk_size;
+    size_t            n_chunks    = 0;
+#endif // USE_CUDA_GRAPH
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -7080,6 +7136,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                // [TAG_UPSTREAM_30804] fused nodes are skipped together, so a cut never splits a fusion; a concurrent region
+                // must join before its capture can end
+                if (chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                    cudaGraph_t cuda_graph = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+                    ggml_cuda_graph_exec_chunk(cuda_ctx, chunk_graph, n_chunks++, cuda_graph);
+                    ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE] the chunk starts while the next one is captured
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    chunk_end = i + chunk_size;
+                }
+#endif // USE_CUDA_GRAPH
                 if (!fn_l22_fused.empty() && fn_l22_fused[i]) { // [TAG_FN_L22_GLUQ8]
                     prev_i = i;
                     continue;
@@ -7208,19 +7276,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
-            }
-
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            cudaGraph_t cuda_graph = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
             ggml_cuda_fn_l22_cap_end(cuda_ctx, graph); // [TAG_FN_L22_GRAPHKEEP] the pool offsets this capture uses
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    ggml_cuda_lock_cv.notify_all();
+                }
             }
+
+            // [TAG_UPSTREAM_30804] the last chunk (the only one when the graph has <= chunk_size nodes): update or create its
+            // executable outside the capture lock, as before (instance cap, OOM hook), and launch it; the earlier chunks
+            // were launched during the capture. Chunks left over from a capture with more chunks are dropped.
+            ggml_cuda_graph_exec_chunk(cuda_ctx, graph, n_chunks++, cuda_graph);
+            for (size_t c = n_chunks; c < graph->instances.size(); ++c) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instances[c]));
+            }
+            graph->instances.resize(n_chunks);
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -7238,32 +7313,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            // [TAG_FN_L4_QSA_STREAMS] the QSA side stream's kernels keep their high priority (instantiate flags);
-            // [TAG_FN_L22_GRAPHKEEP] the instance cap and the OOM retry
-            ggml_cuda_fn_l22_instantiate(cuda_ctx, graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
-        }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-        // [TAG_FN_R4_POKE] GGML_CUDA_GRAPH_POKE=1: one stream query right after the launch flushes WDDM's batched
-        // submission, so the GPU starts the graph now rather than at the next driver call, and host work that should
-        // overlap it (a CPU split, the MoE bridge's executor) does. Strata R4.2d measured 17 of 10,562 layers overlapped
-        // without it and 9,190 with it. The query changes no result; "not ready" is its normal answer here.
-        static const bool graph_poke = [] {
-            const char * e = getenv("GGML_CUDA_GRAPH_POKE");
-            return e != nullptr && atoi(e) != 0;
-        }();
-        if (graph_poke) {
-            const cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
-            if (q == cudaErrorNotReady) {
-                (void) cudaGetLastError(); // not an error: clear it, as torch's stream query does
-            } else if (q != cudaSuccess) {
-                CUDA_CHECK(q);
+        // [TAG_UPSTREAM_30804] a capture launched its chunks already; a replay launches them here, in order
+        // ([TAG_FN_L4_QSA_STREAMS] the instantiate flags keep the QSA side stream's priority; [TAG_FN_L22_GRAPHKEEP] the
+        // instance cap and the OOM retry are in ggml_cuda_fn_l22_instantiate)
+        if (!cuda_graph_update_required) {
+            GGML_ASSERT(graph->has_instance());
+            for (cudaGraphExec_t instance : graph->instances) {
+                CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
             }
         }
+        ggml_cuda_graph_poke(cuda_ctx); // [TAG_FN_R4_POKE]
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -7275,7 +7334,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (graph->graph == nullptr) {
+    if (!graph->has_instance()) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
@@ -7429,7 +7488,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     recapture_safe = ggml_cuda_info().devices[device].vmm;
                 }
 #endif // defined(GGML_USE_VMM)
-                if (properties_changed && recapture_safe && graph->instance != nullptr && graph->replayed_since_capture &&
+                if (properties_changed && recapture_safe && graph->has_instance() && graph->replayed_since_capture &&
                         !nodes_changed) {
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
@@ -7440,7 +7499,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     gp_reason = 3;
                 } else {
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    cuda_graph_update_required = !graph->has_instance();
                 }
             }
         } else {
@@ -7556,7 +7615,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             graph->n_replay++;
             graph->n_replay_cap++;
         } else if (use_cuda_graph) {
-            c[graph->instance != nullptr ? GGML_CUDA_FN_L22_CNT_RECAP : GGML_CUDA_FN_L22_CNT_CAPTURE]++;
+            c[graph->has_instance() ? GGML_CUDA_FN_L22_CNT_RECAP : GGML_CUDA_FN_L22_CNT_CAPTURE]++;
         } else if (gp_reason == 5) {
             c[GGML_CUDA_FN_L22_CNT_EAGER_ROWS]++;
         } else if (gp_reason == 3 || gp_reason == 4) {
@@ -8182,7 +8241,7 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend, size_t keep) {
                         kept++;
                     }
                 }
-                if (g->instance == nullptr) {
+                if (!g->has_instance()) {
                     continue;
                 }
                 if (above(g->pool_top_known, g->pool_top)) {
@@ -8219,11 +8278,11 @@ static void ggml_backend_cuda_pool_mark(ggml_backend_t backend) {
         ggml_cuda_pool * p = ctx->pools[ctx->device][s].get();
         size_t m = p ? p->used_hwm() : 0;
         for (const auto & [k, g] : ctx->cuda_graphs) {
-            if (g->instance != nullptr && g->pool_top_known) {
+            if (g->has_instance() && g->pool_top_known) {
                 m = std::max(m, g->pool_top[s]);
             }
             for (const auto & v : g->fn_l22_alt) {
-                if (v.instance != nullptr && v.pool_top_known) {
+                if (v.has_instance() && v.pool_top_known) {
                     m = std::max(m, v.pool_top[s]);
                 }
             }
