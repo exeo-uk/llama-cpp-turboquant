@@ -1641,8 +1641,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     }
     s->cp_spin = gen5::env_int("LLAMA_PREFILL_STREAM_SPIN_US", s->cp_tmp ? 200 : 0, 0, 10000);
     // [TAG_FN_R25_STAGE] LLAMA_PREFILL_STREAM_ASYNC=1: the streamer dispatches a chunk's DMA while the copy threads fill the
-    // next slot (the streamer no longer copies a part itself)
-    s->cp_async = gen5::env_int("LLAMA_PREFILL_STREAM_ASYNC", 0, 0, 1) != 0;
+    // next slot (the streamer no longer copies a part itself). Default on with the cached ring: the r25 probe (copy + DMA,
+    // workers one CCD each) 30.1 GB/s synchronous, 31.2 GB/s async; the r25 GPU test ran cached + async + PIN 2
+    s->cp_async = gen5::env_int("LLAMA_PREFILL_STREAM_ASYNC", s->cp_tmp ? 1 : 0, 0, 1) != 0;
     // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 1 each copy worker on its own physical core, the cores in turn from each L3
     // domain; 2 the workers in turn on the whole CCDs (the scheduler still moves a worker inside its CCD). Left to the
     // scheduler the 16 copy threads ran on the cache CCD (r25 probe: 22.2 GB/s copy + DMA; one per core across both CCDs

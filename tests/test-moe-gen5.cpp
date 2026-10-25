@@ -775,6 +775,8 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cache
     }
     if (cached >= 3) {
         set_env("LLAMA_PREFILL_STREAM_ASYNC", "1");
+    } else if (cached > 0) {
+        set_env("LLAMA_PREFILL_STREAM_ASYNC", "0"); // the cached ring's default is async: keep the synchronous dispatch covered
     }
     if (cached == 2 || cached == 3) {
         set_env("LLAMA_PREFILL_STREAM_PIN", cached == 2 ? "1" : "2"); // [TAG_FN_R25_PIN] pinned copy workers (same bytes)
