@@ -3946,7 +3946,7 @@ static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_c
         // [TAG_FN_L23_PINFIX] R-L23-6: a second failure aborts below: the hook's second attempt first
         if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 4)) {
             (void) cudaGetLastError();
-            graph->instance = nullptr;
+            *instance = nullptr; // [TAG_FN_V0252_MERGE] the chunk's instance ([TAG_UPSTREAM_30804] has no graph->instance)
             err = inst();
         }
     }
