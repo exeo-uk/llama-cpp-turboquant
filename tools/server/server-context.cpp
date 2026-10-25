@@ -2324,6 +2324,7 @@ private:
         int32_t     op_near   = 16384;            // _NEAR: a rest of at most this many text tokens finishes first
         double      op_frac   = 0.75;             // _FRAC: a prompt this far done finishes first
         bool        gscap     = false;            // LLAMA_FN_L24_GSCAP: the GENSHARE2 window cap follows the pass's rows
+        int32_t     gs_tail   = 64;               // _TAIL: no window while a prompt has at most this many rows left
     } l24;
     int l24_claim_task = -1; // [TAG_FN_L24_OPFAIR] the task that claimed the last prompt batch
 
@@ -3584,12 +3585,13 @@ private:
             l24.op_frac = std::clamp(num("LLAMA_FN_L24_OPFAIR_FRAC", 0.75), 0.0, 1.0);
         }
         if (slots.size() >= 2 && l22two.gs2 > 0) {
-            l24.gscap = num("LLAMA_FN_L24_GSCAP", 0.0) != 0.0;
+            l24.gscap   = num("LLAMA_FN_L24_GSCAP", 0.0) != 0.0;
+            l24.gs_tail = (int32_t) std::clamp(num("LLAMA_FN_L24_GSCAP_TAIL", 64.0), 0.0, 1e6);
         }
         if (l24.opfair || l24.gscap) {
             SRV_INF("[TAG_FN_L24] two-connection rules: [TAG_FN_L24_OPFAIR] %d (a prompt in progress finishes when <= %d text tokens "
-                    "or %.0f %% done are left, and gives way at most once per request), [TAG_FN_L24_GSCAP] %d\n", (int) l24.opfair,
-                    l24.op_near, l24.op_frac * 100.0, (int) l24.gscap);
+                    "left or %.0f %% is done, and gives way at most once per request), [TAG_FN_L24_GSCAP] %d (no window before a "
+                    "prompt tail of <= %d rows)\n", (int) l24.opfair, l24.op_near, l24.op_frac * 100.0, (int) l24.gscap, l24.gs_tail);
         }
     }
 
@@ -7107,10 +7109,28 @@ private:
                     const int64_t base    = (t1 - t_batch0) + l22_media_us;
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(base, cap_eff));
                     l22_win_first      = true; // [TAG_FN_L22_GENSHARE2] the next answer-only decode moves the end
+                    // [TAG_FN_L24_GSCAP] a prompt left with a few rows (the 4-token assistant-turn tail of a split prompt) runs
+                    // them now: the window held that ~0.1 s batch, and the prompt's first token, for 2-3 s (l24c 3b)
+                    int32_t tail_left = 0;
+                    if (l24.gscap && l24.gs_tail > 0) {
+                        for (const auto & s : slots) {
+                            if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
+                                const int32_t left = l22_prompt_left(s);
+                                if (left > 0 && left <= l24.gs_tail) {
+                                    tail_left = left;
+                                }
+                            }
+                        }
+                        if (tail_left > 0) {
+                            gen_share_until_us = 0;
+                            l22_win_first      = false;
+                        }
+                    }
                     if (llama_fn_l22_passlog_level() >= 1) {
                         llama_fn_l22_log("turn", "two=genshare2 rows=%lld cap_rows=%d gen_rows=%d window_ms=%.0f pass_ms=%.0f media_ms=%.0f "
-                                         "cap_ms=%.0f", (long long) rows, l22_cap_rows, batch.n_gen_rows, (gen_share_until_us - t1) / 1000.0,
-                                         base / 1000.0, l22_media_us / 1000.0, cap_eff / 1000.0);
+                                         "cap_ms=%.0f%s", (long long) rows, l22_cap_rows, batch.n_gen_rows,
+                                         tail_left > 0 ? 0.0 : (gen_share_until_us - t1) / 1000.0, base / 1000.0, l22_media_us / 1000.0,
+                                         cap_eff / 1000.0, tail_left > 0 ? " (a prompt tail runs first)" : "");
                     }
                 } else {
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(t1 - t_batch0, cap_us));
