@@ -319,6 +319,8 @@ void copy_pool::run(int idx) {
         const copy_seg * sg;
         int n_sg;
         size_t n;
+        int base;
+        int parts;
         if (spin_us > 0) { // [TAG_FN_R25_STAGE] during a pass the next chunk comes within a few us
             spin_until([&]() { return gen.load(std::memory_order_acquire) != seen || quit.load(std::memory_order_relaxed); },
                        spin_us);
@@ -329,13 +331,15 @@ void copy_pool::run(int idx) {
             if (quit.load(std::memory_order_relaxed)) {
                 return;
             }
-            seen = gen.load(std::memory_order_relaxed);
-            sg   = segs_p;
-            n_sg = n_segs;
-            n    = n_bytes;
+            seen  = gen.load(std::memory_order_relaxed);
+            sg    = segs_p;
+            n_sg  = n_segs;
+            n     = n_bytes;
+            base  = job_base;
+            parts = job_parts;
         }
         size_t off, len;
-        part_range(n, idx, size(), off, len);
+        part_range(n, idx - base, parts, off, len);
         if (len > 0) {
             copy_segs_part(sg, n_sg, off, len, temporal, prefetch);
         }
@@ -364,9 +368,11 @@ void copy_pool::copy_list(const copy_seg * segs, int n_sg) {
     }
     {
         std::lock_guard<std::mutex> lk(mtx);
-        segs_p  = segs;
-        n_segs  = n_sg;
-        n_bytes = n;
+        segs_p    = segs;
+        n_segs    = n_sg;
+        n_bytes   = n;
+        job_base  = 0;
+        job_parts = parts;
         pending.store(parts - 1, std::memory_order_relaxed);
         gen.fetch_add(1, std::memory_order_release);
     }
@@ -376,6 +382,34 @@ void copy_pool::copy_list(const copy_seg * segs, int n_sg) {
     if (len > 0) {
         copy_segs_part(segs, n_sg, off, len, temporal, prefetch);
     }
+    wait();
+}
+
+// [TAG_FN_R25_STAGE]
+void copy_pool::submit(const copy_seg * segs, int n_sg) {
+    size_t n = 0;
+    for (int i = 0; i < n_sg; ++i) {
+        n += segs[i].n;
+    }
+    const int parts = size() - 1;
+    if (parts < 1 || n < (1u << 20)) {
+        copy_segs_part(segs, n_sg, 0, n, temporal, prefetch); // pending stays 0: wait() returns at once
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        segs_p    = segs;
+        n_segs    = n_sg;
+        n_bytes   = n;
+        job_base  = 1;
+        job_parts = parts;
+        pending.store(parts, std::memory_order_relaxed);
+        gen.fetch_add(1, std::memory_order_release);
+    }
+    cv_go.notify_all();
+}
+
+void copy_pool::wait() {
     if (spin_us > 0) { // [TAG_FN_R25_STAGE]
         spin_until([&]() { return pending.load(std::memory_order_acquire) == 0; }, spin_us);
     }

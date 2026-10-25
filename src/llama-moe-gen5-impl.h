@@ -85,6 +85,11 @@ public:
     void copy(void * dst, const void * src, size_t n);
     // [TAG_FN_L14_PFSD2D] the segments as one byte range split over the threads (one wake for many small pieces)
     void copy_list(const copy_seg * segs, int n);
+    // [TAG_FN_R25_STAGE] the same copy by the workers alone: submit() returns at once (the caller dispatches the chunk before
+    // meanwhile), wait() blocks until it is done. The segments must stay unchanged until wait() returns. A pool without
+    // workers, or less than 1 MiB, copies inside submit()
+    void submit(const copy_seg * segs, int n);
+    void wait();
     int  size() const { return (int) workers.size() + 1; }
 
 private:
@@ -102,6 +107,8 @@ private:
     const copy_seg *         segs_p  = nullptr;
     int                      n_segs  = 0;
     size_t                   n_bytes = 0;
+    int                      job_base  = 0; // [TAG_FN_R25_STAGE] worker idx - job_base = its part of job_parts (copy_list: 0 /
+    int                      job_parts = 1; // size(), the caller copies part 0; submit: 1 / size() - 1)
     bool                     temporal = false; // [TAG_FN_R25_STAGE]
     bool                     prefetch = false;
     int                      spin_us  = 0;

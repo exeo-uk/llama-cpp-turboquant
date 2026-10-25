@@ -62,7 +62,7 @@ static const char * k_env[] = {
     "LLAMA_PREFILL_STREAM_WRAP", "LLAMA_PREFILL_STREAM_CHUNK_MIB", "LLAMA_PREFILL_STREAM_RING_MIB",
     "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_STATS",
     "LLAMA_PREFILL_STREAM_CACHED", "LLAMA_PREFILL_STREAM_CACHED_RING_MIB", "LLAMA_PREFILL_STREAM_CACHED_CHUNK_MIB", // [TAG_FN_R25_STAGE]
-    "LLAMA_PREFILL_STREAM_CACHED_PF", "LLAMA_PREFILL_STREAM_SPIN_US",
+    "LLAMA_PREFILL_STREAM_CACHED_PF", "LLAMA_PREFILL_STREAM_SPIN_US", "LLAMA_PREFILL_STREAM_ASYNC",
 };
 
 static void reset_env() {
@@ -754,7 +754,8 @@ static void test_dma_bridge(t_model & m, const char * name, const char * share, 
 //
 
 // [TAG_FN_R25_STAGE] cached: 0 the non-temporal ring copies; 1 plain stores + NTA prefetch + spinning copy threads with the
-// test's 1 MiB chunks (an explicit size wins); 2 the same with the cached ring's own sizes (4 x 8 MiB)
+// test's 1 MiB chunks (an explicit size wins); 2 the same with the cached ring's own sizes (4 x 8 MiB); 3 = 1 with the async
+// dispatch (a chunk dispatched while the next one is copied); 4 the non-temporal copies with the async dispatch
 static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cached = 0) {
     reset_env();
     char nb[8];
@@ -767,13 +768,16 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cache
         set_env("LLAMA_PREFILL_STREAM_RING_MIB", "2");
     }
     set_env("LLAMA_PREFILL_STREAM_THREADS", "3");
-    if (cached > 0) {
+    if (cached > 0 && cached != 4) {
         set_env("LLAMA_PREFILL_STREAM_CACHED", "1");
-        set_env("LLAMA_PREFILL_STREAM_SPIN_US", cached == 1 ? "50" : "500");
+        set_env("LLAMA_PREFILL_STREAM_SPIN_US", cached == 2 ? "500" : "50");
+    }
+    if (cached >= 3) {
+        set_env("LLAMA_PREFILL_STREAM_ASYNC", "1");
     }
     char name[80];
     snprintf(name, sizeof(name), "pfs bufs %d wrap %d%s%s", n_bufs, wrap ? 1 : 0, partial ? " partial" : "",
-             cached == 1 ? " cached" : cached == 2 ? " cached 4x8" : "");
+             cached == 1 ? " cached" : cached == 2 ? " cached 4x8" : cached == 3 ? " cached async" : cached == 4 ? " async" : "");
     static int owner_tag = 0;
     const void * owner = &owner_tag;
     const bool ok = llama_prefill_stream_init_layers(descs(m), cpu_device(m), owner);
@@ -923,6 +927,10 @@ int main() {
     test_pfs(m, 2, true, true, 1);
     test_pfs(m, 1, false, false, 2);
     test_pfs(m, 3, true, true, 2);
+    test_pfs(m, 2, true, false, 3);
+    test_pfs(m, 2, true, true, 3);
+    test_pfs(m, 1, true, true, 3);
+    test_pfs(m, 2, true, true, 4);
 
     reset_env();
     free_model(m);
