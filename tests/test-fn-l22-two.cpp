@@ -191,7 +191,50 @@ static void test_draft2() {
     TCHECK(common_speculative_pmin_draft2(0.85f, 2, 2, 0.6f) == 0.85f, "max: a higher position p_min stays");
 }
 
+// [TAG_FN_L24_OPFAIR] the fair order and the near-end rule; [TAG_FN_L24_GSCAP] the window cap
+static void test_l24() {
+    auto first = [](const std::vector<l24_prompt_cand> & c) {
+        const auto o = l24_oneprompt_order(c);
+        return o.empty() ? -1 : o[0];
+    };
+    // A (slot 1) in progress, 15.5K left of 30K, never gave way; B (slot 0) new with 11.4K: B may pre-empt once
+    TCHECK(first({ { 0, 11389, 0, false, false }, { 1, 15536, 0, true, false } }) == 0, "one pre-emption allowed");
+    // A gave way once in this request: it keeps the batch now
+    TCHECK(first({ { 0, 11389, 0, false, false }, { 1, 15536, 1, true, false } }) == 1, "at most once per request");
+    // A near its end keeps the batch
+    TCHECK(first({ { 0, 2000, 0, false, false }, { 1, 6000, 0, true, true } }) == 1, "near the end: finishes first");
+    // B, the pre-emptor, is now the claimer: A (more left, gave way) does not take the batch back
+    TCHECK(first({ { 0, 9000, 0, true, false }, { 1, 15536, 1, false, false } }) == 0, "no ping-pong");
+    // a challenger with more tokens left never pre-empts
+    TCHECK(first({ { 0, 20000, 0, false, false }, { 1, 15536, 0, true, false } }) == 1, "shortest first only");
+    // no claimer: a slot that gave way goes first (n_force 1), else the fewest left
+    TCHECK(first({ { 0, 3000, 0, false, false }, { 1, 15536, 1, false, false } }) == 1, "gave way: first");
+    TCHECK(first({ { 0, 3000, 0, false, false }, { 1, 15536, 0, false, false } }) == 0, "fewest left");
+    // a claimer with nothing left is no claimer
+    TCHECK(first({ { 0, 3000, 0, false, false }, { 1, 0, 0, true, false } }) == 1, "left 0 sorts first, as before");
+    {
+        const auto o = l24_oneprompt_order({ { 2, 500, 0, false, false }, { 0, 9000, 0, true, false }, { 1, 700, 0, false, false } });
+        TCHECK(o.size() == 3 && o[0] == 2 && o[1] == 0 && o[2] == 1, "three slots: pre-emptor, claimer, rest (%zu)", o.size());
+        std::vector<int> s = o;
+        std::sort(s.begin(), s.end());
+        TCHECK(s == std::vector<int>({ 0, 1, 2 }), "every slot once");
+    }
+    // near end
+    TCHECK(l24_prompt_near_end(13616, 30000, false, 16384, 0.75), "one more 16K pass of text");
+    TCHECK(!l24_prompt_near_end(13616, 30000, true, 16384, 0.75), "pictures left: by the fraction only");
+    TCHECK(l24_prompt_near_end(6000, 30000, true, 16384, 0.75), "80 percent done");
+    TCHECK(!l24_prompt_near_end(20000, 30000, false, 16384, 0.75), "a third done");
+    TCHECK(l24_prompt_near_end(0, 30000, false, 0, 1.0), "nothing left");
+    TCHECK(!l24_prompt_near_end(5, 0, false, 0, 0.75), "no turn rows: by tokens only");
+    // window cap
+    TCHECK(l24_window_cap_us(4000000, 16381) > 7990000 && l24_window_cap_us(4000000, 16381) < 8000000, "16K pass: ~2x the cap");
+    TCHECK(l24_window_cap_us(4000000, 100) == 4000000, "at least the cap");
+    TCHECK(l24_window_cap_us(4000000, 8192) == 4000000, "8K: the cap");
+    TCHECK(l22_window_cap_us(4000000, 16381, 1) == 4000000, "the old cap counted whole 8Ks");
+}
+
 int main() {
+    test_l24();
     test_order();
     test_yield();
     test_cap();

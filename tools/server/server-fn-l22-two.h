@@ -44,6 +44,82 @@ static inline std::vector<int> l22_oneprompt_order(std::vector<l22_prompt_cand> 
     return out;
 }
 
+// [TAG_FN_L24_OPFAIR] one slot with prompt tokens left, with what the fair order needs
+struct l24_prompt_cand {
+    int     id       = -1;
+    int32_t left     = 0;
+    int32_t n_yield  = 0;
+    bool    claimer  = false; // its task claimed the last prompt batch (the prompt in progress)
+    bool    near_end = false; // its rest is short or most of it is done: it finishes first
+};
+
+// whether a prompt is near its end: a text-only rest of at most near tokens, or at least frac of its turn done
+static inline bool l24_prompt_near_end(int32_t left, int32_t turn_rows, bool media_left, int32_t near, double frac) {
+    if (left <= 0) {
+        return true;
+    }
+    if (!media_left && left <= near) {
+        return true;
+    }
+    return turn_rows > 0 && (double) (turn_rows - left) >= frac * (double) turn_rows;
+}
+
+// The visit order with the prompt in progress kept (owner 10-24: a new prompt took the batch from one with 15.5K left,
+// which then waited ~45 s). Shortest remaining first, with limits: the claimer goes first unless a challenger has fewer
+// tokens left, the claimer never gave way in this request and is not near its end (the near-end rule is off by default:
+// the short request matters more). The pre-emptor then keeps the batch (no ping-pong). Without a claimer, a slot that
+// gave way goes first, then the fewest tokens left (l22_oneprompt_order with n_force 1). Every slot of c is in the result once.
+static inline std::vector<int> l24_oneprompt_order(const std::vector<l24_prompt_cand> & c) {
+    std::vector<l22_prompt_cand> base;
+    for (const auto & x : c) {
+        base.push_back({ x.id, x.left, x.n_yield });
+    }
+    std::vector<int> order = l22_oneprompt_order(base, 1);
+    int k = -1;
+    for (int i = 0; i < (int) c.size(); ++i) {
+        if (c[i].claimer && c[i].left > 0) {
+            k = i;
+            break;
+        }
+    }
+    if (k < 0) {
+        return order;
+    }
+    const auto & cl = c[k];
+    int best = -1; // the first challenger in the base order
+    for (const int id : order) {
+        if (id != cl.id) {
+            best = id;
+            break;
+        }
+    }
+    int32_t best_left = 0;
+    for (const auto & x : c) {
+        if (x.id == best) {
+            best_left = x.left;
+        }
+    }
+    const bool preempt = best >= 0 && !cl.near_end && cl.n_yield == 0 && best_left < cl.left;
+    std::vector<int> out;
+    out.reserve(order.size());
+    if (preempt) {
+        out.push_back(best);
+    }
+    out.push_back(cl.id);
+    for (const int id : order) {
+        if (id != cl.id && !(preempt && id == best)) {
+            out.push_back(id);
+        }
+    }
+    return out;
+}
+
+// [TAG_FN_L24_GSCAP] l22_window_cap_us with the rows counted in fractions of 8K: a 16,381-row pass got the 8K cap (4 s),
+// so its window was 2.0 s of a 6.6 s pass (share 0.30, the answer ~21 t/s) instead of half the pass
+static inline int64_t l24_window_cap_us(int64_t cap_us, int64_t prompt_rows) {
+    return (int64_t) ((double) cap_us * std::max(1.0, (double) prompt_rows / 8192.0));
+}
+
 // the slot gave way to claimer_task in this batch: counts once per claiming task (a long prompt gives way to a shorter
 // one at most n_force times)
 static inline void l22_yield_note(int32_t & n_yield, int & last_task, int claimer_task) {
