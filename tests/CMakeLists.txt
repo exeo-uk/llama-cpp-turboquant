@@ -381,6 +381,10 @@ llama_build_and_test(test-fn-l4-host.cpp)
 # it under compute-sanitizer memcheck first); without one it prints SKIPPED.
 llama_build(test-vmm-lend.cpp)
 
+# [TAG_FUSED_BINBCAST_ALIAS] the CUDA multi-mul fusion with the last output placed over a src1 an earlier node read
+# (the MoE amax rescale chain). Built, not registered with ctest: it needs the GPU; without one it prints SKIPPED.
+llama_build(test-cuda-fused-mul-alias.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
