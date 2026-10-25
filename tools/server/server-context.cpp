@@ -6994,9 +6994,12 @@ private:
         } else if (batch.size() > batch.n_gen_rows) {
             l22_win_first = false;
         }
-        // [TAG_FN_L24_TTFT] a merged pass the answers sat out opens their window as a batch with their rows does
-        const bool l24_win = l24_excl_held && batch.l22_slot >= 0 && batch.n_gen_rows == 0;
-        if (l24_win) {
+        // [TAG_FN_L24_TTFT] a merged pass the answers sat out opens their window as a batch with their rows does; not when only a
+        // short tail of that prompt is left (the 4 rows after the last picture waited the whole 2 s window before the first token):
+        // the tail goes with the answers' next step, and that batch opens the window
+        const bool l24_win = l24_excl_held && batch.l22_slot >= 0 && batch.l22_slot < (int) slots.size() && batch.n_gen_rows == 0 &&
+                             l22_prompt_left(slots[batch.l22_slot]) > 512;
+        if (l24_excl_held && batch.l22_slot >= 0) {
             l22.n_excl++;
         }
         if ((batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) || l24_win) {
