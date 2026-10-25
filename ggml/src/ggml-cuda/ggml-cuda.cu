@@ -100,6 +100,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -447,7 +448,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // [TAG_FN_L22_OOMHOOK] defined after ggml_cuda_lock_counter: the libllama OOM hook (pins), outside a capture
 static void ggml_cuda_fn_l22_oom_precheck(size_t need);
-static bool ggml_cuda_fn_l22_oom_retry(size_t need);
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code = 1);
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
@@ -674,7 +675,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             ggml_cuda_fn_l22_oom_precheck(reserve_size); // [TAG_FN_L22_OOMHOOK]
             CUresult cr = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size)) { // [TAG_FN_L22_OOMHOOK]
+            // [TAG_FN_L23_PINFIX] R-L23-6: a failed retry aborts here, so the hook gets two attempts (code 3, then 4)
+            for (int k = 0; k < 2 && cr == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_fn_l22_oom_retry(reserve_size, 3 + k); ++k) { // [TAG_FN_L22_OOMHOOK]
                 cr = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
             CU_CHECK(cr);
@@ -808,14 +810,15 @@ static void ggml_cuda_fn_l22_oom_precheck(size_t need) {
     }
 }
 
-static bool ggml_cuda_fn_l22_oom_retry(size_t need) {
+// code ([TAG_FN_L23_PINFIX] R-L23-6): 1 = device allocation, 2 = pinned host allocation, 3 / 4 = device allocation whose failed retry aborts (first / second attempt)
+static bool ggml_cuda_fn_l22_oom_retry(size_t need, int code) {
     const ggml_cuda_fn_l22_oom_fn_t fn = ggml_cuda_fn_l22_oom_fn.load();
     if (fn == nullptr || ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) {
         return false;
     }
-    const bool freed = fn(need, 1, ggml_cuda_fn_l22_oom_ud.load());
-    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] device allocation of %.1f MiB failed: the OOM hook %s, one retry\n",
-            need/1048576.0, freed ? "gave memory back" : "had nothing to give");
+    const bool freed = fn(need, code, ggml_cuda_fn_l22_oom_ud.load());
+    GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] %s allocation of %.1f MiB failed (code %d): the OOM hook %s\n", code == 2 ? "pinned host" : "device",
+            need/1048576.0, code, freed ? "gave memory back, retry" : "had nothing to give");
     return freed;
 }
 
@@ -989,11 +992,124 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// [TAG_FN_L23_PINFIX] a host -> device copy whose source starts inside a range registered with cudaHostRegister but runs
+// past its end is refused by CUDA (cudaErrorInvalidValue: nothing is queued, the error is not sticky). libllama registers
+// per-expert ranges of the mapped model ([TAG_FN_L22_PIN]) and now keeps them, so a caller that does not split its copy at
+// the registered edges (FAULT 2026-10-21 10:10: a hot-set refill slice of a lend-layer resident through the synchronous
+// set_tensor, LLAMA_FN_L22_REFILL=0) hit it. Such a copy goes again through a pinned bounce buffer (CPU copy, then DMA,
+// 32 MiB pieces, synchronous on the stream); any other error stays fatal. true: the bounce ran (the stream is idle)
+// [TAG_FN_L23_PINFIX] R-L23-8: one pinned bounce buffer for the whole process, allocated before the first pin (the first
+// registration asks for it), so a copy never needs new pinned memory when the page-lock budget is short
+static std::mutex g_fn_bounce_mtx;
+static void *     g_fn_bounce = nullptr;
+static bool       g_fn_bounce_tried = false;
+static constexpr size_t FN_BOUNCE_B = (size_t) 32 << 20;
+
+static void * ggml_cuda_fn_bounce_locked() {
+    if (g_fn_bounce == nullptr && !g_fn_bounce_tried) {
+        g_fn_bounce_tried = true;
+        if (cudaMallocHost(&g_fn_bounce, FN_BOUNCE_B) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_fn_bounce = nullptr;
+            GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] no pinned bounce buffer (%.0f MiB)\n", FN_BOUNCE_B/1048576.0);
+        }
+    }
+    return g_fn_bounce;
+}
+
+// a host copy through the bounce buffer, synchronous on the stream (CPU copy + DMA in 32 MiB pieces)
+static cudaError_t ggml_cuda_fn_copy_bounced(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_fn_bounce_mtx);
+    if (g_fn_bounce == nullptr) {
+        g_fn_bounce_tried = false; // one more try: pins may have gone
+    }
+    void * bb = ggml_cuda_fn_bounce_locked();
+    if (bb == nullptr) {
+        return cudaErrorMemoryAllocation;
+    }
+    cudaError_t e = cudaStreamSynchronize(stream);
+    for (size_t o = 0; e == cudaSuccess && o < size; o += FN_BOUNCE_B) {
+        const size_t k = std::min(FN_BOUNCE_B, size - o);
+        if (kind == cudaMemcpyHostToDevice) {
+            memcpy(bb, (const char *) src + o, k);
+            e = cudaMemcpyAsync((char *) dst + o, bb, k, cudaMemcpyHostToDevice, stream);
+        } else {
+            e = cudaMemcpyAsync(bb, (const char *) src + o, k, cudaMemcpyDeviceToHost, stream);
+        }
+        if (e == cudaSuccess) {
+            e = cudaStreamSynchronize(stream);
+        }
+        if (e == cudaSuccess && kind == cudaMemcpyDeviceToHost) {
+            memcpy((char *) dst + o, bb, k);
+        }
+    }
+    return e;
+}
+
+// [TAG_FN_L23_PINFIX] R-L23-7 / R-L23-8: a copy with pageable host memory needs the driver's pinned staging, which fails with
+// out of memory when the page-lock budget is short (FAULTs 2026-10-21 15:20 and 15:58: a D2H get_tensor, the abort, the TDR).
+// It never aborts for that: the bounce buffer first, then the pins drop (hook code 2), then direct / bounce again while the
+// driver frees the pages (up to ~2 s)
+static cudaError_t ggml_cuda_memcpy_oom_retry(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    cudaError_t e = cudaMemcpyAsync(dst, src, size, kind, stream);
+    if (e != cudaErrorMemoryAllocation || size == 0) {
+        return e;
+    }
+    (void) cudaGetLastError();
+    static std::atomic<int> n_notes{0};
+    const int note = n_notes.fetch_add(1) + 1;
+    e = ggml_cuda_fn_copy_bounced(dst, src, size, kind, stream);
+    const char * how = "bounce";
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        const bool freed = ggml_cuda_fn_l22_oom_retry(size, 2);
+        how = freed ? "pins dropped" : "retry";
+        for (int k = 0; k < 100; ++k) {
+            e = cudaMemcpyAsync(dst, src, size, kind, stream);
+            if (e == cudaSuccess) {
+                break;
+            }
+            (void) cudaGetLastError();
+            if (e != cudaErrorMemoryAllocation) {
+                return e;
+            }
+            e = ggml_cuda_fn_copy_bounced(dst, src, size, kind, stream);
+            if (e == cudaSuccess) {
+                break;
+            }
+            (void) cudaGetLastError();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    if (note <= 3 || note % 256 == 0) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] a %s copy of %.2f MiB ran out of pinned staging: %s (%s, %d so far)\n",
+                kind == cudaMemcpyHostToDevice ? "H2D" : "D2H", size/1048576.0, e == cudaSuccess ? "done" : "FAILED", how, note);
+    }
+    return e;
+}
+
+static bool ggml_cuda_h2d_or_bounce(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const cudaError_t e = ggml_cuda_memcpy_oom_retry(dst, src, size, cudaMemcpyHostToDevice, stream);
+    if (e != cudaErrorInvalidValue || size == 0) {
+        CUDA_CHECK(e);
+        return false;
+    }
+    (void) cudaGetLastError();
+    static std::atomic<int> n_notes{0};
+    CUDA_CHECK(ggml_cuda_fn_copy_bounced(dst, src, size, cudaMemcpyHostToDevice, stream));
+    const int k = n_notes.fetch_add(1) + 1;
+    if (k <= 3 || k % 1024 == 0) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] a host copy of %.2f MiB at %p crossed a registered host range's edge: sent "
+                "through the pinned bounce buffer (%d so far)\n", size/1048576.0, src, k);
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cudaStreamPerThread); // [TAG_FN_L23_PINFIX]
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1001,7 +1117,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread)); // [TAG_FN_L23_PINFIX] R-L23-7
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1688,6 +1804,11 @@ static void * ggml_cuda_host_malloc(size_t size) {
 
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    // [TAG_FN_L23_PINFIX] R-L23-5: pinned host memory short while libllama holds pins: they go first, one retry
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(size, 2)) {
+        (void) cudaGetLastError();
+        err = cudaMallocHost((void **) &ptr, size);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -3106,7 +3227,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_h2d_or_bounce((char *) tensor->data + offset, data, size, cuda_ctx->stream()); // [TAG_FN_L23_PINFIX]
 }
 
 // [TAG_FN_L4_HOST_BATCHCPY] host -> device copies into whole device tensors as one cudaMemcpyBatchAsync on the backend's
@@ -3367,7 +3488,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_oom_retry(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream())); // [TAG_FN_L23_PINFIX] R-L23-7
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3818,10 +3939,16 @@ static void ggml_cuda_fn_l22_instantiate(ggml_backend_cuda_context * ctx, ggml_c
         while (ggml_cuda_fn_l22_drop_one_instance(ctx, graph, true)) {
             n_dropped++;
         }
-        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024);
+        const bool hook = ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 3);
         GGML_LOG_WARN("ggml_cuda: [TAG_FN_L22_OOMHOOK] graph instantiate out of memory (%d nodes): %d cold instances dropped, "
                 "hook %d, one retry\n", (int) graph->node_props.size(), n_dropped, hook ? 1 : 0);
         err = inst();
+        // [TAG_FN_L23_PINFIX] R-L23-6: a second failure aborts below: the hook's second attempt first
+        if (err == cudaErrorMemoryAllocation && ggml_cuda_fn_l22_oom_retry(256u*1024*1024, 4)) {
+            (void) cudaGetLastError();
+            graph->instance = nullptr;
+            err = inst();
+        }
     }
     CUDA_CHECK(err);
 }
@@ -9422,10 +9549,59 @@ static bool ggml_backend_cuda_turbot_supports_geometry(ggml_backend_dev_t dev, i
     return ggml_cuda_turbot_geometry_supported(dev_ctx->device, head_dim, n_head_kv);
 }
 
+// [TAG_FN_L23_PINFIX] R-L23-8 backstop for our registrations (upstream #31122: the WDDM page-lock budget is about half the RAM
+// and unstable past it): the total stays under the cap libllama sets (0.4 x RAM), and the first refusal by the driver stops
+// every later registration of the process (no retry until a restart)
+static std::mutex                         g_fn_reg_mtx;
+static std::unordered_map<void *, size_t> g_fn_reg_map;
+static size_t                             g_fn_reg_total   = 0;
+static size_t                             g_fn_reg_cap     = 0;
+static bool                               g_fn_reg_refused = false;
+
+static void ggml_backend_cuda_fn_set_reg_cap(size_t cap) {
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    g_fn_reg_cap = cap;
+}
+
+static bool ggml_cuda_fn_reg_admit(size_t size) {
+    {
+        std::lock_guard<std::mutex> lk(g_fn_bounce_mtx);
+        (void) ggml_cuda_fn_bounce_locked(); // the bounce buffer exists before the first pin
+    }
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    if (g_fn_reg_refused) {
+        return false;
+    }
+    if (g_fn_reg_cap > 0 && g_fn_reg_total + size > g_fn_reg_cap) {
+        GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] %.0f MiB not registered: %.2f GiB registered, cap %.2f GiB\n", size/1048576.0,
+                g_fn_reg_total/1073741824.0, g_fn_reg_cap/1073741824.0);
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cuda_fn_reg_done(void * buffer, size_t size, cudaError_t err) {
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    if (err != cudaSuccess) {
+        if (!g_fn_reg_refused) {
+            GGML_LOG_WARN("ggml_cuda: [TAG_FN_L23_PINFIX] the driver refused a registration (%.0f MiB, %.2f GiB registered: %s): no more "
+                    "registrations in this process\n", size/1048576.0, g_fn_reg_total/1073741824.0, cudaGetErrorString(err));
+        }
+        g_fn_reg_refused = true;
+        return;
+    }
+    g_fn_reg_map[buffer] = size;
+    g_fn_reg_total += size;
+}
+
 // [TAG_FN_L14_ARENA] the expert arena (locked host memory) registered for direct DMA, without the GGML_CUDA_REGISTER_HOST
 // switch the generic pair needs; false when the driver refuses (the caller keeps its staged copies then)
 static bool ggml_backend_cuda_fn_register_host(void * buffer, size_t size) {
+    if (!ggml_cuda_fn_reg_admit(size)) {
+        return false;
+    }
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    ggml_cuda_fn_reg_done(buffer, size, err);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
@@ -9438,6 +9614,12 @@ static void ggml_backend_cuda_fn_unregister_host(void * buffer) {
     if (cudaHostUnregister(buffer) != cudaSuccess) {
         (void) cudaGetLastError();
     }
+    std::lock_guard<std::mutex> lk(g_fn_reg_mtx);
+    auto it = g_fn_reg_map.find(buffer);
+    if (it != g_fn_reg_map.end()) {
+        g_fn_reg_total -= std::min(g_fn_reg_total, it->second);
+        g_fn_reg_map.erase(it);
+    }
 }
 
 // [TAG_FN_L22_PIN] R-P14-5: a host range registered with a device mapping (pinned DMA share reads it from kernels), and
@@ -9446,7 +9628,11 @@ static bool ggml_backend_cuda_fn_register_host_mapped(void * buffer, size_t size
     if (dev) {
         *dev = nullptr;
     }
+    if (!ggml_cuda_fn_reg_admit(size)) {
+        return false;
+    }
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly | cudaHostRegisterMapped);
+    ggml_cuda_fn_reg_done(buffer, size, err);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: %.0f MiB not registered: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
@@ -9653,6 +9839,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_oom_hook") == 0) {
         return (void *)ggml_backend_cuda_set_oom_hook;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fn_set_reg_cap") == 0) { // [TAG_FN_L23_PINFIX] R-L23-8
+        return (void *)ggml_backend_cuda_fn_set_reg_cap;
     }
     if (strcmp(name, "ggml_backend_cuda_limits") == 0) { // [TAG_FN_L3_VRAM_ACCOUNT]
         return (void *)ggml_backend_cuda_limits;

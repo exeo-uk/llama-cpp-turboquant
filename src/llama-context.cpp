@@ -4153,6 +4153,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 full_w = l20_base_ub;
             }
             keep_full = llama_fn_l20_keep_full(l20_base_ub, wide, cbuf_short, cbuf_state == CBUF_FULL, after);
+            // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+            // GENSHARE2 window while a prompt waits) leaves the FULL reserve: the answer gets the hot set's tail back (~5 GiB of
+            // experts on the GPU), as the staged stream's windows did. With pins FULL stayed through every window of a 30K
+            // prompt and the other answer read 21.8 vs 30.9 t/s (l23p sess4)
+            if (keep_full && n_outputs_all > 0 && n_outputs_all == n_tokens_all) {
+                keep_full = false;
+            }
             if (keep_full && l20_n_keep++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_L20_BIGPROMPT_UB] a %d-token part of a prompt with %d tokens after it stays FULL\n",
                         __func__, (int) n_tokens_all, (int) after);
@@ -4515,7 +4522,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t left = (int64_t) n_tokens_all - n_tokens_prev - (int64_t) ubatch.n_tokens;
             l22_last_ub = left <= 0 && l22_after >= 0 && l22_after <= (int64_t) cbuf_small_t;
             if (l22.keeplend || l22.endoverlap) {
-                llama_prefill_stream_l22_set_after(this, std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left), l22_tail);
+                // [TAG_FN_L23_PINFIX] R-L23-3: an answer-only batch (every row an output: another slot's answer steps in a
+                // GENSHARE2 window while a prompt waits) does not keep the banks (KEEPLEND): the answer decodes on the whole hot
+                // set, as the staged stream's windows did. With pins the stream kept them through every window (keeps=219) and
+                // the other answer fell from 27.5 to 17.7 t/s while a 30K prompt was read (l23p two-connection run)
+                const bool ans_only = n_outputs_all > 0 && n_outputs_all == n_tokens_all && l22_after > 0;
+                llama_prefill_stream_l22_set_after(this, ans_only ? 0 : std::max<int64_t>(0, l22_after) + std::max<int64_t>(0, left),
+                        l22_tail);
             }
         }
         // [TAG_FN_L22_XOVER] [TAG_FN_L22_UBPLAN] a prompt ubatch of a FULL period is observed (host time, the stream's record)
@@ -7692,7 +7705,7 @@ bool llama_context::l22_oom_retry(size_t need) {
     if (!llama_fn_pin_active()) {
         return false;
     }
-    const bool freed = llama_fn_pin_on_oom(need > 0 ? need : (size_t) 1 << 30);
+    const bool freed = llama_fn_pin_on_alloc_fail(need > 0 ? need : (size_t) 1 << 30); // [TAG_FN_L23_PINFIX] R-L23-5: all pins go
     llama_fn_l22_log("pin", "what=oom_retry need_mib=%.0f freed=%d", need/1048576.0, freed ? 1 : 0);
     return freed;
 }

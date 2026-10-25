@@ -232,7 +232,7 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_SSDTIER_IO", "8", false },
     { "LLAMA_FN_L22_PIN", "0", false },
     { "LLAMA_FN_L22_PIN_UNIT", "ranges", false },
-    { "LLAMA_FN_L22_PIN_MARGIN_MIB", "8192", false },
+    { "LLAMA_FN_L22_PIN_MARGIN_MIB", "16384", false },
     { "LLAMA_FN_L22_PIN_LOCAL_MARGIN_MIB", "1024", false },
     { "LLAMA_FN_L22_PIN_FLOOR_MIB", "6144", false },
     { "LLAMA_FN_L22_PIN_ARENA_MIB", "16384", false },
