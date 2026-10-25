@@ -569,12 +569,12 @@ void ggml_time_init(void) {
 int64_t ggml_time_ms(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return ((t.QuadPart-timer_start) * 1000) / timer_freq;
+    return ggml_time_ticks_scale(t.QuadPart - timer_start, timer_freq, 1000); // [TAG_UPSTREAM_30969]
 }
 int64_t ggml_time_us(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
+    return ggml_time_ticks_scale(t.QuadPart - timer_start, timer_freq, 1000000); // [TAG_UPSTREAM_30969]
 }
 #else
 void ggml_time_init(void) {}
