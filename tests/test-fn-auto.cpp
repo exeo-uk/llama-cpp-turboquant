@@ -263,6 +263,8 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L22_PAUSE_S", "8", false },
     { "LLAMA_FN_L22_SHAREKV", "1", false },
     { "LLAMA_FN_L22_DRAFT2", "0", false },
+    { "LLAMA_FN_L24_ATTACH", "1", false }, // [TAG_FN_L24_ATTACH]
+    { "LLAMA_FN_L24_ATTACH_CKPT", "0", false }, // [TAG_FN_L24_ATTACH]
     { "LLAMA_FN_L22_STAGERS", "auto", false },
     { "LLAMA_FN_L22_XOVER", "1", false },
     { "LLAMA_FN_L22_UBPLAN", "1", false },

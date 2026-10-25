@@ -180,6 +180,87 @@ static void test_park_cells() {
     TCHECK(l22_park_cells(0, 0, true) == 0, "nothing");
 }
 
+// [TAG_FN_L24_ATTACH] the donor pick
+static void test_attach() {
+    // slot 0: answering a 30,512-token prompt, checkpoints at 8192, 29,980 (the last user message) and 30,508 (tail)
+    l24_donor_view a;
+    a.id       = 0;
+    a.usable   = true;
+    a.idle     = false;
+    a.whole_ok = true;
+    a.n_tokens = 31200;
+    a.lcp      = 30020;
+    a.ckpts    = { 8192, 29980, 30508 };
+    // the task: 30,100 tokens, its slot keeps nothing
+    l24_attach_pick p = l24_attach_best({ a }, 30100, 0, 512, 256);
+    TCHECK(p.donor == 0 && p.n == 29980 && p.ckpt == 1, "busy donor: newest checkpoint within the shared part (%d %d %d)",
+           p.donor, p.n, p.ckpt);
+    // the same slot idle and the task continues all of it: the whole content
+    auto b = a;
+    b.idle     = true;
+    b.lcp      = 31200;
+    p = l24_attach_best({ b }, 31260, 0, 512, 256);
+    TCHECK(p.donor == 0 && p.n == 31200 && p.ckpt == -1, "idle donor, full continuation: whole content (%d %d)", p.n, p.ckpt);
+    // ... but not while answering (its state moves on)
+    auto c = b;
+    c.idle = false;
+    p = l24_attach_best({ c }, 31260, 0, 512, 256);
+    TCHECK(p.n == 30508 && p.ckpt == 2, "busy donor, full continuation: the newest checkpoint (%d)", p.n);
+    // nor when its memory does not end at its last token
+    c = b;
+    c.whole_ok = false;
+    p = l24_attach_best({ c }, 31260, 0, 512, 256);
+    TCHECK(p.n == 30508 && p.ckpt == 2, "memory and tokens disagree: checkpoint (%d)", p.n);
+    // the whole content needs one token of the task's own after it
+    p = l24_attach_best({ b }, 31200, 0, 512, 256);
+    TCHECK(p.n == 30508 && p.ckpt == 2, "the task is exactly the donor's tokens: checkpoint (%d)", p.n);
+    // a checkpoint at the task's last token is not usable (one token is evaluated)
+    auto d = a;
+    d.lcp   = 40000;
+    d.ckpts = { 30100 };
+    p = l24_attach_best({ d }, 30100, 0, 512, 256);
+    TCHECK(p.donor < 0, "checkpoint at n_task: none");
+    d.ckpts = { 30099 };
+    p = l24_attach_best({ d }, 30100, 0, 512, 256);
+    TCHECK(p.n == 30099, "checkpoint at n_task - 1 (%d)", p.n);
+    // thresholds: at least n_min, and gain over what the slot keeps itself
+    p = l24_attach_best({ a }, 30100, 29800, 512, 256);
+    TCHECK(p.donor < 0, "own 29,800: 180 more is under the gain");
+    p = l24_attach_best({ a }, 30100, 29700, 512, 256);
+    TCHECK(p.n == 29980, "own 29,700: 280 more (%d)", p.n);
+    auto e = a;
+    e.lcp   = 600;
+    e.ckpts = { 400 };
+    p = l24_attach_best({ e }, 30100, 0, 512, 256);
+    TCHECK(p.donor < 0, "under n_min");
+    // unusable donors (parked, the task's slot) and empty ones
+    auto f = a;
+    f.usable = false;
+    p = l24_attach_best({ f }, 30100, 0, 512, 256);
+    TCHECK(p.donor < 0, "unusable donor");
+    l24_donor_view g;
+    p = l24_attach_best({ g }, 30100, 0, 512, 256);
+    TCHECK(p.donor < 0, "empty view");
+    p = l24_attach_best({ a }, 1, 0, 0, 0);
+    TCHECK(p.donor < 0, "one-token task");
+    // the longest of two donors; on a tie the checkpoint wins over a live snapshot
+    auto h = b;    // idle, whole 31200
+    h.id = 1;
+    auto k = a;    // busy, checkpoint 31200
+    k.id    = 2;
+    k.lcp   = 31300;
+    k.ckpts = { 31200 };
+    p = l24_attach_best({ h, k }, 31300, 0, 512, 256);
+    TCHECK(p.donor == 2 && p.n == 31200 && p.ckpt == 0, "tie: checkpoint (%d %d %d)", p.donor, p.n, p.ckpt);
+    p = l24_attach_best({ k, h }, 31300, 0, 512, 256);
+    TCHECK(p.donor == 2 && p.ckpt == 0, "tie, other order: checkpoint (%d %d)", p.donor, p.ckpt);
+    auto m = a;
+    m.id  = 3;
+    m.lcp = 9000;
+    p = l24_attach_best({ m, a }, 30100, 0, 512, 256);
+    TCHECK(p.donor == 0 && p.n == 29980, "longest donor (%d %d)", p.donor, p.n);
+}
+
 // [TAG_FN_L22_DRAFT2] the joint draft rule's p_min
 static void test_draft2() {
     TCHECK(common_speculative_pmin_draft2(0.2f, 0, 2, 0.6f) == 0.2f, "position 0 never raised");
@@ -242,6 +323,7 @@ int main() {
     test_pause();
     test_sharekv();
     test_park_cells();
+    test_attach();
     test_draft2();
 
     fprintf(stderr, "test-fn-l22-two: %d checks, %d failures\n", g_checks, g_fail);
