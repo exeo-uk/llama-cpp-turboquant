@@ -99,6 +99,8 @@ const fn_item k_items[] = {
     // [TAG_FN_R25_STAGE] round 25: the stream's ring copies with plain stores into a 4 x 8 MiB ring that stays in the L3 (the
     // DMA reads it there): a staged byte crosses DRAM once instead of three times (E:/turbot-gates/flashnext/test/r25/stream)
     { "LLAMA_PREFILL_STREAM_CACHED",  "1",     P_ALL },
+    // [TAG_FN_R25_PIN] the copy workers in turn on the two CCDs (left free they stayed on the cache CCD)
+    { "LLAMA_PREFILL_STREAM_PIN",     "2",     P_ALL },
     // [TAG_FN_L3_ADOPT] lever round 3 (flashnext/int-l3): ALL-ON against the shipped default at -c 262144, turbot, MTP,
     // 2 interleaved rounds: real use +19.5 % (70.5 vs 59.0 t/s, the SHIP round without a stall; +30.7 % over both rounds); see
     // E:/turbot-gates/flashnext/test/l3/int/REPORT.md

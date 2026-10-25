@@ -48,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string> // [TAG_FN_R25_PIN]
 #include <thread>
 #include <vector>
 
@@ -206,6 +207,9 @@ struct pfs_state {
     bool           cp_pf   = false;       // LLAMA_PREFILL_STREAM_CACHED_PF: NTA prefetch of the source
     int            cp_spin = 0;           // LLAMA_PREFILL_STREAM_SPIN_US
     bool           cp_async = false;      // LLAMA_PREFILL_STREAM_ASYNC: a chunk is dispatched while the next one is copied
+    int            cp_pin   = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 0 free, 1 one core each, 2 one CCD each
+    std::vector<gen5::cpu_mask> cp_affs;  // [TAG_FN_R25_PIN] the copy workers' affinities (empty: free)
+    size_t         cp_grain = 0;          // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_GRAIN_KIB (0: fixed parts)
     int            stagers_mode  = 0;     // [TAG_FN_L22_STAGERS] 0 off, -1 auto, n >= 2 fixed
     double         stg_share     = -1.0;  // EWMA (alpha 0.5) of staged / host bytes per pass (-1: none since a pin change)
     bool           stg_pin       = false; // pins were live at the last lend
@@ -1483,6 +1487,8 @@ static void pfs_stagers_apply(pfs_state * s) {
     }
     auto np = std::make_unique<gen5::copy_pool>();
     np->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
+    np->set_affinities(s->cp_affs);                // [TAG_FN_R25_PIN]
+    np->set_grain(s->cp_grain);
     np->start(target);
     s->pool.swap(np); // the old pool's workers stop and join here (~1-3 ms)
     s->stg_restarts++;
@@ -1637,6 +1643,13 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     // [TAG_FN_R25_STAGE] LLAMA_PREFILL_STREAM_ASYNC=1: the streamer dispatches a chunk's DMA while the copy threads fill the
     // next slot (the streamer no longer copies a part itself)
     s->cp_async = gen5::env_int("LLAMA_PREFILL_STREAM_ASYNC", 0, 0, 1) != 0;
+    // [TAG_FN_R25_PIN] LLAMA_PREFILL_STREAM_PIN: 1 each copy worker on its own physical core, the cores in turn from each L3
+    // domain; 2 the workers in turn on the whole CCDs (the scheduler still moves a worker inside its CCD). Left to the
+    // scheduler the 16 copy threads ran on the cache CCD (r25 probe: 22.2 GB/s copy + DMA; one per core across both CCDs
+    // 29.6 GB/s; 32 free threads 22.6 GB/s)
+    s->cp_pin  = gen5::env_int("LLAMA_PREFILL_STREAM_PIN", 0, 0, 2);
+    s->cp_affs = gen5::copy_affinities(s->cp_pin);
+    s->cp_grain = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_GRAIN_KIB", 0, 0, 65536) << 10;
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
@@ -1840,6 +1853,8 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
 
     s->pool = std::make_unique<gen5::copy_pool>();
     s->pool->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
+    s->pool->set_affinities(s->cp_affs);                // [TAG_FN_R25_PIN]
+    s->pool->set_grain(s->cp_grain);
     s->pool->start(n_threads);
     s->n_threads_max = s->pool->size(); // [TAG_FN_L22_STAGERS]
     s->thr = std::thread(pfs_run, s);
@@ -1855,6 +1870,17 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             s->cp_tmp ? "with plain stores (the ring stays in the L3, the DMA reads it there)" : "non-temporal (through DRAM)",
             s->cp_pf ? ", source prefetch NTA" : "", s->cp_spin,
             s->cp_async ? ", a chunk's DMA is queued while the next chunk is copied" : "");
+    if (s->cp_pin > 0) { // [TAG_FN_R25_PIN]
+        std::string al;
+        for (size_t i = 0; i < s->cp_affs.size() && i < 16; ++i) {
+            char b[40];
+            snprintf(b, sizeof(b), "%s%d:0x%llx", al.empty() ? "" : ",", s->cp_affs[i].group, (unsigned long long) s->cp_affs[i].mask);
+            al += b;
+        }
+        LLAMA_LOG_INFO("prefill-stream: [TAG_FN_R25_PIN] copy workers pinned (mode %d: %s): %s\n", s->cp_pin,
+                s->cp_pin == 1 ? "one physical core each, the L3 domains in turn" : "one CCD each, in turn",
+                al.empty() ? "no topology - not pinned" : al.c_str());
+    }
     if (s->cps_mode > 0) {
         LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s\n",
                 s->cps_mode, s->cps_wait_ms, s->zexp ? ", a zero expert behind every layer in the banks" : "");

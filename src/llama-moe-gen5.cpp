@@ -9,6 +9,16 @@
 #include "llama-model.h"
 #include "llama-fn-auto.h" // [TAG_FN_SHIP1] llama_fn_env
 
+#ifdef _WIN32 // [TAG_FN_R25_PIN] the CPU topology and the copy workers' affinity
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono> // [TAG_FN_R25_STAGE]
@@ -159,11 +169,118 @@ void copy_pool::set_mode(bool temporal_, bool prefetch_, int spin_us_) {
     spin_us  = std::max(0, spin_us_);
 }
 
+void copy_pool::set_affinities(const std::vector<cpu_mask> & affs_) {
+    affs = affs_;
+}
+
+void copy_pool::set_grain(size_t bytes) {
+    grain = bytes == 0 ? 0 : std::max<size_t>(4096, bytes / 4096 * 4096);
+}
+
+static void copy_segs_part(const copy_seg * sg, int n_sg, size_t off, size_t len, bool temporal, bool prefetch);
+
+void copy_pool::copy_units(const copy_seg * segs, int n_sg, size_t n) {
+    const size_t units = (n + grain - 1) / grain;
+    for (;;) {
+        const size_t u = next_unit.fetch_add(1, std::memory_order_relaxed);
+        if (u >= units) {
+            return;
+        }
+        const size_t off = u*grain;
+        copy_segs_part(segs, n_sg, off, std::min(grain, n - off), temporal, prefetch);
+    }
+}
+
+// [TAG_FN_R25_PIN] the calling thread on the CPUs of a
+static void pin_this_thread(const cpu_mask & a) {
+#ifdef _WIN32
+    GROUP_AFFINITY ga = {};
+    ga.Group = (WORD) a.group;
+    ga.Mask  = (KAFFINITY) a.mask;
+    SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr);
+#else
+    (void) a;
+#endif
+}
+
+std::vector<cpu_mask> copy_affinities(int mode) {
+    std::vector<cpu_mask> out;
+#ifdef _WIN32
+    if (mode <= 0) {
+        return out;
+    }
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationAll, nullptr, &len);
+    if (len == 0) {
+        return out;
+    }
+    std::vector<uint8_t> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationAll, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        return out;
+    }
+    std::vector<cpu_mask> l3;    // the L3 domains
+    std::vector<cpu_mask> cores; // the physical cores
+    for (DWORD o = 0; o + 2*sizeof(DWORD) <= len; ) {
+        auto * p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + o);
+        if (p->Size == 0) {
+            break;
+        }
+        if (p->Relationship == RelationCache && p->Cache.Level == 3 && p->Cache.GroupMask.Mask != 0) {
+            l3.push_back({ (int) p->Cache.GroupMask.Group, (uint64_t) p->Cache.GroupMask.Mask });
+        } else if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 && p->Processor.GroupMask[0].Mask != 0) {
+            cores.push_back({ (int) p->Processor.GroupMask[0].Group, (uint64_t) p->Processor.GroupMask[0].Mask });
+        }
+        o += p->Size;
+    }
+    if (mode == 2) {
+        return l3.size() >= 2 ? l3 : out; // one domain: nothing to spread, the scheduler as before
+    }
+    const size_t n_dom = std::max<size_t>(1, l3.size());
+    std::vector<std::vector<cpu_mask>> by_dom(n_dom);
+    for (const auto & c : cores) {
+        int last = 63;
+        while (last > 0 && !(c.mask & ((uint64_t) 1 << last))) {
+            --last;
+        }
+        size_t dom = 0;
+        for (size_t d = 0; d < l3.size(); ++d) {
+            if (l3[d].group == c.group && (l3[d].mask & c.mask) != 0) {
+                dom = d;
+                break;
+            }
+        }
+        by_dom[dom].push_back({ c.group, (uint64_t) 1 << last });
+    }
+    for (size_t i = 0; ; ++i) { // in turn from each domain
+        bool any = false;
+        for (const auto & d : by_dom) {
+            if (i < d.size()) {
+                out.push_back(d[i]);
+                any = true;
+            }
+        }
+        if (!any) {
+            break;
+        }
+    }
+#else
+    (void) mode;
+#endif
+    return out;
+}
+
 void copy_pool::start(int n_threads) {
     stop();
     quit.store(false, std::memory_order_relaxed);
     for (int i = 1; i < n_threads; ++i) {
-        workers.emplace_back([this, i]() { llama_fn_thread_name("gen5-copy", i); run(i); }); // [TAG_FN_L18_FIRSTANS_STALL] name
+        const cpu_mask a = affs.empty() ? cpu_mask() : affs[(size_t) (i - 1) % affs.size()]; // [TAG_FN_R25_PIN]
+        workers.emplace_back([this, i, a]() {
+            llama_fn_thread_name("gen5-copy", i); // [TAG_FN_L18_FIRSTANS_STALL] name
+            if (a.mask != 0) {
+                pin_this_thread(a);
+            }
+            run(i);
+        });
     }
 }
 
@@ -338,10 +455,14 @@ void copy_pool::run(int idx) {
             base  = job_base;
             parts = job_parts;
         }
-        size_t off, len;
-        part_range(n, idx - base, parts, off, len);
-        if (len > 0) {
-            copy_segs_part(sg, n_sg, off, len, temporal, prefetch);
+        if (grain > 0) {
+            copy_units(sg, n_sg, n); // [TAG_FN_R25_PIN]
+        } else {
+            size_t off, len;
+            part_range(n, idx - base, parts, off, len);
+            if (len > 0) {
+                copy_segs_part(sg, n_sg, off, len, temporal, prefetch);
+            }
         }
         // the caller reads 0 under mtx before it sleeps, and the last worker notifies under mtx: no lost wakeup
         if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -373,14 +494,19 @@ void copy_pool::copy_list(const copy_seg * segs, int n_sg) {
         n_bytes   = n;
         job_base  = 0;
         job_parts = parts;
+        next_unit.store(0, std::memory_order_relaxed);
         pending.store(parts - 1, std::memory_order_relaxed);
         gen.fetch_add(1, std::memory_order_release);
     }
     cv_go.notify_all();
-    size_t off, len;
-    part_range(n, 0, parts, off, len);
-    if (len > 0) {
-        copy_segs_part(segs, n_sg, off, len, temporal, prefetch);
+    if (grain > 0) {
+        copy_units(segs, n_sg, n); // [TAG_FN_R25_PIN]
+    } else {
+        size_t off, len;
+        part_range(n, 0, parts, off, len);
+        if (len > 0) {
+            copy_segs_part(segs, n_sg, off, len, temporal, prefetch);
+        }
     }
     wait();
 }
@@ -403,6 +529,7 @@ void copy_pool::submit(const copy_seg * segs, int n_sg) {
         n_bytes   = n;
         job_base  = 1;
         job_parts = parts;
+        next_unit.store(0, std::memory_order_relaxed);
         pending.store(parts, std::memory_order_relaxed);
         gen.fetch_add(1, std::memory_order_release);
     }

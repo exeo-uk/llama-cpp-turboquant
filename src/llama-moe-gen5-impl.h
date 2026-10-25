@@ -65,6 +65,17 @@ void ev_sync(ggml_backend_event_t ev, ggml_backend_t src);
 // llama-moe-dma.cpp: LLAMA_MOE_DMA_SHARE or LLAMA_MOE_PREFETCH is set
 bool dma_requested();
 
+// [TAG_FN_R25_PIN] an affinity: a processor group and a mask of its logical CPUs
+struct cpu_mask {
+    int      group = 0;
+    uint64_t mask  = 0;
+};
+// [TAG_FN_R25_PIN] the copy workers' affinities, taken in turn by the workers. mode 1: one logical CPU per physical core (the
+// core's last one: the SMT sibling a --cpu-mask 0x5555... leaves free), the cores in turn from each L3 domain; mode 2: the
+// whole L3 domains (the CCDs) in turn, so that both CCDs' fabric links carry the copies while the scheduler still moves a
+// worker inside its CCD. Empty when the topology cannot be read (or not on Windows) or mode 0
+std::vector<cpu_mask> copy_affinities(int mode);
+
 // a memcpy split over worker threads; copy() blocks until every part is done
 struct copy_seg {
     uint8_t *       dst;
@@ -80,6 +91,11 @@ public:
     // prefetch: the source lines with the NTA hint (they pass the caches without pushing the ring out); spin_us: the workers
     // and the caller poll this long for the next job / the last part before they sleep (0: sleep at once, as before)
     void set_mode(bool temporal, bool prefetch, int spin_us);
+    // [TAG_FN_R25_PIN] call before start(): worker i runs on affs[(i - 1) % size]; the caller keeps its affinity. Empty: none
+    void set_affinities(const std::vector<cpu_mask> & affs);
+    // [TAG_FN_R25_PIN] call before start(): > 0 the threads take units of this many bytes from a shared counter instead of a
+    // fixed part each (a worker that the scheduler stops holds one unit, not 1/n of the chunk); 0: fixed parts (as before)
+    void set_grain(size_t bytes);
     void start(int n_threads);
     void stop();
     void copy(void * dst, const void * src, size_t n);
@@ -112,6 +128,10 @@ private:
     bool                     temporal = false; // [TAG_FN_R25_STAGE]
     bool                     prefetch = false;
     int                      spin_us  = 0;
+    std::vector<cpu_mask>    affs;             // [TAG_FN_R25_PIN]
+    size_t                   grain = 0;        // [TAG_FN_R25_PIN] 0: fixed parts
+    std::atomic<size_t>      next_unit{0};     // the next unit of the job (grain > 0)
+    void copy_units(const copy_seg * segs, int n_sg, size_t n);
 };
 
 } // namespace gen5

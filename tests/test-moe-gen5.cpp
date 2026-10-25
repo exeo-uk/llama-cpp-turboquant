@@ -63,6 +63,7 @@ static const char * k_env[] = {
     "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_STATS",
     "LLAMA_PREFILL_STREAM_CACHED", "LLAMA_PREFILL_STREAM_CACHED_RING_MIB", "LLAMA_PREFILL_STREAM_CACHED_CHUNK_MIB", // [TAG_FN_R25_STAGE]
     "LLAMA_PREFILL_STREAM_CACHED_PF", "LLAMA_PREFILL_STREAM_SPIN_US", "LLAMA_PREFILL_STREAM_ASYNC",
+    "LLAMA_PREFILL_STREAM_PIN", "LLAMA_PREFILL_STREAM_GRAIN_KIB", // [TAG_FN_R25_PIN]
 };
 
 static void reset_env() {
@@ -774,6 +775,12 @@ static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cache
     }
     if (cached >= 3) {
         set_env("LLAMA_PREFILL_STREAM_ASYNC", "1");
+    }
+    if (cached == 2 || cached == 3) {
+        set_env("LLAMA_PREFILL_STREAM_PIN", cached == 2 ? "1" : "2"); // [TAG_FN_R25_PIN] pinned copy workers (same bytes)
+    }
+    if (cached == 3 || cached == 4) {
+        set_env("LLAMA_PREFILL_STREAM_GRAIN_KIB", "64"); // [TAG_FN_R25_PIN] units from a shared counter
     }
     char name[80];
     snprintf(name, sizeof(name), "pfs bufs %d wrap %d%s%s", n_bufs, wrap ? 1 : 0, partial ? " partial" : "",
