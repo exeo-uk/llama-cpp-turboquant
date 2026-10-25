@@ -1618,7 +1618,14 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     const uint64_t test_local = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_TEST_LOCAL_MIB", 0);
     st->watch_local = test_local > 0 ? test_local
                                      : std::min<uint64_t>(st->reserve_need, st->l_ready > 2*tol ? st->l_ready - 2*tol : 0);
-    const uint64_t allow = fn_pin::plan_bytes(b, st->cfg);
+    // [TAG_FN_L23_PINFIX] R-L23-8: in mapped mode the cap stops the registration (RULE_MAX), not the plan. The fully streamed
+    // layers come first in the plan but are read by direct I/O, so their mapped pages are not resident and get skipped; the
+    // next groups fill the cap (l23p st12_1: the capped plan held only those 15 layers, 0 GiB pinned)
+    fn_pin::budget_cfg c_plan = st->cfg;
+    if (st->unit != 2) {
+        c_plan.max_pin = 0;
+    }
+    const uint64_t allow = fn_pin::plan_bytes(b, c_plan);
     st->n_take = fn_pin::plan_take(st->plan, st->unit == 2 ? std::min(allow, st->arena_max) : allow);
     st->gst.assign(st->plan.groups.size(), {});
     uint64_t planned = 0;
