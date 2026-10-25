@@ -3162,8 +3162,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // these archs are denied -sm tensor (llm_arch_supports_sm_tensor).
     // TODO (upstream): only when the backend does not support ggml_prec_set_src(experts, GGML_PREC_BF16, 1)
     //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
+    // LLAMA_MOE_AMAX=0: no rescale (speed A/B only: src1 values above the F16 range then overflow in the Q8_1 blocks)
+    static const bool amax_on = [] { const char * e = getenv("LLAMA_MOE_AMAX"); return e == nullptr || atoi(e) != 0; }();
     llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
-    if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT) {
+    if (amax_on && (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT)) {
         amax_src1 = build_amax_src1_f16(cur);
         cur = amax_src1.res;
     }
