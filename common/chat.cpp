@@ -1362,6 +1362,21 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                 auto_params.thinking_end_tags = {std::move(end_tag)};
             }
         }
+        // [TAG_FLINT_TOOL_RESCUE] upstream issue #31000 (Flint): the model writes a tool call inside <think> without
+        // closing it, then stops on <|observation|> (EOG); the lazy grammar never triggers inside reasoning, so the turn
+        // ended as reasoning only. The final parse retries with </think> inserted before the tool-call start (see
+        // common_chat_peg_parse). Only the Flint template by default, so no other model's parsing changes
+        {
+            const char * env = getenv("LLAMA_TOOL_RESCUE");
+            const int    mode = env ? atoi(env) : -1; // -1: Flint only, 0: off, 1: every autoparser template
+            const bool   on   = mode == 1 || (mode < 0 && src.find("flint_text") != std::string::npos);
+            const std::string & marker = !autoparser.tools.format.section_start.empty() ?
+                autoparser.tools.format.section_start : autoparser.tools.format.per_call_start;
+            if (on && !auto_params.thinking_end_tags.empty() && params.tools.is_array() && !params.tools.empty() &&
+                !trim_whitespace(marker).empty()) {
+                auto_params.tool_rescue_marker = trim_whitespace(marker);
+            }
+        }
         common_peg_arena arena;
         arena.load(auto_params.parser);
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
@@ -1530,6 +1545,40 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
         fflush(stderr);
+    }
+
+    // [TAG_FLINT_TOOL_RESCUE] upstream issue #31000: the final message is reasoning only, the reasoning never closed and
+    // it holds the tool-call start: parse again with the end tag inserted before the first tool-call start, strictly (not
+    // lenient: the call must be complete and nothing but tool calls may follow), and keep that result only if it has
+    // tool calls. Streaming already sent the call text as reasoning; the final message then carries the tool call
+    if (!is_partial && params.parse_tool_calls && !params.tool_rescue_marker.empty() && !params.tool_rescue_end.empty() &&
+        msg.tool_calls.empty() && msg.content.empty() && !msg.reasoning_content.empty() &&
+        input.find(params.tool_rescue_end) == std::string::npos) {
+        const size_t pos = input.find(params.tool_rescue_marker);
+        if (pos != std::string::npos) {
+            const std::string rescued = params.generation_prompt +
+                input.substr(0, pos) + params.tool_rescue_end + input.substr(pos);
+            common_peg_parse_context ctx2(rescued, params.debug ? COMMON_PEG_PARSE_FLAG_DEBUG : COMMON_PEG_PARSE_FLAG_NONE);
+            auto result2 = parser.parse(ctx2);
+            if (result2.success()) {
+                common_chat_msg msg2;
+                msg2.role = "assistant";
+                std::unique_ptr<common_chat_peg_mapper> mapper2;
+                if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
+                    mapper2 = std::make_unique<common_chat_peg_gemma4_mapper>(msg2);
+                } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
+                    mapper2 = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg2);
+                } else {
+                    mapper2 = std::make_unique<common_chat_peg_mapper>(msg2);
+                }
+                mapper2->from_ast(ctx2.ast, result2);
+                if (!msg2.tool_calls.empty()) {
+                    LOG_WRN("%s: [TAG_FLINT_TOOL_RESCUE] %zu tool call(s) written inside unclosed reasoning, returned as tool calls\n",
+                            __func__, msg2.tool_calls.size());
+                    msg = std::move(msg2);
+                }
+            }
+        }
     }
 
     if (!is_partial) {

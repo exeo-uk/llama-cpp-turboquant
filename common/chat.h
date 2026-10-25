@@ -280,6 +280,10 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+    // [TAG_FLINT_TOOL_RESCUE] upstream issue #31000: a final parse whose reasoning never closed and holds a complete tool
+    // call is parsed again with the reasoning end tag inserted before this marker (the tool-call start). Empty = off;
+    // set for the Flint template only (LLAMA_TOOL_RESCUE=0 turns it off, =1 on for every autoparser template)
+    std::string                         tool_rescue_marker;
 };
 
 // per-message parsing syntax
@@ -295,10 +299,16 @@ struct common_chat_parser_params {
     bool                    echo                 = false;  // Include assistant prefilled msg in output
     bool                    debug                = false;  // Enable debug output for PEG parser
     common_peg_arena        parser               = {};
+    std::string             tool_rescue_marker;   // [TAG_FLINT_TOOL_RESCUE] see common_chat_params, empty = off
+    std::string             tool_rescue_end;      // the reasoning end tag inserted before the marker
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;
         generation_prompt = chat_params.generation_prompt;
+        if (!chat_params.tool_rescue_marker.empty() && !chat_params.thinking_end_tags.empty()) {
+            tool_rescue_marker = chat_params.tool_rescue_marker;
+            tool_rescue_end    = chat_params.thinking_end_tags.front();
+        }
     }
 };
 

@@ -1556,6 +1556,11 @@ json oaicompat_chat_params_parse(
     if (!chat_params.parser.empty()) {
         llama_params["chat_parser"] = chat_params.parser;
     }
+    // [TAG_FLINT_TOOL_RESCUE] see common_chat_params::tool_rescue_marker
+    if (!chat_params.tool_rescue_marker.empty() && !chat_params.thinking_end_tags.empty()) {
+        llama_params["tool_rescue_marker"] = chat_params.tool_rescue_marker;
+        llama_params["tool_rescue_end"]    = chat_params.thinking_end_tags.front();
+    }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 

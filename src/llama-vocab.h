@@ -69,6 +69,8 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA          = 59,
     LLAMA_VOCAB_PRE_TYPE_MMBERT            = 60,
+    // 61 = upstream LLAMA_VOCAB_PRE_TYPE_K2_HORIZON (not ported); the number is internal, the GGUF stores the name
+    LLAMA_VOCAB_PRE_TYPE_FLINT             = 62,
 };
 
 struct LLM_KV;

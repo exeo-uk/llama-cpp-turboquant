@@ -1901,6 +1901,47 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// [TAG_UPSTREAM_30861] [TAG_MOE_AMAX_SCALE] per expert token power-of-two rescale of a MUL_MAT_ID src1 (used by the MoE
+// down projection of the archs listed in build_moe_ffn only): the CUDA MMQ path quantizes src1 into Q8_1 blocks with F16
+// scales/sums, which overflow for activations above the F16 range. The factor is an exact power of two, so the
+// matmul result is the same as the unscaled one wherever that one did not overflow.
+llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
+          ggml_tensor * cur) const {
+    llm_graph_amax_src1 result = {
+        /*.res     =*/ cur,
+        /*.scale_s =*/ nullptr,
+    };
+
+    const int64_t n_embd = cur->ne[0];
+
+    // amax = max|cur| along the rows for each [expert, token] -> [1, n_expert, n_tokens]
+    ggml_tensor * ab = ggml_abs(ctx0, cur);
+    ggml_tensor * amax = ggml_pool_1d(ctx0, ab, GGML_OP_POOL_MAX, n_embd, n_embd, 0);
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/26223
+    constexpr float k_log2_e = 1.4426950408889634f; // 1 / ln(2)
+    constexpr float k_ln_2   = 0.6931471805599453f;
+
+    ggml_tensor * e;
+    // note: this can technically be:
+    // e = ggml_scale(ctx0, amax, 1.0f/32768.0f);
+    // but we leave x32 headroom for the F16 sums of 32 values in Q8 activation blocks
+    e = ggml_scale(ctx0, amax, 1.0f/1024.0f);
+    e = ggml_log  (ctx0, e);
+    e = ggml_scale(ctx0, e, k_log2_e);
+    e = ggml_ceil (ctx0, e);
+    e = ggml_clamp(ctx0, e, 0.0f, 127.0f);
+    e = ggml_scale(ctx0, e, k_ln_2);
+    e = ggml_exp  (ctx0, e);
+
+    result = {
+        /*.res     =*/ ggml_div(ctx0, cur, e),
+        /*.scale_s =*/ e,
+    };
+
+    return result;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -3114,13 +3155,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    // [TAG_UPSTREAM_30861] [TAG_MOE_AMAX_SCALE] src1 of the down projection can exceed the F16 range for these archs:
+    // rescale it per expert token by a power of two and undo that on the result (replaces the PREC_F32 src1 of
+    // MISTRAL4, which CUDA does not support for MUL_MAT_ID, so that matmul ran on the CPU). Only the listed archs get the
+    // extra ops; every other graph (qwen4exp, qwen35, ...) is unchanged. The amax op cannot be split across devices, so
+    // these archs are denied -sm tensor (llm_arch_supports_sm_tensor).
+    // TODO (upstream): only when the backend does not support ggml_prec_set_src(experts, GGML_PREC_BF16, 1)
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
+    // LLAMA_MOE_AMAX=0: no rescale (speed A/B only: src1 values above the F16 range then overflow in the Q8_1 blocks)
+    static const bool amax_on = [] { const char * e = getenv("LLAMA_MOE_AMAX"); return e == nullptr || atoi(e) != 0; }();
+    llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
+    if (amax_on && (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT)) {
+        amax_src1 = build_amax_src1_f16(cur);
+        cur = amax_src1.res;
+    }
+
     pin_cs_dev(cur); // [TAG_FN_L22_CPUSHARE] the activation
     experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     pin_cs_dev(experts); // [TAG_FN_L22_CPUSHARE]
-    if (arch == LLM_ARCH_MISTRAL4) {
-        // src1 can exceed F16 range
-        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
-    }
     cb(experts, "ffn_moe_down", il);
 
     // [TAG_FN_PREFILL_STREAM] the bank of this layer may be refilled once its down projection is done
@@ -3133,6 +3185,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     set_skip(experts);
+
+    // [TAG_UPSTREAM_30861] undo the src1 rescale: after set_skip (its skip table belongs on the MUL_MAT_ID node) and
+    // before the hot-set / DMA adds below (those chains run their own down projection on the unscaled activation)
+    if (amax_src1.scale_s) {
+        experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
+        cb(experts, "ffn_moe_down_unscaled", il);
+    }
 
     // [TAG_MOE_DMA_SHARE] the fence closes the CPU split: the bank chain below runs after the copies have landed
     if (mdma) {

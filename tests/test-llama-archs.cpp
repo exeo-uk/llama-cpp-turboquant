@@ -289,13 +289,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
-            arch == LLM_ARCH_MAPLE) {
+            arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_FLINT) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             pattern.push_back(il % 2);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+        if (arch == LLM_ARCH_FLINT) {
+            ms.add_kv(LLM_KV_ATTENTION_ROPE_PATTERN, pattern);
+        }
     } else {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
@@ -426,6 +429,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+        if (arch == LLM_ARCH_FLINT) {
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, true);
+        }
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -587,6 +593,7 @@ static bool check_causal_attn_toggle(
 
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_FLINT:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_GROK:
