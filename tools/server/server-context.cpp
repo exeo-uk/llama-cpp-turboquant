@@ -2321,8 +2321,8 @@ private:
         llama_token tok_think = LLAMA_TOKEN_NULL; // </think>: one right after it
         llama_token tok_tool  = LLAMA_TOKEN_NULL; // <tool_call>: one right before it (or right after, when a draft held it)
         bool        opfair    = false;            // LLAMA_FN_L24_OPFAIR: ONEPROMPT keeps the prompt in progress (2+ slots)
-        int32_t     op_near   = 16384;            // _NEAR: a rest of at most this many text tokens finishes first
-        double      op_frac   = 0.75;             // _FRAC: a prompt this far done finishes first
+        int32_t     op_near   = 0;                // _NEAR: a rest of at most this many text tokens finishes first (0: off)
+        double      op_frac   = 1.0;              // _FRAC: a prompt this far done finishes first (1: off)
         bool        gscap     = false;            // LLAMA_FN_L24_GSCAP: the GENSHARE2 window cap follows the pass's rows
         int32_t     gs_tail   = 64;               // _TAIL: no window while a prompt has at most this many rows left
     } l24;
@@ -3581,16 +3581,18 @@ private:
         }
         if (slots.size() >= 2 && l22two.one) {
             l24.opfair  = num("LLAMA_FN_L24_OPFAIR", 0.0) != 0.0;
-            l24.op_near = (int32_t) std::clamp(num("LLAMA_FN_L24_OPFAIR_NEAR", 16384.0), 0.0, 1e9);
-            l24.op_frac = std::clamp(num("LLAMA_FN_L24_OPFAIR_FRAC", 0.75), 0.0, 1.0);
+            // shortest remaining first (main session 10-25: the short request matters more than the prompt in progress)
+            l24.op_near = (int32_t) std::clamp(num("LLAMA_FN_L24_OPFAIR_NEAR", 0.0), 0.0, 1e9);
+            l24.op_frac = std::clamp(num("LLAMA_FN_L24_OPFAIR_FRAC", 1.0), 0.0, 1.0);
         }
         if (slots.size() >= 2 && l22two.gs2 > 0) {
             l24.gscap   = num("LLAMA_FN_L24_GSCAP", 0.0) != 0.0;
             l24.gs_tail = (int32_t) std::clamp(num("LLAMA_FN_L24_GSCAP_TAIL", 64.0), 0.0, 1e6);
         }
         if (l24.opfair || l24.gscap) {
-            SRV_INF("[TAG_FN_L24] two-connection rules: [TAG_FN_L24_OPFAIR] %d (a prompt in progress finishes when <= %d text tokens "
-                    "left or %.0f %% is done, and gives way at most once per request), [TAG_FN_L24_GSCAP] %d (no window before a "
+            SRV_INF("[TAG_FN_L24] two-connection rules: [TAG_FN_L24_OPFAIR] %d (shortest remaining first, a prompt gives way at most "
+                    "once per request and keeps the batch after; near-end exception: <= %d text tokens "
+                    "left or %.0f %% done), [TAG_FN_L24_GSCAP] %d (no window before a "
                     "prompt tail of <= %d rows)\n", (int) l24.opfair, l24.op_near, l24.op_frac * 100.0, (int) l24.gscap, l24.gs_tail);
         }
     }

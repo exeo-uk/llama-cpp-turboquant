@@ -65,9 +65,10 @@ static inline bool l24_prompt_near_end(int32_t left, int32_t turn_rows, bool med
 }
 
 // The visit order with the prompt in progress kept (owner 10-24: a new prompt took the batch from one with 15.5K left,
-// which then waited ~45 s). The claimer goes first unless it may be pre-empted: not near its end, it never gave way in
-// this request, and a challenger has fewer tokens left. Without a claimer, a slot that gave way goes first, then the
-// fewest tokens left (l22_oneprompt_order with n_force 1). Every slot of c is in the result once.
+// which then waited ~45 s). Shortest remaining first, with limits: the claimer goes first unless a challenger has fewer
+// tokens left, the claimer never gave way in this request and is not near its end (the near-end rule is off by default:
+// the short request matters more). The pre-emptor then keeps the batch (no ping-pong). Without a claimer, a slot that
+// gave way goes first, then the fewest tokens left (l22_oneprompt_order with n_force 1). Every slot of c is in the result once.
 static inline std::vector<int> l24_oneprompt_order(const std::vector<l24_prompt_cand> & c) {
     std::vector<l22_prompt_cand> base;
     for (const auto & x : c) {

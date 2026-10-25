@@ -340,7 +340,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_QSA_SHAREPFX",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SHAREPFX] R-P13-4 (exact)
     { "LLAMA_FN_L22_TBO",                   "0",       P_ALL }, // D5 [TAG_FN_L22_TBO] two-chain decode (kld; 2 active sequences only), R-D5-6: opt-in (owner 10-18)
     { "LLAMA_FN_L24_GENCKPT",               "1",       P_ALL }, // [TAG_FN_L24_GENCKPT] checkpoints inside long answers (exact: state copies)
-    { "LLAMA_FN_L24_OPFAIR",                "1",       P_ALL }, // [TAG_FN_L24_OPFAIR] ONEPROMPT keeps the prompt in progress (2+ slots)
+    { "LLAMA_FN_L24_OPFAIR",                "1",       P_ALL }, // [TAG_FN_L24_OPFAIR] ONEPROMPT shortest remaining first, a prompt gives way at most once per request (2+ slots)
     { "LLAMA_FN_L24_GSCAP",                 "1",       P_ALL }, // [TAG_FN_L24_GSCAP] GENSHARE2 window cap per row fraction (2+ slots)
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
