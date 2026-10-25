@@ -626,6 +626,9 @@ private:
     bool     l22_end_pending = false;
     int      l22_first_n     = 0;    // decode calls still counted after a prompt's switch (first 8)
     int64_t  l22_first_t0    = 0;
+    // [TAG_FN_R25_REFILL] the parts of the last switch to SMALL (ms): stream return + unlend, compute free, pool trim, tail
+    // restore, borrow return, reserve / swap
+    double   r25_sw_ms[6]    = { 0, 0, 0, 0, 0, 0 };
     // [TAG_FN_L22_PASSLOG] one record per prompt (FULL period, or a short-path batch); P10 reads l22_rec / l22_rec_seq
     struct l22_pass_rec {
         uint64_t rows = 0, batches = 0, ubatches = 0;

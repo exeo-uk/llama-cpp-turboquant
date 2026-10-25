@@ -7300,12 +7300,14 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
         const bool async = l22.endoverlap && l22_end_pending;
         l22_end_pending  = false;
         l22_class        = 0; // [TAG_FN_L22_LENDCLASS]
+        const int64_t t_r25 = ggml_time_us(); // [TAG_FN_R25_REFILL]
         if (async) {
             llama_prefill_stream_l22_async_return(this, true);
         }
         // the stream's banks come back while FULL is still there (no VRAM moves), then FULL goes, then the tail returns
         llama_moe_gen5_before_ubatch(this, sched.get(), 0);
         llama_prefill_stream_l22_async_return(this, false);
+        r25_sw_ms[0] = (ggml_time_us() - t_r25)/1000.0;
         if (!cbuf_to_small(dev, trimmed, restored, async)) {
             return false;
         }
@@ -7335,6 +7337,12 @@ bool llama_context::cbuf_set(bool full, uint32_t width, uint32_t cls) {
                 c1.avail_ram/MiB, cbuf_full_t, l22p_est_base, l22p_est_big, (long long) l22p_rows_plan, l22p_why, l22p_big_ms,
                 l22p_stream_min() == INT32_MAX ? 0 : l22p_stream_min(), l22p.smallkeep > 0 ? l22_sk_last : 0,
                 l22p.smallkeep > 0 ? l22_sk_why : "off", (full && l22_sk_parked ? l22_sk_bytes : 0)/MiB);
+        if (!full) {
+            // [TAG_FN_R25_REFILL] where the switch's time went
+            llama_fn_l22_log("switch", "what=small_parts ret_ms=%.1f free_ms=%.1f trim_ms=%.1f restore_ms=%.1f unborrow_ms=%.1f "
+                    "reserve_ms=%.1f", r25_sw_ms[0], r25_sw_ms[1], r25_sw_ms[2], r25_sw_ms[3], r25_sw_ms[4], r25_sw_ms[5]);
+            r25_sw_ms[0] = 0.0;
+        }
         if (full) {
             l22_rec_begin();
             l22_rec_cur.full_ms = ms;
@@ -7396,11 +7404,21 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
     } else if (sk_keep) {
         l22_sk_why = "swap";
     }
+    int64_t t_r25 = ggml_time_us(); // [TAG_FN_R25_REFILL] the parts of the switch
+    auto r25_part = [&](int i) {
+        const int64_t t = ggml_time_us();
+        r25_sw_ms[i] = (t - t_r25)/1000.0;
+        t_r25 = t;
+    };
+    for (int i = 1; i < 6; ++i) {
+        r25_sw_ms[i] = 0.0;
+    }
     if (sk_keep) {
         l22_sk_free_full();
     } else {
         cbuf_free_compute();
     }
+    r25_part(1);
     if (cbuf_trim) {
         // [TAG_FN_L3_VRAM_TRIM] the temporaries of the prompt's kernels: the decode needs a fraction of them
         for (auto & backend : backends) {
@@ -7415,8 +7433,10 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
             }
         }
     }
+    r25_part(2);
     // [TAG_FN_L22_ENDOVERLAP] async_refill: the tail's residents through the upload worker (LLAMA_FN_CBUF_ASYNC's path)
     restored = async_refill ? llama_moe_hot_cbuf_restore_ex(this, true) : llama_moe_hot_cbuf_restore(this);
+    r25_part(3);
     if (l21_extra > 0) {
         const int64_t t_ub = ggml_time_us();
         llama_moe_hot_cb_unborrow(this); // [TAG_FN_L21_BIGUB] after the tail: mapped, cleared, its residents queued
@@ -7424,12 +7444,15 @@ bool llama_context::cbuf_to_small(ggml_backend_dev_t dev, size_t & trimmed, bool
             l22p_big_ms += (ggml_time_us() - t_ub)/1000.0; // [TAG_FN_L22_UBPLAN]
         }
     }
+    r25_part(4);
     if (sk_keep) {
         l22_sk_swap_in(restored); // [TAG_FN_L22_SMALLKEEP] no SMALL reserve
+        r25_part(5);
         return true;
     }
     try {
         sched_reserve();
+        r25_part(5);
         return true;
     } catch (const std::exception & err) {
         // the tail took VRAM the SMALL reserve needs (another process grew): give it back, its layers sit out
