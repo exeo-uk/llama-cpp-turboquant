@@ -1346,6 +1346,9 @@ struct server_slot {
     // [TAG_FN_L22_ONEPROMPT] the claimers this slot's prompt gave way to (once per claiming task), and the last one
     int32_t l22_n_yield    = 0;
     int     l22_yield_task = -1;
+    // [TAG_FN_L24_GENCKPT] the answer tokens scanned for </think> / <tool_call>, and the markers seen
+    int64_t l24_scan = 0;
+    int     l24_mark = 0;
     // [TAG_FN_L22_PAUSE] the answer is left out of batches until this time (0 = not paused) or until task
     // l22_pause_by_task ends; pending = paused from the next step on that has no rows of this slot in flight
     int64_t l22_pause_until_us = 0;
@@ -1486,6 +1489,8 @@ struct server_slot {
         // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] per request (l22_kv_shared describes the memory: prompt_clear)
         l22_n_yield        = 0;
         l22_yield_task     = -1;
+        l24_scan           = 0; // [TAG_FN_L24_GENCKPT]
+        l24_mark           = 0;
         l22_pause_until_us = 0;
         l22_pause_t0_us    = 0;
         l22_pause_by_task  = -1;
@@ -2307,6 +2312,21 @@ private:
     // [TAG_FN_L22_ONEPROMPT] the task that claimed the last prompt batch (for the log line on a change)
     int     l22_last_claim = -1;
 
+    // [TAG_FN_L24] round 24 switches, read once per model load by l24_init() (llama_model_fn_env; qwen4exp profile: on)
+    struct l24_cfg_t {
+        bool        genckpt   = false;            // LLAMA_FN_L24_GENCKPT: context checkpoints inside long answers
+        int32_t     gc_every  = 2048;             // _EVERY: one per this many answer tokens
+        int32_t     gc_gap    = 256;              // _GAP: none closer than this to the newest checkpoint
+        int32_t     gc_ram    = 2;                // _RAM: answer checkpoints of one request in the ring (older ones go to disk)
+        llama_token tok_think = LLAMA_TOKEN_NULL; // </think>: one right after it
+        llama_token tok_tool  = LLAMA_TOKEN_NULL; // <tool_call>: one right before it (or right after, when a draft held it)
+        bool        opfair    = false;            // LLAMA_FN_L24_OPFAIR: ONEPROMPT keeps the prompt in progress (2+ slots)
+        int32_t     op_near   = 16384;            // _NEAR: a rest of at most this many text tokens finishes first
+        double      op_frac   = 0.75;             // _FRAC: a prompt this far done finishes first
+        bool        gscap     = false;            // LLAMA_FN_L24_GSCAP: the GENSHARE2 window cap follows the pass's rows
+    } l24;
+    int l24_claim_task = -1; // [TAG_FN_L24_OPFAIR] the task that claimed the last prompt batch
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -2939,6 +2959,7 @@ private:
 
         keepctx_init(); // [TAG_FN_L18_KEEPCTX] after the prompt cache: it stays off beside one
         l22two_init();  // [TAG_FN_L22] P9: after the slots and the prompt cache
+        l24_init();     // [TAG_FN_L24]
         if (const char * e = llama_model_fn_env(model_tgt, "LLAMA_FN_L19_TTFT_CKPT_TAIL"); e && *e) { // [TAG_FN_L19_TTFT_CKPT]
             ckpt_tail_min = std::max<long long>(0, strtoll(e, nullptr, 10));
             SRV_WRN("[TAG_FN_L19_TTFT_CKPT] a prompt batch of >= %lld tokens leaves its last 4 tokens to their own batch with a "
@@ -3532,6 +3553,46 @@ private:
         }
     }
 
+    // [TAG_FN_L24] round 24's switches (l24_cfg_t)
+    void l24_init() {
+        l24            = l24_cfg_t();
+        l24_claim_task = -1;
+        auto num = [&](const char * name, double def) {
+            const char * e = llama_model_fn_env(model_tgt, name);
+            return e && *e ? atof(e) : def;
+        };
+        // a marker counts only when it is one token
+        auto one_tok = [&](const char * text) {
+            const llama_tokens t = common_tokenize(vocab, text, false, true);
+            return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+        };
+        const bool fixed = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        l24.genckpt = num("LLAMA_FN_L24_GENCKPT", 0.0) != 0.0 && params_base.n_ctx_checkpoints > 0 && fixed;
+        if (l24.genckpt) {
+            l24.gc_every  = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_EVERY", 2048.0), 0.0, 1e9);
+            l24.gc_gap    = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_GAP", 256.0), 1.0, 1e9);
+            l24.gc_ram    = (int32_t) std::clamp(num("LLAMA_FN_L24_GENCKPT_RAM", 2.0), 1.0, 64.0);
+            l24.tok_think = one_tok("</think>");
+            l24.tok_tool  = one_tok("<tool_call>");
+            SRV_INF("[TAG_FN_L24_GENCKPT] checkpoints inside answers: every %d tokens%s%s, at least %d apart, %d per answer in the ring\n",
+                    l24.gc_every, l24.tok_think != LLAMA_TOKEN_NULL ? ", after </think>" : "",
+                    l24.tok_tool != LLAMA_TOKEN_NULL ? ", before <tool_call>" : "", l24.gc_gap, l24.gc_ram);
+        }
+        if (slots.size() >= 2 && l22two.one) {
+            l24.opfair  = num("LLAMA_FN_L24_OPFAIR", 0.0) != 0.0;
+            l24.op_near = (int32_t) std::clamp(num("LLAMA_FN_L24_OPFAIR_NEAR", 16384.0), 0.0, 1e9);
+            l24.op_frac = std::clamp(num("LLAMA_FN_L24_OPFAIR_FRAC", 0.75), 0.0, 1.0);
+        }
+        if (slots.size() >= 2 && l22two.gs2 > 0) {
+            l24.gscap = num("LLAMA_FN_L24_GSCAP", 0.0) != 0.0;
+        }
+        if (l24.opfair || l24.gscap) {
+            SRV_INF("[TAG_FN_L24] two-connection rules: [TAG_FN_L24_OPFAIR] %d (a prompt in progress finishes when <= %d text tokens "
+                    "or %.0f %% done are left, and gives way at most once per request), [TAG_FN_L24_GSCAP] %d\n", (int) l24.opfair,
+                    l24.op_near, l24.op_frac * 100.0, (int) l24.gscap);
+        }
+    }
+
     // [TAG_FN_L22] P9's switches (l22two_cfg_t); every rule needs 2+ slots, so --parallel 1 runs today's code paths
     void l22two_init() {
         l22two         = l22two_cfg_t();
@@ -4068,6 +4129,18 @@ private:
             kp.gdsf         = env_ll("LLAMA_FN_L19_CONVSTORE_EVICT", 1) != 0;
             kp.fixed_tokens = (double) std::max<long long>(0, env_ll("LLAMA_FN_L19_CONVSTORE_FIXED", 2048));
         }
+        // [TAG_FN_L24_KEEPVAL] LLAMA_FN_L24_KEEPVAL=1 (qwen4exp profile: 1): evict by re-read cost x recency, keep the biggest
+        // conversation used within _ACTIVE_S against the count limit; _HALF_S the recency half time, _DISK_MIB the free disk
+        // space a store keeps (0: not checked)
+        kp.val = env_ll("LLAMA_FN_L24_KEEPVAL", 0) != 0;
+        if (kp.val) {
+            kp.val_half_s   = (double) std::max<long long>(1, env_ll("LLAMA_FN_L24_KEEPVAL_HALF_S", 900));
+            kp.val_active_s = (double) std::max<long long>(0, env_ll("LLAMA_FN_L24_KEEPVAL_ACTIVE_S", 3600));
+            kp.disk_margin  = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L24_KEEPVAL_DISK_MIB", 8192)) * 1024 * 1024;
+            if (!cs.on) {
+                kp.fixed_tokens = (double) std::max<long long>(0, env_ll("LLAMA_FN_L19_CONVSTORE_FIXED", 2048));
+            }
+        }
         kp.verify   = env_ll("LLAMA_FN_L18_KEEPCTX_VERIFY", 0) != 0;
         kp.hot      = env_ll("LLAMA_FN_L18_KEEPCTX_HOT", 0) != 0;
         // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
@@ -4088,6 +4161,7 @@ private:
         cs.lazy = kp.lazy;
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
                 "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
+                kp.val ? ", [TAG_FN_L24_KEEPVAL] re-read cost x recency, the biggest active one kept" :
                 kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "",
                 kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "",
                 kp.lazy ? ", [TAG_FN_L20_CONVFIX_LAZY] restores leave the checkpoints on disk" : "");
@@ -6205,6 +6279,84 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // [TAG_FN_L24_GENCKPT] A client that sends the last answer back re-rendered (other whitespace or tokens late in the
+    // answer: owner 10-21..24, 15 generation-count cuts re-read 65,775 tokens) made the server go back to the checkpoint at
+    // the answer's start. A checkpoint every gc_every answer tokens, right after </think> and right before <tool_call>
+    // bounds that re-read. The ring holds at most gc_ram of one answer's checkpoints (the older ones go to disk with the
+    // keeping rule's spill, else they are dropped), so the RAM stays as before. Answers are unchanged (state copies only).
+    void l24_gen_checkpoint(server_slot & slot) {
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.spec_is_replay) {
+            return;
+        }
+        const int64_t n_prompt = slot.task->n_tokens();
+        const int64_t n_now    = slot.prompt.n_tokens();
+        if (n_now <= n_prompt) {
+            return;
+        }
+        for (int64_t i = std::max(slot.l24_scan, n_prompt); i < n_now; ++i) {
+            const llama_token t = slot.prompt.tokens[i];
+            if (t != LLAMA_TOKEN_NULL && t == l24.tok_think) {
+                slot.l24_mark |= 1;
+            }
+            if (t != LLAMA_TOKEN_NULL && t == l24.tok_tool) {
+                slot.l24_mark |= 2;
+            }
+        }
+        slot.l24_scan = n_now;
+        const bool before_tool = l24.tok_tool != LLAMA_TOKEN_NULL && slot.sampled == l24.tok_tool;
+
+        int64_t n_last = 0;
+        int     n_own  = 0;
+        for (const auto & c : slot.prompt.checkpoints) {
+            n_last = std::max(n_last, c.n_tokens);
+            n_own += c.id_task == slot.task->id && c.n_tokens > n_prompt ? 1 : 0;
+        }
+        const int64_t step   = n_now - n_last;
+        const bool    every  = l24.gc_every > 0 && step >= l24.gc_every;
+        const int     why    = every ? 4 : (before_tool ? 8 : slot.l24_mark);
+        slot.l24_mark = 0;
+        if (why == 0 || step < l24.gc_gap) {
+            return;
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0 || pos_max + 1 != slot.prompt.tokens.pos_next()) {
+            static int n_warn = 0;
+            if (n_warn++ < 4) {
+                SLT_WRN(slot, "[TAG_FN_L24_GENCKPT] no answer checkpoint: the memory holds [%d, %d], the tokens end at %d\n",
+                        pos_min, pos_max, (int) slot.prompt.tokens.pos_next());
+            }
+            return;
+        }
+        // this answer's oldest checkpoint in the ring makes room (to disk when the spill is on)
+        while (n_own >= l24.gc_ram) {
+            auto old = slot.prompt.checkpoints.end();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->id_task == slot.task->id && it->n_tokens > n_prompt && (old == slot.prompt.checkpoints.end() || it->n_tokens < old->n_tokens)) {
+                    old = it;
+                }
+            }
+            if (old == slot.prompt.checkpoints.end()) {
+                break;
+            }
+            convstore_spill(slot, *old, n_now);
+            if (slot.ckpt_spare.empty()) {
+                slot.ckpt_spare = std::move(old->data_tgt);
+            }
+            slot.prompt.checkpoints.erase(old);
+            if (slot.ckpt_spare.empty() && keepctx) {
+                keepctx->take_spare(slot.ckpt_spare);
+            }
+            n_own--;
+        }
+        const int64_t t0 = ggml_time_us();
+        create_checkpoint(slot, 0, pos_min, pos_max);
+        SLT_INF(slot, "[TAG_FN_L24_GENCKPT] answer checkpoint at n_tokens = %lld (%lld answer tokens, %s, %.1f ms, ring %zu)\n",
+                (long long) n_now, (long long) (n_now - n_prompt),
+                why & 4 ? "periodic" : why & 8 ? "before <tool_call>" : why & 2 ? "after <tool_call>" : "after </think>",
+                (ggml_time_us() - t0) / 1000.0, slot.prompt.checkpoints.size());
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -6950,7 +7102,8 @@ private:
                 const int64_t t1 = ggml_time_us();
                 if (l22two.gs2 > 0) {
                     const int64_t rows    = (int64_t) (batch.size() - batch.n_gen_rows) + l22_media_rows;
-                    const int64_t cap_eff = l22_window_cap_us(cap_us, rows, l22two.gs2);
+                    const int64_t cap_eff = l24.gscap ? l24_window_cap_us(cap_us, rows) // [TAG_FN_L24_GSCAP]
+                                                      : l22_window_cap_us(cap_us, rows, l22two.gs2);
                     const int64_t base    = (t1 - t_batch0) + l22_media_us;
                     gen_share_until_us = t1 + (int64_t) (share*(double) std::min(base, cap_eff));
                     l22_win_first      = true; // [TAG_FN_L22_GENSHARE2] the next answer-only decode moves the end
@@ -7186,6 +7339,14 @@ private:
             }
         });
 
+        // [TAG_FN_L24_GENCKPT] checkpoints inside long answers, before the drafts (the memory holds exactly the slot's tokens:
+        // the accepted rows are decoded, the sampled token is not)
+        if (l24.genckpt) {
+            iterate("l24_genckpt", generating, [&](server_slot & slot) {
+                l24_gen_checkpoint(slot);
+            });
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
@@ -7336,15 +7497,32 @@ private:
             int32_t l22_claim_left = 0;
             if (l22two.one) {
                 std::vector<l22_prompt_cand> cand;
+                std::vector<l24_prompt_cand> cand24; // [TAG_FN_L24_OPFAIR]
                 std::vector<char>            is_cand(slots.size(), 0);
                 for (const auto & s : slots) {
                     if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) && s.task && !s.parked) {
-                        cand.push_back({ s.id, l22_prompt_left(s), s.l22_n_yield });
+                        const int32_t left = l22_prompt_left(s);
+                        cand.push_back({ s.id, left, s.l22_n_yield });
                         is_cand[s.id] = 1;
+                        if (l24.opfair) {
+                            l24_prompt_cand c24;
+                            c24.id      = s.id;
+                            c24.left    = left;
+                            c24.n_yield = s.l22_n_yield;
+                            c24.claimer = s.task->id == l24_claim_task && s.state == SLOT_STATE_PROCESSING_PROMPT;
+                            if (c24.claimer) {
+                                const size_t n_at       = (size_t) s.prompt.n_tokens();
+                                const bool   media_left = (n_at < s.task->tokens.size() && s.task->tokens[n_at] == LLAMA_TOKEN_NULL) ||
+                                                          s.task->tokens.find_next_media_chunk(n_at).first != nullptr;
+                                c24.near_end = l24_prompt_near_end(left, (int32_t) s.task->n_tokens() - s.l22_turn.n_past, media_left,
+                                                                   l24.op_near, l24.op_frac);
+                            }
+                            cand24.push_back(c24);
+                        }
                     }
                 }
                 if (cand.size() >= 2) {
-                    for (const int id : l22_oneprompt_order(cand)) {
+                    for (const int id : l24.opfair ? l24_oneprompt_order(cand24) : l22_oneprompt_order(cand)) {
                         l22_order.push_back(&slots[id]);
                     }
                     for (auto & s : slots) {
@@ -8271,6 +8449,10 @@ private:
                         l22_claim      = slot.task->id;
                         l22_claim_slot = slot.id;
                         l22_claim_left = l22_prompt_left(slot);
+                    }
+                    // [TAG_FN_L24_OPFAIR] the prompt in progress: the last one that added prompt rows (also when it ran alone)
+                    if (l24.opfair && (n_tokens_cur > 0 || has_mtmd)) {
+                        l24_claim_task = slot.task->id;
                     }
                 }
 

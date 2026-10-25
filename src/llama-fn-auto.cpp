@@ -235,10 +235,11 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L4_PROMPT",             "160",    P_ALL }, // [TAG_FN_L4_MEM_PROMPT] a <= 160-token prompt stays SMALL (ubatches of <= 31 tokens, no FULL switch)
     { "LLAMA_FN_L19_TTFT_TAILFULL",     "512",    P_ALL }, // [TAG_FN_L19_TTFT_TAILFULL] the narrow tail of a split short prompt keeps FULL
     { "LLAMA_FN_L19_CONVSTORE",         "1",      P_ALL }, // [TAG_FN_L19_CONVSTORE] with the four lines below: the assistant-turn checkpoint only (_OPENER auto)
-    { "LLAMA_FN_L19_CONVSTORE_N",       "4",      P_ALL }, //   4 conversations, as LLAMA_FN_L18_KEEPCTX
+    { "LLAMA_FN_L19_CONVSTORE_N",       "8",      P_ALL }, //   [TAG_FN_L24_KEEPVAL] 8 conversations (4 before; the files are on disk only, the 32 GiB budget binds)
     { "LLAMA_FN_L19_CONVSTORE_EVICT",   "0",      P_ALL }, //   least recently stored first, as before
     { "LLAMA_FN_L19_CONVSTORE_CKPT",    "0",      P_ALL }, //   the checkpoint ring as before (no keeping rule, no disk checkpoints)
     { "LLAMA_FN_L19_CONVSTORE_SYS",     "0",      P_ALL }, //   no store when a prompt keeps only the system block
+    { "LLAMA_FN_L24_KEEPVAL",           "1",      P_ALL }, // [TAG_FN_L24_KEEPVAL] evict by re-read cost x recency, the biggest active conversation kept (owner 10-22: 4 side stores evicted a 48.6K chat)
     // [TAG_FN_L21_DEC] round 21 decode / TTFT items (exact). MTP_VISION stays off: on the owner's command with a
     // 2560x1600 image (greedy, one pair, l21/dec) the answer after the image drafted 0.784 -> 0.739 accepted and an
     // edit after it 0.870 -> 0.792, and the 4000 image rows cost the draft context ~0.9 s of the prompt
@@ -338,6 +339,9 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_QSA_SEQPOOLS",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SEQPOOLS] D12
     { "LLAMA_FN_L22_QSA_SHAREPFX",          "1",       P_ALL }, // P13 [TAG_FN_L22_QSA_SHAREPFX] R-P13-4 (exact)
     { "LLAMA_FN_L22_TBO",                   "0",       P_ALL }, // D5 [TAG_FN_L22_TBO] two-chain decode (kld; 2 active sequences only), R-D5-6: opt-in (owner 10-18)
+    { "LLAMA_FN_L24_GENCKPT",               "1",       P_ALL }, // [TAG_FN_L24_GENCKPT] checkpoints inside long answers (exact: state copies)
+    { "LLAMA_FN_L24_OPFAIR",                "1",       P_ALL }, // [TAG_FN_L24_OPFAIR] ONEPROMPT keeps the prompt in progress (2+ slots)
+    { "LLAMA_FN_L24_GSCAP",                 "1",       P_ALL }, // [TAG_FN_L24_GSCAP] GENSHARE2 window cap per row fraction (2+ slots)
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner
