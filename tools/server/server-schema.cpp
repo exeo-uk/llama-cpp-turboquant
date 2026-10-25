@@ -341,6 +341,19 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("echo", params.chat_parser_params.echo))
         ->set_desc("Whether to echo the input tokens in the output"));
 
+    // [TAG_FLINT_TOOL_RESCUE] set by the chat template path (Flint), see common_chat_params::tool_rescue_marker
+    add((new field_str("tool_rescue_marker"))
+        ->set_desc("Internal: tool-call start that ends unclosed reasoning in the final parse")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.chat_parser_params.tool_rescue_marker = data.at("tool_rescue_marker").get<std::string>();
+        }));
+
+    add((new field_str("tool_rescue_end"))
+        ->set_desc("Internal: reasoning end tag inserted before tool_rescue_marker")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.chat_parser_params.tool_rescue_end = data.at("tool_rescue_end").get<std::string>();
+        }));
+
     //
     // Token-level fields (require vocab)
     //

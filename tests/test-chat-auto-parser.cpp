@@ -99,6 +99,9 @@ static void test_normalize_quotes_with_embedded_quotes(testing & t);
 static void test_tagged_args_with_embedded_quotes(testing & t);
 static void test_bailing_v3_tool_format(testing & t);
 
+// Flint (Recursive) template, GLM-style tagged arguments [TAG_UPSTREAM_30928] [TAG_FLINT_TOOL_RESCUE]
+static void test_flint_analysis(testing & t);
+
 static void test_role_markers_all_templates(testing & t);
 
 static json build_tools_definition();
@@ -563,6 +566,7 @@ int main(int argc, char * argv[]) {
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
     t.test("bailing_v3", test_bailing_v3_tool_format);
+    t.test("flint", test_flint_analysis);
     t.test("role_markers_all_templates", test_role_markers_all_templates);
 
     return t.summary();
@@ -2459,6 +2463,7 @@ static void test_role_markers_all_templates(testing & t) {
         { "GLM-4.6.jinja",                                   "<|user|>",               "<|assistant|>"              },
         { "unsloth-Apriel-1.5.jinja",                        "<|user|>",               "<|assistant|>"              },
         { "GLM-4.7-Flash.jinja",                             "<|user|>",                 "<|assistant|>"                },
+        { "RecursiveSI-flint.jinja",                         "<|user|>",                 "<|assistant|>"                },
 
         // Gemma 2: <start_of_turn>{user|model}
         { "google-gemma-2-2b-it.jinja",                      "<start_of_turn>user",    "<start_of_turn>model"       },
@@ -2586,6 +2591,176 @@ static void test_bailing_v3_tool_format(testing & t) {
         "</tool_call>";
     common_peg_parse_context ctx(output, COMMON_PEG_PARSE_FLAG_LENIENT);
     t.assert_true("multi-argument tool call", parser.parse(ctx).success());
+}
+
+// ============================================================================
+// Flint (Recursive FlintForCausalLM) template: <|role|> tokens, <think> written by the model,
+// <tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> (non-string values as JSON),
+// tool results as <|observation|><tool_response>...</tool_response>
+// ============================================================================
+static std::vector<common_chat_tool> flint_tools() {
+    common_chat_tool read_tool;
+    read_tool.name        = "read";
+    read_tool.description = "Read a file";
+    read_tool.parameters  = R"({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"required":["path"]})";
+    common_chat_tool edit_tool;
+    edit_tool.name        = "edit";
+    edit_tool.description = "Replace text in a file";
+    edit_tool.parameters  = R"({"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"]})";
+    return { read_tool, edit_tool };
+}
+
+static common_chat_templates_inputs flint_inputs() {
+    common_chat_templates_inputs inputs;
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Fix the off-by-one in src/ring.c";
+    inputs.messages            = { user };
+    inputs.tools               = flint_tools();
+    inputs.reasoning_format    = COMMON_REASONING_FORMAT_DEEPSEEK;
+    inputs.parallel_tool_calls = true;
+    return inputs;
+}
+
+static common_chat_msg flint_parse(const common_chat_params & params, const std::string & output, bool is_partial = false) {
+    common_chat_parser_params pp(params);
+    pp.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    pp.parser.load(params.parser);
+    return common_chat_parse(output, is_partial, pp);
+}
+
+static void test_flint_analysis(testing & t) {
+    const std::string src = read_file("models/templates/RecursiveSI-flint.jinja");
+    t.assert_true("Flint template loaded", !src.empty());
+
+    // the template uses replace("\x00", ""): needs the jinja hex escapes [TAG_UPSTREAM_30929]
+    common_chat_template tmpl(src, "", "");
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+    t.assert_equal("reasoning_start", "<think>", analysis.reasoning.start);
+    t.assert_equal("reasoning_end", "</think>", analysis.reasoning.end);
+    t.assert_equal("reasoning TAG_BASED", reasoning_mode::TAG_BASED, analysis.reasoning.mode);
+    t.assert_equal("per_call_start", "<tool_call>", analysis.tools.format.per_call_start);
+    t.assert_equal("arg_name_prefix", "<arg_key>", analysis.tools.arguments.name_prefix);
+    t.assert_equal("arg_value_suffix", "</arg_value>", analysis.tools.arguments.value_suffix);
+    t.assert_true("supports tools", analysis.jinja_caps.supports_tools);
+    t.assert_true("supports object arguments", tmpl.original_caps().supports_object_arguments);
+
+    auto tmpls = common_chat_templates_init(nullptr, src);
+    const auto inputs = flint_inputs();
+    const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+    t.test("prompt", [&](testing & t) {
+        t.assert_true("tools block in a <|system|> turn", params.prompt.find("<|system|>\n# Tools") == 0);
+        t.assert_true("user turn", params.prompt.find("<|user|>Fix the off-by-one in src/ring.c") != std::string::npos);
+        t.assert_true("ends with the assistant token", params.prompt.size() >= 13 &&
+                params.prompt.compare(params.prompt.size() - 13, 13, "<|assistant|>") == 0);
+        t.assert_true("lazy grammar", params.grammar_lazy && !params.grammar.empty());
+        t.assert_true("trigger <tool_call>", !params.grammar_triggers.empty() && params.grammar_triggers[0].value == "<tool_call>");
+        t.assert_equal("thinking start", "<think>", params.thinking_start_tag);
+        t.assert_true("thinking end", params.thinking_end_tags.size() == 1 && params.thinking_end_tags[0] == "</think>");
+        t.assert_equal("tool rescue on for Flint", "<tool_call>", params.tool_rescue_marker);
+    });
+
+    t.test("reasoning + content", [&](testing & t) {
+        auto msg = flint_parse(params, "<think>Simple question.</think>The bug is on line 12.");
+        t.assert_equal("reasoning", "Simple question.", msg.reasoning_content);
+        t.assert_equal("content", "The bug is on line 12.", msg.content);
+        t.assert_equal("no tool calls", (size_t) 0, msg.tool_calls.size());
+    });
+
+    t.test("reasoning + tool call", [&](testing & t) {
+        auto msg = flint_parse(params,
+            "<think>I need the file first.</think>"
+            "<tool_call>read<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
+            "<arg_key>limit</arg_key><arg_value>200</arg_value></tool_call>");
+        t.assert_equal("reasoning", "I need the file first.", msg.reasoning_content);
+        t.assert_equal("content", "", msg.content);
+        if (t.assert_equal("one tool call", (size_t) 1, msg.tool_calls.size())) {
+            t.assert_equal("name", "read", msg.tool_calls[0].name);
+            t.assert_equal("args", json({{"path", "src/ring.c"}, {"limit", 200}}).dump(), json::parse(msg.tool_calls[0].arguments).dump());
+        }
+    });
+
+    t.test("two tool calls, multi-line string value", [&](testing & t) {
+        auto msg = flint_parse(params,
+            "<think>Two edits.</think>"
+            "<tool_call>edit<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
+            "<arg_key>oldText</arg_key><arg_value>if (i <= n) {\n  i++;</arg_value>"
+            "<arg_key>newText</arg_key><arg_value>if (i < n) {\n  i++;</arg_value></tool_call>"
+            "<tool_call>read<arg_key>path</arg_key><arg_value>src/ring.h</arg_value></tool_call>");
+        if (t.assert_equal("two tool calls", (size_t) 2, msg.tool_calls.size())) {
+            t.assert_equal("name 0", "edit", msg.tool_calls[0].name);
+            t.assert_equal("args 0",
+                    json({{"path", "src/ring.c"}, {"oldText", "if (i <= n) {\n  i++;"}, {"newText", "if (i < n) {\n  i++;"}}).dump(),
+                    json::parse(msg.tool_calls[0].arguments).dump());
+            t.assert_equal("name 1", "read", msg.tool_calls[1].name);
+        }
+    });
+
+    t.test("history round trip", [&](testing & t) {
+        // an assistant turn with reasoning + a tool call, then the tool result, renders back in the model's format
+        auto inputs2 = flint_inputs();
+        common_chat_msg ass;
+        ass.role              = "assistant";
+        ass.reasoning_content = "I need the file first.";
+        ass.tool_calls        = { { "read", R"({"path":"src/ring.c","limit":200})", "call_0" } };
+        common_chat_msg tool;
+        tool.role         = "tool";
+        tool.tool_call_id = "call_0";
+        tool.content      = "int ring_push(...)";
+        inputs2.messages.push_back(ass);
+        inputs2.messages.push_back(tool);
+        const auto p2 = common_chat_templates_apply(tmpls.get(), inputs2);
+        const std::string want =
+            "<|assistant|><think>I need the file first.</think>"
+            "<tool_call>read<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
+            "<arg_key>limit</arg_key><arg_value>200</arg_value></tool_call>"
+            "<|observation|><tool_response>int ring_push(...)</tool_response><|assistant|>";
+        t.assert_true("rendered history: " + p2.prompt, p2.prompt.find(want) != std::string::npos);
+    });
+
+    // upstream issue #31000: the tool call written inside reasoning that never closed, then EOG (<|observation|>)
+    const std::string unclosed =
+        "<think>The loop runs one past the end. Fix it:"
+        "<tool_call>edit<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
+        "<arg_key>oldText</arg_key><arg_value>i <= n</arg_value>"
+        "<arg_key>newText</arg_key><arg_value>i < n</arg_value></tool_call>";
+
+    t.test("unclosed reasoning with a tool call (#31000)", [&](testing & t) {
+        auto msg = flint_parse(params, unclosed);
+        t.assert_equal("reasoning before the call", "The loop runs one past the end. Fix it:", msg.reasoning_content);
+        if (t.assert_equal("rescued tool call", (size_t) 1, msg.tool_calls.size())) {
+            t.assert_equal("name", "edit", msg.tool_calls[0].name);
+            t.assert_equal("args", json({{"path", "src/ring.c"}, {"oldText", "i <= n"}, {"newText", "i < n"}}).dump(),
+                    json::parse(msg.tool_calls[0].arguments).dump());
+        }
+        // streaming (partial) parses are unchanged: the text stays reasoning until the final parse
+        auto part = flint_parse(params, unclosed, true);
+        t.assert_equal("partial: no tool calls", (size_t) 0, part.tool_calls.size());
+    });
+
+    t.test("unclosed reasoning, rescue limits", [&](testing & t) {
+        // an incomplete call (cut by max_tokens) stays reasoning
+        auto cut = flint_parse(params, unclosed.substr(0, unclosed.size() - 30));
+        t.assert_equal("cut call: no tool calls", (size_t) 0, cut.tool_calls.size());
+        t.assert_true("cut call: all reasoning", !cut.reasoning_content.empty() && cut.content.empty());
+        // a call followed by more reasoning text stays reasoning
+        auto more = flint_parse(params, unclosed + " Then I will rebuild.");
+        t.assert_equal("text after the call: no tool calls", (size_t) 0, more.tool_calls.size());
+        // an unknown tool name stays reasoning
+        auto unknown = flint_parse(params, "<think>Maybe <tool_call>bash<arg_key>cmd</arg_key><arg_value>ls</arg_value></tool_call>");
+        t.assert_equal("unknown tool: no tool calls", (size_t) 0, unknown.tool_calls.size());
+        // closed reasoning that only mentions the marker is not touched
+        auto closed = flint_parse(params, "<think>I could use <tool_call> later.</think>Done.");
+        t.assert_equal("closed: content", "Done.", closed.content);
+        t.assert_equal("closed: no tool calls", (size_t) 0, closed.tool_calls.size());
+        // without the rescue (other templates, LLAMA_TOOL_RESCUE=0) the turn stays reasoning only, as before
+        common_chat_params off = params;
+        off.tool_rescue_marker.clear();
+        auto msg_off = flint_parse(off, unclosed);
+        t.assert_equal("rescue off: no tool calls", (size_t) 0, msg_off.tool_calls.size());
+    });
 }
 
 // Test that reproduces the Seed-OSS template issue with embedded quotes
