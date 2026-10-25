@@ -4,6 +4,7 @@
 
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +75,11 @@ struct copy_seg {
 class copy_pool {
 public:
     ~copy_pool() { stop(); }
+    // [TAG_FN_R25_STAGE] call before start(). temporal: plain (cached) stores instead of non-temporal ones, for a ring small
+    // enough to stay in the L3 (the DMA then reads the lines from the cache: the ring costs no DRAM write and no DRAM read);
+    // prefetch: the source lines with the NTA hint (they pass the caches without pushing the ring out); spin_us: the workers
+    // and the caller poll this long for the next job / the last part before they sleep (0: sleep at once, as before)
+    void set_mode(bool temporal, bool prefetch, int spin_us);
     void start(int n_threads);
     void stop();
     void copy(void * dst, const void * src, size_t n);
@@ -88,12 +94,17 @@ private:
     std::mutex               mtx;
     std::condition_variable  cv_go;
     std::condition_variable  cv_done;
-    uint64_t                 gen     = 0;
-    int                      pending = 0;
-    bool                     quit    = false;
+    // [TAG_FN_R25_STAGE] gen / pending / quit are written under mtx (pending also by the workers' decrement) and polled
+    // without it while a thread spins
+    std::atomic<uint64_t>    gen{0};
+    std::atomic<int>         pending{0};
+    std::atomic<bool>        quit{false};
     const copy_seg *         segs_p  = nullptr;
     int                      n_segs  = 0;
     size_t                   n_bytes = 0;
+    bool                     temporal = false; // [TAG_FN_R25_STAGE]
+    bool                     prefetch = false;
+    int                      spin_us  = 0;
 };
 
 } // namespace gen5

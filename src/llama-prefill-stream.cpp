@@ -201,6 +201,10 @@ struct pfs_state {
 
     // [TAG_FN_L22_P10] round 22, package P10 (all off unless the context turned them on)
     int            n_threads_max = 8;     // LLAMA_PREFILL_STREAM_THREADS: the pool at init
+    // [TAG_FN_R25_STAGE] the copy pool's mode (every pool made for this state, also a stagers restart)
+    bool           cp_tmp  = false;       // LLAMA_PREFILL_STREAM_CACHED: plain stores into an L3-sized ring
+    bool           cp_pf   = false;       // LLAMA_PREFILL_STREAM_CACHED_PF: NTA prefetch of the source
+    int            cp_spin = 0;           // LLAMA_PREFILL_STREAM_SPIN_US
     int            stagers_mode  = 0;     // [TAG_FN_L22_STAGERS] 0 off, -1 auto, n >= 2 fixed
     double         stg_share     = -1.0;  // EWMA (alpha 0.5) of staged / host bytes per pass (-1: none since a pin change)
     bool           stg_pin       = false; // pins were live at the last lend
@@ -1442,6 +1446,7 @@ static void pfs_stagers_apply(pfs_state * s) {
         return;
     }
     auto np = std::make_unique<gen5::copy_pool>();
+    np->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
     np->start(target);
     s->pool.swap(np); // the old pool's workers stop and join here (~1-3 ms)
     s->stg_restarts++;
@@ -1573,8 +1578,26 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     s->chunk      = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CHUNK_MIB", 32, 1, 256) << 20;
     s->lend       = gen5::env_int("LLAMA_PREFILL_STREAM_LEND", 0, 0, 1) != 0; // [TAG_FN_R1_PFS_LEND]
     s->ahead      = gen5::env_int("LLAMA_PREFILL_STREAM_AHEAD", 2, 0, 8); // [TAG_FN_L15_PFSAHEAD]
-    const size_t ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
+    size_t       ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_RING_MIB", 512, 2, 4096) << 20;
     const int    n_threads  = gen5::env_int("LLAMA_PREFILL_STREAM_THREADS", 8, 1, 64);
+    // [TAG_FN_R25_STAGE] LLAMA_PREFILL_STREAM_CACHED=1: the copy threads write the ring with plain stores and the ring is
+    // small enough to stay in the L3 (default 4 x 8 MiB), so the DMA reads the staged lines from the cache. With
+    // non-temporal stores into the 512 MiB ring every staged byte crossed DRAM three times (source read, ring write, DMA
+    // read): the stream pass ran at ~22 GB/s against a measured DRAM copy ceiling of ~31 GB/s (r25 probe). An explicit
+    // LLAMA_PREFILL_STREAM_RING_MIB / _CHUNK_MIB still wins over the cached sizes
+    s->cp_tmp = gen5::env_int("LLAMA_PREFILL_STREAM_CACHED", 0, 0, 1) != 0;
+    if (s->cp_tmp) {
+        const char * er = getenv("LLAMA_PREFILL_STREAM_RING_MIB");
+        const char * ec = getenv("LLAMA_PREFILL_STREAM_CHUNK_MIB");
+        if (!er || !er[0]) {
+            ring_bytes = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_RING_MIB", 32, 2, 512) << 20;
+        }
+        if (!ec || !ec[0]) {
+            s->chunk = (size_t) gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_CHUNK_MIB", 8, 1, 64) << 20;
+        }
+        s->cp_pf = gen5::env_int("LLAMA_PREFILL_STREAM_CACHED_PF", 1, 0, 1) != 0;
+    }
+    s->cp_spin = gen5::env_int("LLAMA_PREFILL_STREAM_SPIN_US", s->cp_tmp ? 200 : 0, 0, 10000);
     if (s->min_tokens > 32 && !s->lend) { // [TAG_FN_R1_PFS_LEND] a lending stream reserves with the op offload
         LLAMA_LOG_WARN("prefill-stream: LLAMA_PREFILL_STREAM_MIN=%" PRId64 " > 32: ubatches of 32..%" PRId64 " tokens keep the "
                 "op-offload copies, which the compute buffer was not reserved for\n", s->min_tokens, s->min_tokens - 1);
@@ -1777,6 +1800,7 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
     }
 
     s->pool = std::make_unique<gen5::copy_pool>();
+    s->pool->set_mode(s->cp_tmp, s->cp_pf, s->cp_spin); // [TAG_FN_R25_STAGE]
     s->pool->start(n_threads);
     s->n_threads_max = s->pool->size(); // [TAG_FN_L22_STAGERS]
     s->thr = std::thread(pfs_run, s);
@@ -1788,6 +1812,9 @@ bool llama_prefill_stream_init_layers(const std::vector<llama_moe_gen5_layer_des
             s->ring.pinned ? "pinned" : (need_ring ? "plain" : "no"), (size_t) s->n_chunks,
             s->chunk >> 20, s->pool->size(), s->wrap ? "on" : "off",
             s->d2d ? ", the hot set's experts slot -> bank on the device [TAG_FN_L14_PFSD2D]" : "");
+    LLAMA_LOG_INFO("prefill-stream: [TAG_FN_R25_STAGE] ring copies %s%s, copy threads spin %d us before they sleep\n",
+            s->cp_tmp ? "with plain stores (the ring stays in the L3, the DMA reads it there)" : "non-temporal (through DRAM)",
+            s->cp_pf ? ", source prefetch NTA" : "", s->cp_spin);
     if (s->cps_mode > 0) {
         LLAMA_LOG_INFO("prefill-stream: [TAG_FN_L22_CPUSHARE] share mode %d: late experts after each layer's plan (wait <= %d ms)%s\n",
                 s->cps_mode, s->cps_wait_ms, s->zexp ? ", a zero expert behind every layer in the banks" : "");

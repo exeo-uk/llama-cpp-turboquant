@@ -61,6 +61,8 @@ static const char * k_env[] = {
     "LLAMA_MOE_HOT_PROFILE", "LLAMA_MOE_DMA_STATS", "LLAMA_PREFILL_STREAM_MIN", "LLAMA_PREFILL_STREAM_BUFS",
     "LLAMA_PREFILL_STREAM_WRAP", "LLAMA_PREFILL_STREAM_CHUNK_MIB", "LLAMA_PREFILL_STREAM_RING_MIB",
     "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_STATS",
+    "LLAMA_PREFILL_STREAM_CACHED", "LLAMA_PREFILL_STREAM_CACHED_RING_MIB", "LLAMA_PREFILL_STREAM_CACHED_CHUNK_MIB", // [TAG_FN_R25_STAGE]
+    "LLAMA_PREFILL_STREAM_CACHED_PF", "LLAMA_PREFILL_STREAM_SPIN_US",
 };
 
 static void reset_env() {
@@ -751,18 +753,27 @@ static void test_dma_bridge(t_model & m, const char * name, const char * share, 
 // prefill stream
 //
 
-static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial) {
+// [TAG_FN_R25_STAGE] cached: 0 the non-temporal ring copies; 1 plain stores + NTA prefetch + spinning copy threads with the
+// test's 1 MiB chunks (an explicit size wins); 2 the same with the cached ring's own sizes (4 x 8 MiB)
+static void test_pfs(t_model & m, int n_bufs, bool wrap, bool partial, int cached = 0) {
     reset_env();
     char nb[8];
     snprintf(nb, sizeof(nb), "%d", n_bufs);
     set_env("LLAMA_PREFILL_STREAM_BUFS", nb);
     set_env("LLAMA_PREFILL_STREAM_WRAP", wrap ? "1" : "0");
     set_env("LLAMA_PREFILL_STREAM_MIN", "16");
-    set_env("LLAMA_PREFILL_STREAM_CHUNK_MIB", "1");
-    set_env("LLAMA_PREFILL_STREAM_RING_MIB", "2");
+    if (cached != 2) {
+        set_env("LLAMA_PREFILL_STREAM_CHUNK_MIB", "1");
+        set_env("LLAMA_PREFILL_STREAM_RING_MIB", "2");
+    }
     set_env("LLAMA_PREFILL_STREAM_THREADS", "3");
-    char name[64];
-    snprintf(name, sizeof(name), "pfs bufs %d wrap %d%s", n_bufs, wrap ? 1 : 0, partial ? " partial" : "");
+    if (cached > 0) {
+        set_env("LLAMA_PREFILL_STREAM_CACHED", "1");
+        set_env("LLAMA_PREFILL_STREAM_SPIN_US", cached == 1 ? "50" : "500");
+    }
+    char name[80];
+    snprintf(name, sizeof(name), "pfs bufs %d wrap %d%s%s", n_bufs, wrap ? 1 : 0, partial ? " partial" : "",
+             cached == 1 ? " cached" : cached == 2 ? " cached 4x8" : "");
     static int owner_tag = 0;
     const void * owner = &owner_tag;
     const bool ok = llama_prefill_stream_init_layers(descs(m), cpu_device(m), owner);
@@ -907,6 +918,11 @@ int main() {
         }
         test_pfs(m, nb, true, true);
     }
+    // [TAG_FN_R25_STAGE] the cached ring: plain-store copies, NTA prefetch, spinning copy threads
+    test_pfs(m, 2, true, false, 1);
+    test_pfs(m, 2, true, true, 1);
+    test_pfs(m, 1, false, false, 2);
+    test_pfs(m, 3, true, true, 2);
 
     reset_env();
     free_model(m);
