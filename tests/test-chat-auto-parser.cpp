@@ -2607,7 +2607,12 @@ static std::vector<common_chat_tool> flint_tools() {
     edit_tool.name        = "edit";
     edit_tool.description = "Replace text in a file";
     edit_tool.parameters  = R"({"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"]})";
-    return { read_tool, edit_tool };
+    // pi's edit tool: a JSON array argument
+    common_chat_tool pi_edit_tool;
+    pi_edit_tool.name        = "pi_edit";
+    pi_edit_tool.description = "Edit a single file using exact text replacement";
+    pi_edit_tool.parameters  = R"({"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]}}},"required":["path","edits"]})";
+    return { read_tool, edit_tool, pi_edit_tool };
 }
 
 static common_chat_templates_inputs flint_inputs() {
@@ -2695,6 +2700,19 @@ static void test_flint_analysis(testing & t) {
                     json({{"path", "src/ring.c"}, {"oldText", "if (i <= n) {\n  i++;"}, {"newText", "if (i < n) {\n  i++;"}}).dump(),
                     json::parse(msg.tool_calls[0].arguments).dump());
             t.assert_equal("name 1", "read", msg.tool_calls[1].name);
+        }
+    });
+
+    t.test("pi edit: JSON array argument", [&](testing & t) {
+        auto msg = flint_parse(params,
+            "<think>One edit.</think>"
+            "<tool_call>pi_edit<arg_key>path</arg_key><arg_value>src/ring.c</arg_value>"
+            "<arg_key>edits</arg_key><arg_value>[{\"oldText\": \"i <= n\", \"newText\": \"i < n\"}]</arg_value></tool_call>");
+        if (t.assert_equal("one tool call", (size_t) 1, msg.tool_calls.size())) {
+            t.assert_equal("name", "pi_edit", msg.tool_calls[0].name);
+            const auto args = json::parse(msg.tool_calls[0].arguments);
+            t.assert_true("edits is an array: " + msg.tool_calls[0].arguments, args.contains("edits") && args.at("edits").is_array());
+            t.assert_equal("edit 0 newText", "i < n", args.at("edits").at(0).at("newText").get<std::string>());
         }
     });
 
