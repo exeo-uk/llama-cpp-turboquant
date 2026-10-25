@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 static int g_fail   = 0;
 static int g_checks = 0;
