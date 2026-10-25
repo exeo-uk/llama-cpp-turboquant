@@ -165,6 +165,7 @@ enum llm_arch {
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MINIMAX_01,
     LLM_ARCH_HRM_TEXT,
+    LLM_ARCH_FLINT, // [TAG_UPSTREAM_30928] last (upstream: after QWEN3MOE), so no existing arch changes its value
     LLM_ARCH_UNKNOWN,
 };
 
