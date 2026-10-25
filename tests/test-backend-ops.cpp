@@ -4219,6 +4219,54 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// [TAG_FLINT_AMAX_FUSION] the MoE down-projection rescale of build_amax_src1_f16 (llama-graph.cpp): ABS, POOL_1D (max over
+// the row), SCALE, LOG, SCALE, CEIL, CLAMP, SCALE, EXP, DIV(x, e) as one CUDA launch. out = div + e (broadcast), so both
+// fused outputs are checked; vmax > 32768 * 1024 / 32 makes e > 1 (the rescale path), small vmax keeps e = 1
+struct test_moe_amax_src1 : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float vmax;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_AMAX_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, vmax);
+    }
+
+    test_moe_amax_src1(std::array<int64_t, 4> ne = {512, 6, 1, 1}, float vmax = 10.0f) : ne(ne), vmax(vmax) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+
+        constexpr float k_log2_e = 1.4426950408889634f;
+        constexpr float k_ln_2   = 0.6931471805599453f;
+        ggml_tensor * amax = ggml_pool_1d(ctx, ggml_abs(ctx, x), GGML_OP_POOL_MAX, ne[0], ne[0], 0);
+        ggml_tensor * e;
+        e = ggml_scale(ctx, amax, 1.0f/1024.0f);
+        e = ggml_log  (ctx, e);
+        e = ggml_scale(ctx, e, k_log2_e);
+        e = ggml_ceil (ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, k_ln_2);
+        e = ggml_exp  (ctx, e);
+        ggml_tensor * out = ggml_add(ctx, ggml_div(ctx, x, e), e);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -vmax, vmax);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -14427,6 +14475,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+    }
+
+    // [TAG_FLINT_AMAX_FUSION] decode / prompt rows of Flint (512), a ragged width, the 256-thread path (> 1024)
+    for (float vmax : { 10.0f, 3.0e6f }) {
+        test_cases.emplace_back(new test_moe_amax_src1({ 512, 6, 1, 1 }, vmax));
+        test_cases.emplace_back(new test_moe_amax_src1({ 512, 6, 37, 1 }, vmax));
+        test_cases.emplace_back(new test_moe_amax_src1({ 1000, 4, 5, 1 }, vmax));
+        test_cases.emplace_back(new test_moe_amax_src1({ 2048, 3, 2, 1 }, vmax));
     }
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {

@@ -6000,6 +6000,66 @@ static bool ggml_cuda_fn_l22_try_gluq8(ggml_backend_cuda_context * cuda_ctx, ggm
     return false;
 }
 
+// [TAG_FLINT_AMAX_FUSION] build_amax_src1_f16 (llama-graph.cpp, the MoE down-projection rescale of Flint / Mistral4 /
+// Mellum): ABS, POOL_1D, SCALE, LOG, SCALE, CEIL, CLAMP, SCALE, EXP, DIV(x, e) are 10 launches per MoE layer; they go
+// into one (ggml_cuda_op_amax_src1_fused) when the 10 nodes follow each other and only e (EXP) and the DIV leave the
+// group. Same float ops, so the outputs keep their bits. GGML_CUDA_AMAX_FUSION=0 turns it off.
+static bool ggml_cuda_try_amax_src1_fusion(const ggml_cgraph * cgraph, int i, ggml_cuda_amax_src1_params & p) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_AMAX_FUSION"); return e == nullptr || atoi(e) != 0; }();
+    static const ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                   GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_DIV };
+    constexpr int n = 10;
+    if (!on || i + n > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * const * nd = cgraph->nodes + i;
+    for (int k = 0; k < n; ++k) {
+        if (nd[k]->op != ops[k] || nd[k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (k > 0 && k < n - 1 && nd[k]->src[0] != nd[k - 1]) {
+            return false;
+        }
+    }
+    if (ggml_get_unary_op(nd[0]) != GGML_UNARY_OP_ABS || ggml_get_unary_op(nd[5]) != GGML_UNARY_OP_CEIL ||
+            ggml_get_unary_op(nd[8]) != GGML_UNARY_OP_EXP) {
+        return false;
+    }
+    const ggml_tensor * x   = nd[0]->src[0];
+    const ggml_tensor * e   = nd[8];
+    const ggml_tensor * dst = nd[9];
+    if (x->type != GGML_TYPE_F32 || dst->src[0] != x || dst->src[1] != e || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(e) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(x, dst) || e->ne[0] != 1 ||
+            e->ne[1] != x->ne[1] || e->ne[2] != x->ne[2] || e->ne[3] != x->ne[3]) {
+        return false;
+    }
+    const int32_t * pp = (const int32_t *) nd[1]->op_params; // POOL_1D: op, k0, s0, p0
+    if (pp[0] != GGML_OP_POOL_MAX || pp[1] != x->ne[0] || pp[2] != x->ne[0] || pp[3] != 0) {
+        return false;
+    }
+    const int outs[2] = { i + 8, i + 9 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, outs, 2)) {
+        return false;
+    }
+    // e must not share memory with x or the DIV; the DIV may run in place on x (the kernel reads a row before writing it)
+    auto range = [](const ggml_tensor * t) {
+        const int64_t a = (int64_t) t->data;
+        return std::make_pair(a, a + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
+    };
+    auto overlap = [](std::pair<int64_t, int64_t> a, std::pair<int64_t, int64_t> b) {
+        return a.first < b.second && b.first < a.second;
+    };
+    const auto rx = range(x), re = range(e), rd = range(dst);
+    if (overlap(re, rx) || overlap(re, rd) || (overlap(rd, rx) && dst->data != x->data)) {
+        return false;
+    }
+    p.s0   = ggml_get_op_params_f32(nd[2], 0); p.b0   = ggml_get_op_params_f32(nd[2], 1);
+    p.s1   = ggml_get_op_params_f32(nd[4], 0); p.b1   = ggml_get_op_params_f32(nd[4], 1);
+    p.cmin = ggml_get_op_params_f32(nd[6], 0); p.cmax = ggml_get_op_params_f32(nd[6], 1);
+    p.s2   = ggml_get_op_params_f32(nd[7], 0); p.b2   = ggml_get_op_params_f32(nd[7], 1);
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<uint8_t> * fn_l22_fused = nullptr) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -6072,6 +6132,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n = ggml_cuda_fn_l3_try_gdnab(cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;
+        }
+    }
+
+    // [TAG_FLINT_AMAX_FUSION] the MoE down-projection rescale (10 nodes) -> one launch
+    if (node->op == GGML_OP_UNARY) {
+        ggml_cuda_amax_src1_params ap;
+        if (ggml_cuda_try_amax_src1_fusion(cgraph, i, ap)) {
+            ggml_cuda_op_amax_src1_fused(*cuda_ctx, node->src[0], cgraph->nodes[i + 8], cgraph->nodes[i + 9], ap);
+            return 9;
         }
     }
 
