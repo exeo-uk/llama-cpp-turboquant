@@ -2289,6 +2289,10 @@ private:
         int32_t     stream_min = 768;   // LLAMA_PREFILL_STREAM_MIN (the PASSLOG path label only)
         llama_token media_tok  = LLAMA_TOKEN_NULL;
         bool        logged_off = false; //   the one log line why a merged batch cannot run here
+        // [TAG_FN_L24_TTFT] LLAMA_FN_L24_IMGPASS2 (default 1): an answer's rows in the batch ask for the next batch alone
+        bool        excl       = false;
+        uint64_t    n_room     = 0;     //   merged batches the pool room check sent to the per-chunk path
+        uint64_t    n_excl     = 0;     //   batches the answers sat out for a merged pass
         // [TAG_FN_L22_PHASE] decodes by phase, and GEN decodes that held a prompt row (must stay 0)
         uint64_t    n_dec_gen    = 0;
         uint64_t    n_dec_prompt = 0;
@@ -3555,6 +3559,10 @@ private:
         l22.ckpt_keep  = on("LLAMA_FN_L22_CKPT_KEEP");
         l22.ckpt_split = on("LLAMA_FN_L22_CKPT_SPLIT");
         l22.keeplend   = on("LLAMA_FN_L22_KEEPLEND");
+        {
+            const char * v = llama_model_fn_env(model_tgt, "LLAMA_FN_L24_IMGPASS2");
+            l22.excl = params_base.n_parallel > 1 && (v == nullptr || !*v || llama_fn_l22_switch_on(v));
+        }
         l22.stream_min = (int32_t) std::max<long long>(1, num("LLAMA_PREFILL_STREAM_MIN", 768));
         l22.spec_mtp   = !params_base.speculative.has_dft() &&
             std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
@@ -4092,8 +4100,16 @@ private:
 
     // [TAG_FN_L22_IMGPASS] where a merged image-turn batch from the slot's position ends (a task token index), or -1 for no
     // merged batch in this iteration (the per-chunk path runs as today)
-    int64_t l22_plan_merged(const server_slot & slot, int32_t n_batch, bool wait_shared) {
-        if (!l22.imgpass_ok || batch.size() != 0 || pool_preempt || media_async || !slot.mctx) {
+    // [TAG_FN_L24_TTFT] E0: a multi-slot unified pool (pool_preempt) refused every merged batch (0 of 24 image turns on the
+    // owner's 2-slot server, 410 of 410 on 1 slot): pool_abandon_tail cannot cut inside a picture. The merged batch decodes
+    // alone, so it runs when the pool's free cells hold its rows and the answers' next step; else the per-chunk path (its own
+    // room wait). With only answers' rows in the batch (want_excl set), it asks for the next batch alone
+    int64_t l22_plan_merged(const server_slot & slot, int32_t n_batch, bool wait_shared, bool * want_excl = nullptr) {
+        if (!l22.imgpass_ok || media_async || !slot.mctx) {
+            return -1;
+        }
+        const int b_rule = l24_merged_batch_rule(batch.size(), batch.n_gen_rows, batch.has_embd, l22.excl && want_excl != nullptr);
+        if (b_rule < 0) {
             return -1;
         }
         const server_task & t = *slot.task;
@@ -4169,7 +4185,25 @@ private:
             cap = std::min<int64_t>(cap, std::max<int64_t>(1, l22.mask_mib * 1024 * 1024 / (2 * n_kv)));
         }
         const int64_t rows = l22_media_plan(segs, W, cap);
-        return rows > 0 ? cur + rows : -1;
+        if (rows <= 0) {
+            return -1;
+        }
+        if (pool_preempt) {
+            const int64_t n_free = llama_memory_attn_n_free_ext(ctx_tgt, slot.id);
+            if (!l24_merged_fits(n_free, rows, pool_gen_rows_max)) {
+                if (l22.n_room++ < 8 || l22.n_room % 64 == 0) {
+                    SLT_WRN(slot, "[TAG_FN_L24_TTFT] merged batch of %lld rows: %lld free cells in the pool (+ %d answer rows): the "
+                            "per-chunk path (%llu)\n", (long long) rows, (long long) n_free, pool_gen_rows_max,
+                            (unsigned long long) l22.n_room);
+                }
+                return -1;
+            }
+        }
+        if (b_rule == 1) {
+            *want_excl = true;
+            return -1;
+        }
+        return cur + rows;
     }
 
     // [TAG_FN_L22_IMGPASS] the media chunk at the slot's position into the merged batch: encoder rows, 4 M-RoPE positions as
@@ -4752,6 +4786,9 @@ private:
     int      pool_n_parked         = 0;
     int      pool_no_progress      = 0;
     int      pool_want_room        = -1;       // slot whose next image does not fit, set by the prompt pass
+    int32_t  pool_gen_rows_max     = 0;        // [TAG_FN_L24_TTFT] sampled + draft rows of every slot in one step
+    int      l24_excl_slot         = -1;       // [TAG_FN_L24_TTFT] the slot whose merged pass wants the next batch alone
+    bool     l24_excl_held         = false;    //   the answers sat out this batch
 
     // [TAG_FN_L15_GENSHARE] after a batch with prompt rows and generating rows, the prompt rows wait until this time, so
     // the generating slots get decode-only steps for LLAMA_SRV_GEN_SHARE x the batch's time (0 = off)
@@ -4773,6 +4810,7 @@ private:
         };
         const int32_t n_gen_max = params_base.n_parallel * (1 + (spec ? common_speculative_n_max(spec.get()) : 0));
         const int32_t n_free    = llama_memory_attn_n_free_ext(ctx_tgt, 0);
+        pool_gen_rows_max = n_gen_max;
         pool_preempt = params_base.kv_unified && params_base.n_parallel > 1
                     && env_i64("TURBO_POOL_PREEMPT", 1) != 0
                     && n_free >= 0 && n_gen_max <= llama_n_batch(ctx_tgt);
@@ -5014,6 +5052,20 @@ private:
             }
         }
         pool_fail_one("no slot could be parked");
+    }
+
+    // [TAG_FN_L24_TTFT] room for the rest of a merged batch: park a slot other than its own (false: none could be parked)
+    bool l24_park_for_merged() {
+        const int id = batch.l22_slot;
+        if (id < 0 || id >= (int) slots.size()) {
+            return false;
+        }
+        for (server_slot * v : pool_victims(ggml_time_us(), &slots[id])) {
+            if (pool_park(*v, "merged image pass")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool pool_park(server_slot & s, const char * why) {
@@ -7259,6 +7311,11 @@ private:
                     // [TAG_POOL_PREEMPT] the pool cannot take even the smallest valid view: undo the tail, make room, rebuild
                     if (pool_exhausted) {
                         pool_exhausted = false;
+                        // [TAG_FN_L24_TTFT] a merged batch whose first views ran cannot be cut (a picture does not split, the
+                        // recurrent state moved on): another slot is parked and the view runs again (the room check makes this rare)
+                        if (batch.l22_slot >= 0 && off > 0 && l24_park_for_merged()) {
+                            continue;
+                        }
                         try {
                             pool_handle_exhausted(off, nullptr);
                         } catch (const std::exception & e) {
@@ -7308,7 +7365,15 @@ private:
         } else if (batch.size() > batch.n_gen_rows) {
             l22_win_first = false;
         }
-        if (batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) {
+        // [TAG_FN_L24_TTFT] a merged pass the answers sat out opens their window as a batch with their rows does; not when only a
+        // short tail of that prompt is left (the 4 rows after the last picture waited the whole 2 s window before the first token):
+        // the tail goes with the answers' next step, and that batch opens the window
+        const bool l24_win = l24_excl_held && batch.l22_slot >= 0 && batch.l22_slot < (int) slots.size() && batch.n_gen_rows == 0 &&
+                             l22_prompt_left(slots[batch.l22_slot]) > 512;
+        if (l24_excl_held && batch.l22_slot >= 0) {
+            l22.n_excl++;
+        }
+        if ((batch.n_gen_rows > 0 && (batch.size() > batch.n_gen_rows || l22_media_win)) || l24_win) {
             static const double share = [] {
                 const char * e = getenv("LLAMA_SRV_GEN_SHARE");
                 return e ? std::max(0.0, atof(e)) : 0.0;
@@ -7485,10 +7550,23 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // [TAG_FN_L24_TTFT] a merged image pass asked for this batch alone: the answers sit out one batch, as paused ones
+        bool l24_excl = false;
+        l24_excl_held = false;
+        if (l24_excl_slot >= 0) {
+            const int id = l24_excl_slot;
+            l24_excl_slot = -1;
+            l24_excl = id < (int) slots.size() && slots[id].state == SLOT_STATE_PROCESSING_PROMPT && slots[id].task && !slots[id].parked;
+        }
+
         // determine which slots are generating and drafting
         iterate("slots_3291", slots, [&](server_slot & slot) {
             // [TAG_FN_L22_PAUSE] a paused answer is left out like a parked one (its cells stay in the pool)
             if (slot.state != SLOT_STATE_GENERATING || slot.parked || slot.l22_pause_until_us != 0) {
+                return;
+            }
+            if (l24_excl) {
+                l24_excl_held = true;
                 return;
             }
 
@@ -8272,9 +8350,18 @@ private:
                         if (l22two.gs2 > 0 && batch.n_gen_rows > 0) {
                             l22_media_us += ggml_time_us() - l22_t_enc0;
                         }
-                        l22_end = l22_plan_merged(slot, n_batch, wait_shared);
+                        bool want_excl = false;
+                        l22_end = l22_plan_merged(slot, n_batch, wait_shared, &want_excl);
                         if (l22_end >= 0) {
                             batch.l22_slot = slot.id;
+                        } else if (want_excl) {
+                            // [TAG_FN_L24_TTFT] the answers' rows decode alone now; the next batch is this merged pass alone
+                            l24_excl_slot = slot.id;
+                            if (llama_fn_l22_passlog_level() >= 1) {
+                                llama_fn_l22_log("turn", "two=imgexcl slot=%d task=%d gen_rows=%d (the next batch is the merged pass alone)",
+                                                 slot.id, slot.task->id, batch.n_gen_rows);
+                            }
+                            return;
                         }
                     }
 
@@ -8585,6 +8672,11 @@ private:
                             batch.add(slot.id, r.tok_aux, r.pos, r.output, r.is_prompt);
                         }
                         l22_end = -1;
+                        // [TAG_FN_L24_TTFT] the answers sat out this batch for it (e.g. the break at the last user message, 10
+                        // rows before the first picture): the next batch is the merged pass alone too, without a GENSHARE window first
+                        if (l24_excl_held && l22.excl) {
+                            l24_excl_slot = slot.id;
+                        }
                     }
                     if (l22_end >= 0) {
                         if (!l22_fail && !batch.fill_text_rows(model_tgt)) {
@@ -8800,6 +8892,12 @@ private:
                 }
             }
             llama_fn_prompt_after_ext(ctx_tgt, n_after_all);
+            // [TAG_FN_L24_ENDOVL1] busy slots (a prompt or an answer; paused ones count): one lets ENDOVERLAP run on 2+ slots
+            int32_t n_busy = 0;
+            for (const auto & slot : slots) {
+                n_busy += slot.is_processing() && !slot.parked ? 1 : 0;
+            }
+            llama_fn_seqs_busy_ext(ctx_tgt, n_busy);
 
             // [TAG_FN_L20_BIGPROMPT_PLEPRE] LLAMA_FN_L20_BIGPROMPT_PLEPRE (qwen4exp profile or environment, default off): the next
             // prompt batch's text tokens (up to the first media chunk) for the PLE read-ahead during this batch

@@ -195,6 +195,11 @@ LLAMA_API void llama_fn_ready_ext(struct llama_context * ctx);
 // reserve width with LLAMA_FN_L20_BIGPROMPT_UB. Outputs never change.
 LLAMA_API void llama_fn_prompt_after_ext(struct llama_context * ctx, int32_t n_after);
 
+// [TAG_FN_L24_ENDOVL1] Before a decode: how many sequences the caller has busy (in a prompt or an answer; -1 = not known). Kept
+// until set again; with one busy sequence a qwen4exp context of n_seq_max > 1 keeps FULL at the prompt's end for the answer's
+// first step (LLAMA_FN_L22_ENDOVERLAP), as with n_seq_max = 1. Outputs never change.
+LLAMA_API void llama_fn_seqs_busy_ext(struct llama_context * ctx, int32_t n_busy);
+
 // [TAG_FN_L20_BIGPROMPT_PLEPRE] Before a decode: the NEXT prompt batch of seq_id, toks[i_first..n) at positions pos0 + i_first..
 // (toks[0..i_first) the tokens before it, up to 16, for the n-gram context; pos0 = the position of toks[0]). qwen4exp reads
 // their PLE rows ahead (llama_ple_prefetch_ext) once this decode's first ubatch has set its inputs. Outputs never change.
