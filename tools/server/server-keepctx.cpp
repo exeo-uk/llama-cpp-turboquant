@@ -179,6 +179,7 @@ public:
     // [TAG_FN_L20_CONVFIX_IO] ext_mem: KC_NBUF blocks the caller owns (kc_alloc_blocks), else the pipe allocates its own
     kc_pipe(server_keepctx_file & file, bool writing, uint64_t n_read, uint64_t base = 0, uint8_t * ext_mem = nullptr) :
             file(file), writing(writing), n_read(kc_round_up(n_read)), base(base) {
+        llama_fn_pin_server_busy(1); // [TAG_FN_L23_PINFIX] R-L23-8: a keepctx copy is busy (the destructor ends it)
         if (ext_mem) {
             mem     = ext_mem;
             own_mem = false;
@@ -196,6 +197,7 @@ public:
     }
 
     ~kc_pipe() {
+        llama_fn_pin_server_busy(-1); // [TAG_FN_L23_PINFIX] R-L23-8
         {
             std::lock_guard<std::mutex> lk(mu);
             stop = true;

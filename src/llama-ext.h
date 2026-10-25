@@ -364,6 +364,8 @@ LLAMA_API int32_t llama_get_decode_phase_ext(const struct llama_context * ctx);
 // [TAG_FN_L22_OOMHOOK] P0: llama_fn_pin_on_oom (P6) for code outside libllama (the vision lend, the server): a device
 // allocation of need_bytes failed or will fail; true = pins were released, retry once
 LLAMA_API bool llama_fn_pin_on_oom_ext(const struct llama_model * model, size_t need_bytes);
+// [TAG_FN_L23_PINFIX] R-L23-8: the server marks a request (+1 / -1; 0 = time stamp only): pins register only while idle
+LLAMA_API void llama_fn_pin_server_busy(int delta);
 // [TAG_FN_L22_PIN] (P2b request 3) llama_fn_pin_active (P6) for code outside libllama
 LLAMA_API bool llama_fn_pin_active_ext(void);
 

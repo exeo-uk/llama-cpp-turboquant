@@ -1191,6 +1191,7 @@ private:
 };
 
 struct server_slot {
+    bool l23_busy = false; // [TAG_FN_L23_PINFIX] R-L23-8: counted in llama_fn_pin_server_busy from launch to release
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -1699,6 +1700,10 @@ struct server_slot {
     }
 
     void release() {
+        if (l23_busy) { // [TAG_FN_L23_PINFIX] R-L23-8
+            l23_busy = false;
+            llama_fn_pin_server_busy(-1);
+        }
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -5176,6 +5181,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!slot.l23_busy) { // [TAG_FN_L23_PINFIX] R-L23-8: no pin registers from here to release()
+            slot.l23_busy = true;
+            llama_fn_pin_server_busy(1);
+        }
         slot.l22_turn.t_launch_us  = ggml_time_us(); // [TAG_FN_L22_PASSLOG]
         slot.l22_turn.logged_start = false;
 
@@ -9280,6 +9289,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const std::vector<raw_buffer> & files,
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+
+    // [TAG_FN_L23_PINFIX] R-L23-8: a request is busy from here (template, tokens, pictures) until the slot takes it
+    struct l23_busy_mark {
+        l23_busy_mark()  { llama_fn_pin_server_busy(1); }
+        ~l23_busy_mark() { llama_fn_pin_server_busy(-1); }
+    } l23_busy;
 
     // [TAG_FN_L22_PASSLOG] request -> here = the body parse and the chat template; here -> tokenized = the pictures too
     const int64_t l22_t_tmpl = ggml_time_us();

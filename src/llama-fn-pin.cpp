@@ -572,6 +572,12 @@ uint64_t fn_unpin(fn_pin_state * st, const std::function<bool(uint64_t freed)> &
 // [TAG_FN_L23_PINFIX] R-L23-7 (hard rule): pins register only while the server is idle, never while a prompt or an answer runs:
 // no decode for LLAMA_FN_L23_PIN_IDLE_MS (1500; an answer's steps are ms apart). FAULT 15:20:50: 51 GiB registered during an answer
 std::atomic<int64_t> g_pin_idle_us{1500000};
+// [TAG_FN_L23_PINFIX] R-L23-8: the server marks requests (llama_fn_pin_server_busy): a request handler, a slot from launch to
+// release, a keepctx copy; every mark also stamps the time, so a gap shorter than the idle time counts as busy
+std::atomic<int>     g_srv_busy{0};
+std::atomic<int64_t> g_srv_us{0};
+// [TAG_FN_L23_PINFIX] R-L23-8: the first refused registration stops pinning for the whole process (no re-pin until a restart)
+std::atomic<bool>    g_pin_refused_ever{false};
 
 bool fn_wait_quiet(fn_pin_state * st) {
     size_t mark = 0;
@@ -579,6 +585,8 @@ bool fn_wait_quiet(fn_pin_state * st) {
         const int64_t now = fn_now_us();
         const bool busy = g_dec_running.load(std::memory_order_relaxed) > 0 ||
                           now - g_dec_end_us.load(std::memory_order_relaxed) < g_pin_idle_us.load(std::memory_order_relaxed) ||
+                          g_srv_busy.load(std::memory_order_relaxed) > 0 ||
+                          now - g_srv_us.load(std::memory_order_relaxed) < g_pin_idle_us.load(std::memory_order_relaxed) ||
                           now - g_query_us.load(std::memory_order_relaxed) < 200000 ||
                           llama_fn_hushed() || llama_fn_warm_state(&mark) == 2;
         if (!busy) {
@@ -635,6 +643,12 @@ int fn_repin(fn_pin_state * st, uint64_t keep, uint64_t * bytes) {
     int n = 0;
     uint64_t b = 0;
     uint64_t pending = 0;
+    if (g_pin_refused_ever.load()) { // [TAG_FN_L23_PINFIX] R-L23-8: no re-pin after a refusal until a restart
+        if (bytes) {
+            *bytes = 0;
+        }
+        return 0;
+    }
     if (!st->arena && st->reg_fn != nullptr) {
         for (int u = 0; u < st->reg.n_units() && !st->stop.load(); ++u) {
             const fn_pin::reg_unit & U = st->reg.unit_at(u);
@@ -661,6 +675,7 @@ int fn_repin(fn_pin_state * st, uint64_t keep, uint64_t * bytes) {
             if (!fn_register(st, U.p, U.n, &dev)) {
                 // [TAG_FN_L23_PINFIX] R-L23-7: a refusal stops pinning; later re-pins stay below it
                 st->n_refused.fetch_add(1);
+                g_pin_refused_ever.store(true);
                 st->cfg.max_pin = st->reg.active_bytes();
                 break;
             }
@@ -1081,6 +1096,7 @@ bool fn_ranges_run(fn_pin_state * st) {
             const int64_t dt = fn_now_us() - tr;
             if (!done) {
                 st->n_refused.fetch_add(1);
+                g_pin_refused_ever.store(true); // [TAG_FN_L23_PINFIX] R-L23-8
                 st->reg.drop(ri);
                 first_refused = n_ok == 0;
                 LLAMA_LOG_WARN("%s: [TAG_FN_L22_PIN] range %d (%.1f MiB, layer %d part %d) refused by the driver after %.1f ms: "
@@ -1297,7 +1313,7 @@ void fn_thread(fn_pin_state * st) {
         // the drop line + 4 GiB (R-L23-6) for 60 s, 60 s after a drop, pins the resident units again (fn_pin::gate_step)
         const uint64_t avail = fn_avail_ram();
         const bool pinned = st->reg.any_active();
-        const bool repinnable = !st->arena && st->reg.n_active_units() < st->reg.n_units();
+        const bool repinnable = !st->arena && st->reg.n_active_units() < st->reg.n_units() && !g_pin_refused_ever.load();
         // [TAG_FN_L23_PINFIX] R-L23-5: NON_LOCAL room under half the registration margin (other allocations grew) counts as
         // pressure too: the gate sees "no RAM" and drops every pin after 3 samples
         uint64_t nl_room = UINT64_MAX;
@@ -1433,6 +1449,11 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     st->unreg_fn = unreg_fn;
     st->devptr   = (fn_devptr_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_host_dev_ptr");
     st->set_oom  = (fn_set_oom_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_set_oom_hook");
+    // [TAG_FN_L23_PINFIX] R-L23-8: ggml-cuda refuses any registration past 0.4 x RAM in total (backstop of the pin cap)
+    using fn_set_cap_t = void (*)(size_t);
+    if (auto set_cap = (fn_set_cap_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_fn_set_reg_cap")) {
+        set_cap((size_t) (0.4*(double) fn_total_ram()));
+    }
     // device addresses of pinned pages only for the decode DMA share (P14): the mapped flag is not needed by copies
     if (llama_fn_l22_switch_on(llama_fn_env(*model, "LLAMA_FN_L22_DMASHARE"))) {
         st->regmap = (fn_regmap_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_fn_register_host_mapped");
@@ -1457,6 +1478,17 @@ void llama_fn_pin_on_ready(const llama_model * model) {
     st->cfg.warm_keep = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_WARM_KEEP_MIB", 0);
     st->cfg.max_pin   = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_MAX_MIB", 0);
     st->arena_max     = fn_mib_switch(*model, "LLAMA_FN_L22_PIN_ARENA_MIB", 16384);
+    {
+        // [TAG_FN_L23_PINFIX] R-L23-8 HARD CAP (owner 10-25, upstream #31122: the WDDM page-lock budget is about half the RAM and
+        // unstable past it; 10-21: three TDRs at 51-56 GiB): RAM/4 by default, LLAMA_FN_L22_PIN_MAX_MIB never above 0.4 x RAM
+        const uint64_t ram  = fn_total_ram();
+        const uint64_t hard = (uint64_t) (0.4*(double) ram);
+        const uint64_t def  = ram/4;
+        st->cfg.max_pin = st->cfg.max_pin > 0 ? std::min(st->cfg.max_pin, hard) : def;
+        st->arena_max   = std::min<uint64_t>(st->arena_max, st->cfg.max_pin);
+        LLAMA_LOG_INFO("%s: [TAG_FN_L23_PINFIX] pin cap %.2f GiB (RAM %.2f GiB; hard limit 0.4 x RAM = %.2f GiB)\n", __func__,
+                fn_gib(st->cfg.max_pin), fn_gib(ram), fn_gib(hard));
+    }
 #if !defined(_WIN32)
     st->cfg.nl_margin = 0; // the Linux rule is the cap RAM/2 - 8 GiB itself
 #endif
@@ -1801,6 +1833,14 @@ void llama_fn_pin_decode_mark(bool begin) {
         g_dec_end_us.store(fn_now_us(), std::memory_order_relaxed);
         g_dec_running.fetch_sub(1, std::memory_order_relaxed);
     }
+}
+
+void llama_fn_pin_server_busy(int delta) {
+    g_srv_us.store(fn_now_us(), std::memory_order_relaxed);
+    if (delta != 0) {
+        g_srv_busy.fetch_add(delta, std::memory_order_relaxed);
+    }
+    g_srv_us.store(fn_now_us(), std::memory_order_relaxed);
 }
 
 void llama_fn_pin_note_need(const llama_model * model, int kind, size_t bytes) {
