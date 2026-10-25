@@ -2298,6 +2298,7 @@ private:
         bool    attach    = false;   // LLAMA_FN_L24_ATTACH: [TAG_FN_L24_ATTACH] start from another slot's cells (needs --kv-unified)
         int32_t attach_min  = 512;   // LLAMA_FN_L24_ATTACH_MIN: at least this many tokens
         int32_t attach_gain = 256;   // LLAMA_FN_L24_ATTACH_GAIN: and this many more than the slot keeps by itself
+        bool    attach_ckpt = false; // LLAMA_FN_L24_ATTACH_CKPT: also at a donor's checkpoint (default 0, see l24_attach_find)
     } l22two;
 
     // [TAG_FN_L22_SHAREKV] the last boundary a leader published: its slot, task and boundary
@@ -3608,9 +3609,10 @@ private:
             l22two.attach      = why == nullptr;
             l22two.attach_min  = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_MIN", 512.0), 1.0, 1e9);
             l22two.attach_gain = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_GAIN", 256.0), 0.0, 1e9);
-            SRV_INF("[TAG_FN_L24_ATTACH] a new prompt starts from another slot's cells (idle or busy, at its checkpoint or its "
-                    "whole content): %s%s (at least %d tokens, %d more than the slot keeps)\n", l22two.attach ? "on" : "off: ",
-                    why ? why : "", l22two.attach_min, l22two.attach_gain);
+            l22two.attach_ckpt = on("LLAMA_FN_L24_ATTACH_CKPT");
+            SRV_INF("[TAG_FN_L24_ATTACH] a new prompt starts from another slot's cells (an idle slot's whole content; at a busy "
+                    "slot's checkpoint: %s): %s%s (at least %d tokens, %d more than the slot keeps)\n", l22two.attach_ckpt ? "on" : "off",
+                    l22two.attach ? "on" : "off: ", why ? why : "", l22two.attach_min, l22two.attach_gain);
         }
         for (auto & s : slots) {
             s.l22_pause_json = l22two.pause;
@@ -3732,9 +3734,16 @@ private:
             }
             const llama_pos pmax = llama_memory_seq_pos_max(mem, D.id);
             v.whole_ok = pmax >= 0 && pmax + 1 == D.prompt.tokens.pos_next();
-            for (const auto & c : D.prompt.checkpoints) {
-                const bool ok = !c.data_tgt.empty() && c.n_tokens > 0 && c.n_tokens <= v.n_tokens && c.pos_max <= pmax;
-                v.ckpts.push_back(ok ? c.n_tokens : 0);
+            // LLAMA_FN_L24_ATTACH_CKPT (default 0): the donor keeps its own cells after the checkpoint, so the new rows land at
+            // other cell indices than the donor's own restore would use, and the dense turbot FA is placement sensitive (l24s
+            // 10-25). The whole content of an idle donor is bitwise equal to its own continuation.
+            if (l22two.attach_ckpt) {
+                for (const auto & c : D.prompt.checkpoints) {
+                    const bool ok = !c.data_tgt.empty() && c.n_tokens > 0 && c.n_tokens <= v.n_tokens && c.pos_max <= pmax;
+                    v.ckpts.push_back(ok ? c.n_tokens : 0);
+                }
+            } else if (!(v.idle && v.whole_ok && v.lcp >= v.n_tokens)) {
+                continue;
             }
             views.push_back(std::move(v));
         }
