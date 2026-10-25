@@ -325,6 +325,7 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L22_PAUSE_S",               "8",       P_ALL }, // P9
     { "LLAMA_FN_L22_SHAREKV",               "1",       P_ALL }, // P9 [TAG_FN_L22_SHAREKV] D9
     { "LLAMA_FN_L22_DRAFT2",                "0",       P_ALL }, // P9 [TAG_FN_L22_DRAFT2] D7 by A/B
+    { "LLAMA_FN_L24_ATTACH",                "1",       P_ALL }, // [TAG_FN_L24_ATTACH] #30970 slot attach (exact)
     { "LLAMA_FN_L22_STAGERS",               "auto",    P_ALL }, // P10 [TAG_FN_L22_STAGERS] M7
     { "LLAMA_FN_L22_XOVER",                 "1",       P_ALL }, // P10 [TAG_FN_L22_XOVER] placement
     { "LLAMA_FN_L22_UBPLAN",                "1",       P_ALL }, // P10 [TAG_FN_L22_UBPLAN] M9 (kld)

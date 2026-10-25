@@ -11,6 +11,7 @@
 //   l22_pause_should_resume    when a paused answer goes on                             [TAG_FN_L22_PAUSE]
 //   l22_sharekv_usable         a follower may take the leader's prefix by seq_cp        [TAG_FN_L22_SHAREKV]
 //   l22_park_cells             the cells a parked slot needs again                      [TAG_FN_L22_SHAREKV]
+//   l24_attach_best            the other slot whose cells a new prompt starts from      [TAG_FN_L24_ATTACH]
 
 #include <algorithm>
 #include <cstdint>
@@ -117,4 +118,56 @@ static inline bool l22_sharekv_usable(const l22_share_view & v) {
 // a park of a slot that shares cells with another sequence frees only its own cells, but the resume writes all of them
 static inline int32_t l22_park_cells(int32_t freed, int32_t n_tokens, bool shared) {
     return shared ? std::max(freed, n_tokens) : freed;
+}
+
+// [TAG_FN_L24_ATTACH] (upstream #30970 --slot-attach, automatic) another slot (the donor) as get_available_slot sees it
+// for a new task: a donor that is idle, still in its prompt or answering lends the task's slot its cells (seq_cp, no copy)
+// up to a point where the recurrent state is known exactly: one of its checkpoints, or (idle only) its whole content
+struct l24_donor_view {
+    int     id       = -1;
+    bool    usable   = false;    // not parked, IDLE / PROCESSING_PROMPT / GENERATING, not the task's slot
+    bool    idle     = false;    // IDLE: its current state is final, the whole content may be lent (a live snapshot)
+    bool    whole_ok = false;    // its memory ends exactly at its last token (seq_pos_max + 1 == pos_next)
+    int32_t n_tokens = 0;        // its tokens
+    int32_t lcp      = 0;        // common prefix of its tokens and the task's tokens
+    std::vector<int64_t> ckpts;  // n_tokens of its checkpoints that hold data and lie within its memory
+};
+
+// what to lend: the donor's id (-1: nothing), the tokens, and which state (-1: the donor's live state, else ckpts[ckpt])
+struct l24_attach_pick {
+    int     donor = -1;
+    int32_t n     = 0;
+    int     ckpt  = -1;
+};
+
+// The longest prefix any donor can lend: its whole content (idle, the task continues all of it) or its newest checkpoint
+// within the shared part; at most n_task - 1 tokens (one prompt token is always evaluated [TAG_PROMPT_LOGITS]). A
+// checkpoint wins a tie (one host->device copy instead of a snapshot and a copy). Taken only with at least n_min tokens
+// and gain tokens more than own (what the task's slot keeps by itself).
+static inline l24_attach_pick l24_attach_best(const std::vector<l24_donor_view> & donors, int32_t n_task, int32_t own,
+                                              int32_t n_min, int32_t gain) {
+    l24_attach_pick best;
+    const int32_t n_max = n_task - 1;
+    if (n_max <= 0) {
+        return best;
+    }
+    for (const auto & d : donors) {
+        if (!d.usable || d.id < 0) {
+            continue;
+        }
+        const int32_t lim = std::min(d.lcp, n_max);
+        for (size_t k = 0; k < d.ckpts.size(); ++k) {
+            const int64_t c = d.ckpts[k];
+            if (c > 0 && c <= lim && (c > best.n || (c == best.n && best.ckpt < 0 && best.donor >= 0))) {
+                best = { d.id, (int32_t) c, (int) k };
+            }
+        }
+        if (d.idle && d.whole_ok && d.n_tokens > 0 && d.lcp >= d.n_tokens && d.n_tokens <= n_max && d.n_tokens > best.n) {
+            best = { d.id, d.n_tokens, -1 };
+        }
+    }
+    if (best.donor < 0 || best.n < std::max<int32_t>(1, n_min) || best.n < (int64_t) own + std::max<int32_t>(0, gain)) {
+        return l24_attach_pick();
+    }
+    return best;
 }

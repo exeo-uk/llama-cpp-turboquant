@@ -1292,6 +1292,10 @@ struct server_slot {
         int32_t n_merged    = 0;     // merged image-turn batches
         int32_t n_media     = 0;     // media chunks decoded
         int32_t n_media_rows = 0;
+        int32_t attach_n     = 0;    // [TAG_FN_L24_ATTACH] tokens taken from another slot's cells
+        int     attach_src   = -1;   // that slot
+        int     attach_how   = 0;    // 1 its checkpoint, 2 its whole content (live snapshot)
+        double  attach_ms    = 0.0;
         bool    logged_start = false;
     } l22_turn;
 
@@ -2291,6 +2295,9 @@ private:
         int32_t pause_tok = 2048;    // LLAMA_FN_L22_PAUSE_TOKENS
         int64_t pause_us  = 8000000; // LLAMA_FN_L22_PAUSE_S
         bool    sharekv   = false;   // LLAMA_FN_L22_SHAREKV: the shared-prefix fan-out by seq_cp (needs --kv-unified)
+        bool    attach    = false;   // LLAMA_FN_L24_ATTACH: [TAG_FN_L24_ATTACH] start from another slot's cells (needs --kv-unified)
+        int32_t attach_min  = 512;   // LLAMA_FN_L24_ATTACH_MIN: at least this many tokens
+        int32_t attach_gain = 256;   // LLAMA_FN_L24_ATTACH_GAIN: and this many more than the slot keeps by itself
     } l22two;
 
     // [TAG_FN_L22_SHAREKV] the last boundary a leader published: its slot, task and boundary
@@ -3387,11 +3394,19 @@ private:
             // restores only a stored conversation that gives more)
             server_slot * l22_leader = l22two.sharekv ? l22_sharekv_leader(task, *ret) : nullptr;
 
+            // [TAG_FN_L24_ATTACH] another slot (idle, in its prompt, answering) holds more of this prompt than the slot
+            // can keep: keepctx restores only a stored conversation that gives more
+            ret->l22_turn.attach_n   = 0;
+            ret->l22_turn.attach_src = -1;
+            ret->l22_turn.attach_how = 0;
+            ret->l22_turn.attach_ms  = 0.0;
+            const l24_attach_pick l24_pre = l22_leader ? l24_attach_pick() : l24_attach_find(task, *ret);
+
             // [TAG_FN_L18_KEEPCTX]
             if (keepctx && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
                 const int64_t t_kc0 = ggml_time_us();
                 ret->l22_turn.kc_what = 0;
-                keepctx_switch(*ret, task, l22_leader ? l22_share_src.n_shared : 0);
+                keepctx_switch(*ret, task, l22_leader ? l22_share_src.n_shared : l24_pre.n);
                 ret->l22_turn.kc_ms = (ggml_time_us() - t_kc0) / 1000.0; // [TAG_FN_L22_PASSLOG]
             }
 
@@ -3402,6 +3417,18 @@ private:
                 }
                 l22_sharekv_take(*l22_leader, *ret);
                 update_cache = false;
+            } else if (l24_pre.donor >= 0) {
+                // [TAG_FN_L24_ATTACH] again after keepctx (it may have restored more, or stored the slot's conversation)
+                const l24_attach_pick p = l24_attach_find(task, *ret);
+                if (p.donor >= 0) {
+                    if (prompt_cache && update_cache) {
+                        ret->prompt_save(*prompt_cache, &task.tokens);
+                        prompt_cache->update();
+                    }
+                    if (l24_attach_apply(*ret, p, task)) {
+                        update_cache = false;
+                    }
+                }
             }
 
             update_cache = update_cache && prompt_cache;
@@ -3560,6 +3587,31 @@ private:
         l22two.pause_us  = (int64_t) (std::clamp(num("LLAMA_FN_L22_PAUSE_S", 8.0), 0.0, 3600.0) * 1e6);
         const bool sharekv_sw = on("LLAMA_FN_L22_SHAREKV");
         l22two.sharekv   = sharekv_sw && params_base.kv_unified;
+        // [TAG_FN_L24_ATTACH] the cells are shared within one KV stream (--kv-unified); a shift (context shift, cache
+        // reuse) would move shared cells for every holder, SWA prunes cells a holder further back still needs, and LoRA
+        // adapters make another slot's cells differ
+        const bool attach_sw = on("LLAMA_FN_L24_ATTACH");
+        if (attach_sw) {
+            const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt));
+            const char * why = nullptr;
+            if (!params_base.kv_unified) {
+                why = "needs --kv-unified";
+            } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                why = "the memory cannot remove a sequence's tail";
+            } else if (n_swa > 0) {
+                why = "SWA";
+            } else if (can_shift && (params_base.ctx_shift || params_base.n_cache_reuse > 0)) {
+                why = "context shift / cache reuse";
+            } else if (!params_base.lora_adapters.empty()) {
+                why = "LoRA adapters";
+            }
+            l22two.attach      = why == nullptr;
+            l22two.attach_min  = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_MIN", 512.0), 1.0, 1e9);
+            l22two.attach_gain = (int32_t) std::clamp(num("LLAMA_FN_L24_ATTACH_GAIN", 256.0), 0.0, 1e9);
+            SRV_INF("[TAG_FN_L24_ATTACH] a new prompt starts from another slot's cells (idle or busy, at its checkpoint or its "
+                    "whole content): %s%s (at least %d tokens, %d more than the slot keeps)\n", l22two.attach ? "on" : "off: ",
+                    why ? why : "", l22two.attach_min, l22two.attach_gain);
+        }
         for (auto & s : slots) {
             s.l22_pause_json = l22two.pause;
         }
@@ -3629,6 +3681,147 @@ private:
             llama_fn_l22_log("turn", "two=sharekv dst=%d src=%d task=%d n=%d ms=%.1f", F.id, L.id, L.task ? L.task->id : -1, n_shared,
                              (ggml_time_us() - t0) / 1000.0);
         }
+    }
+
+    // [TAG_FN_L24_ATTACH] (upstream #30970 --slot-attach, automatic, with vision and MTP) A new prompt that shares a long
+    // prefix with another slot's tokens starts from that slot's cells, whatever the other slot does (idle, in its prompt,
+    // answering). The attention cells get the new slot's id too (seq_cp in the unified pool, no copy: turbot adopts the
+    // write-row counter, the QSA k-pools regroup); the recurrent (GDN) state, which cannot be cut back, comes from the
+    // donor's checkpoint at the attach point, or (an idle donor whose tokens the prompt continues in full) from a snapshot of
+    // its live state (state_write takes a pending RS rollback into account); the MTP draft state comes with it (the draft
+    // KV by the same seq_cp, the draft's partial state and the carry blob / #30141 state). Image chunks in the shared prefix
+    // are shared like text: the tokens keep their chunks (clone), a checkpoint never sits inside an image, and the cut
+    // after the attach point is at pos_next (M-RoPE positions).
+
+    // the donors' views for task (in slot F); own = what F keeps by itself (its tokens, up to its newest checkpoint)
+    l24_attach_pick l24_attach_find(const server_task & task, const server_slot & F, int32_t * own_out = nullptr) {
+        if (!l22two.attach || task.type != SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child() ||
+                !task.params.cache_prompt || F.is_processing()) {
+            return l24_attach_pick();
+        }
+        const int32_t n_task = (int32_t) task.n_tokens();
+        if (n_task <= l22two.attach_min) {
+            return l24_attach_pick();
+        }
+        int32_t own = 0;
+        if (F.prompt.n_tokens() > 0) {
+            const int lcp = (int) F.prompt.tokens.get_common_prefix(task.tokens);
+            own = std::min<int32_t>(keepctx_usable(F.prompt, lcp, (cs.spill || cs.lazy) ? &F.kc_spill.list : nullptr), n_task - 1);
+        }
+        if (own_out) {
+            *own_out = own;
+        }
+        auto * mem = llama_get_memory(ctx_tgt);
+        std::vector<l24_donor_view> views;
+        for (const auto & D : slots) {
+            if (&D == &F || D.parked || D.prompt.n_tokens() == 0) {
+                continue;
+            }
+            const bool st_ok = D.state == SLOT_STATE_IDLE || D.state == SLOT_STATE_PROCESSING_PROMPT || D.state == SLOT_STATE_GENERATING;
+            if (!st_ok) {
+                continue;
+            }
+            l24_donor_view v;
+            v.id       = D.id;
+            v.usable   = true;
+            v.idle     = D.state == SLOT_STATE_IDLE;
+            v.n_tokens = (int32_t) D.prompt.n_tokens();
+            v.lcp      = (int32_t) D.prompt.tokens.get_common_prefix(task.tokens);
+            if (v.lcp <= std::max(own, l22two.attach_min)) {
+                continue; // it cannot give more than the slot keeps, or than the minimum
+            }
+            const llama_pos pmax = llama_memory_seq_pos_max(mem, D.id);
+            v.whole_ok = pmax >= 0 && pmax + 1 == D.prompt.tokens.pos_next();
+            for (const auto & c : D.prompt.checkpoints) {
+                const bool ok = !c.data_tgt.empty() && c.n_tokens > 0 && c.n_tokens <= v.n_tokens && c.pos_max <= pmax;
+                v.ckpts.push_back(ok ? c.n_tokens : 0);
+            }
+            views.push_back(std::move(v));
+        }
+        return l24_attach_best(views, n_task, own, l22two.attach_min, l22two.attach_gain);
+    }
+
+    // F takes the first p.n tokens of slot p.donor; false: F is left empty (the prompt is processed in full)
+    bool l24_attach_apply(server_slot & F, const l24_attach_pick & p, const server_task & task) {
+        const int64_t t0 = ggml_time_us();
+        server_slot & D = slots[p.donor];
+
+        const common_prompt_checkpoint * ck = nullptr;
+        if (p.ckpt >= 0) {
+            ck = &*std::next(D.prompt.checkpoints.begin(), p.ckpt);
+            GGML_ASSERT(ck->n_tokens == p.n);
+        }
+
+        // the donor's live state (an idle donor lent in full): taken before F is touched
+        common_prompt_checkpoint snap;
+        std::vector<uint8_t>     carry;
+        if (!ck) {
+            if (!F.ckpt_spare.empty()) {
+                snap.data_tgt = std::move(F.ckpt_spare); // [TAG_CKPT_BUFFER_REUSE] the same size: no fresh allocation
+                F.ckpt_spare  = std::vector<uint8_t>();
+            }
+            snap.update_tgt(ctx_tgt, D.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            snap.update_dft(ctx_dft, D.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (spec) {
+                common_speculative_get_carry(spec.get(), D.id, carry);
+            }
+        }
+        const double t_snap_ms = (ggml_time_us() - t0) / 1000.0;
+
+        F.prompt_clear();                    // an empty destination: turbot adopts the write-row counter, F's old cells are free
+        F.mem.seq_cp(D.id, F.id, -1, -1);    // every cell of D (target and draft memory) gets F's id; whole sequences only
+
+        // F's own recurrent state at the attach point: the load drops F from the recurrent cell it now shares with D (the
+        // donor keeps its state) and writes F's own cell
+        const common_prompt_checkpoint & src = ck ? *ck : snap;
+        src.load_tgt(ctx_tgt, F.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        src.load_dft(ctx_dft, F.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        bool carry_ok = true;
+        if (spec) {
+            if (ck) {
+                common_speculative_set_state(spec.get(), F.id, ck->data_spec); // what a checkpoint restore of D would set
+            } else {
+                carry_ok = common_speculative_set_carry(spec.get(), F.id, carry);
+            }
+        }
+
+        F.prompt.tokens = D.prompt.tokens.clone(); // the media chunks too
+        F.prompt.tokens.keep_first(p.n);
+
+        // drop F's id from D's cells after the attach point (a no-op for the recurrent cell, which ends before it)
+        const llama_pos p0 = F.prompt.tokens.pos_next();
+        bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), F.id, p0, -1);
+        if (rm_ok && ctx_dft) {
+            rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), F.id, p0, -1);
+        }
+        if (!snap.data_tgt.empty() && F.ckpt_spare.empty()) {
+            F.ckpt_spare = std::move(snap.data_tgt);
+        }
+        if (!rm_ok) {
+            SLT_WRN(F, "[TAG_FN_L24_ATTACH] the cells of slot %d after the attach point could not be dropped, not attaching\n", D.id);
+            F.prompt_clear();
+            return false;
+        }
+
+        F.l22_kv_shared = true;  // [TAG_FN_L22_SHAREKV] park accounting
+        D.l22_kv_shared = true;
+        F.kc_conv.hits     = 0;
+        F.kc_conv.rerender = D.kc_conv.rerender; // [TAG_FN_L19_CONVSTORE_OPENER] the same client
+
+        const double ms = (ggml_time_us() - t0) / 1000.0;
+        F.l22_turn.attach_n   = p.n;
+        F.l22_turn.attach_src = D.id;
+        F.l22_turn.attach_how = ck ? 1 : 2;
+        F.l22_turn.attach_ms  = ms;
+        static const char * st_s[] = { "idle", "waiting", "starting", "in its prompt", "done with its prompt", "answering" };
+        SLT_INF(F, "[TAG_FN_L24_ATTACH] took %d of the prompt's %d tokens from slot %d (%s, task %d) by seq_cp, %s in %.1f ms%s\n",
+                p.n, (int) task.n_tokens(), D.id, st_s[std::clamp((int) D.state, 0, 5)], D.task ? D.task->id : -1,
+                ck ? "its checkpoint's recurrent state" : "a snapshot of its whole state", ms, carry_ok ? "" : " (the draft carry did not apply: acceptance only)");
+        if (llama_fn_l22_passlog_level() >= 1) {
+            llama_fn_l22_log("turn", "two=attach dst=%d src=%d src_state=%d task=%d n=%d n_task=%d how=%s snap_ms=%.1f ms=%.1f",
+                             F.id, D.id, (int) D.state, task.id, p.n, (int) task.n_tokens(), ck ? "checkpoint" : "whole", t_snap_ms, ms);
+        }
+        return true;
     }
 
     // [TAG_FN_L22_ONEPROMPT] [TAG_FN_L22_PAUSE] the prompt tokens a slot has left: exact once processing, an estimate from the
@@ -3945,12 +4138,16 @@ private:
         const int r = std::clamp(slot.l22_turn.restore, 0, 4);
         const int k = slot.l22_turn.kc_what;
         llama_fn_l22_log("turn", "slot=%d task=%d phase=start tokens=%d media=%zu template_ms=%.1f tokenize_ms=%.1f queue_ms=%.1f "
-                "keepctx_ms=%.1f keepctx=%s%s%s%s start_ms=%.1f common=%d kept=%d restore=%s at=%lld re_read=%d",
+                "keepctx_ms=%.1f keepctx=%s%s%s%s start_ms=%.1f common=%d kept=%d restore=%s at=%lld re_read=%d "
+                "attach=%d attach_src=%d attach_how=%s attach_ms=%.1f",
                 slot.id, t.id, (int) t.n_tokens(), l22_media_starts(t.tokens, 0).size(), ms(t.l22_t_req_us, t.l22_t_tmpl_us),
                 ms(t.l22_t_tmpl_us, t.l22_t_tok_us), ms(t.l22_t_tok_us, slot.l22_turn.t_launch_us), slot.l22_turn.kc_ms,
                 k == 0 ? "none" : "", k & 1 ? "stored," : "", k & 2 ? "restored," : "", k & 4 ? "disk-checkpoint" : "",
                 ms(slot.l22_turn.t_launch_us, now), slot.l22_turn.n_common, slot.l22_turn.n_past, restore_s[r],
-                (long long) (r == 2 ? slot.l22_turn.restore_n : -1), (int) t.n_tokens() - slot.l22_turn.n_past);
+                (long long) (r == 2 ? slot.l22_turn.restore_n : -1), (int) t.n_tokens() - slot.l22_turn.n_past,
+                slot.l22_turn.attach_n, slot.l22_turn.attach_src,
+                slot.l22_turn.attach_how == 1 ? "checkpoint" : slot.l22_turn.attach_how == 2 ? "whole" : "none",
+                slot.l22_turn.attach_ms);
     }
 
     // [TAG_FN_L22_PASSLOG] kind=turn at the prompt end (before the first token is sampled)
