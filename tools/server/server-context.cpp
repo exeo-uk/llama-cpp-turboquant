@@ -8254,6 +8254,11 @@ private:
                             batch.add(slot.id, r.tok_aux, r.pos, r.output, r.is_prompt);
                         }
                         l22_end = -1;
+                        // [TAG_FN_L24_TTFT] the answers sat out this batch for it (e.g. the break at the last user message, 10
+                        // rows before the first picture): the next batch is the merged pass alone too, without a GENSHARE window first
+                        if (l24_excl_held && l22.excl) {
+                            l24_excl_slot = slot.id;
+                        }
                     }
                     if (l22_end >= 0) {
                         if (!l22_fail && !batch.fill_text_rows(model_tgt)) {
