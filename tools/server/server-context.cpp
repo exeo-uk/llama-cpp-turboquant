@@ -4395,6 +4395,9 @@ private:
         // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
         kp.io_reuse = env_ll("LLAMA_FN_L20_CONVFIX_IO", 0) != 0;
         kp.trace    = env_ll("LLAMA_FN_L20_CONVFIX_TRACE", 0) != 0;
+        // [TAG_FN_V0254_STORE]
+        kp.ckpt_prefetch = env_ll("LLAMA_FN_V0254_STORE_PF", 0) != 0;
+        kp.quiet         = env_ll("LLAMA_FN_V0254_STORE_QUIET", 0) != 0;
         // [TAG_FN_L20_CONVFIX_LAZY] (needs LLAMA_FN_L19_CONVSTORE: the slot's checkpoints on disk). Not beside the keeping
         // rule's checkpoints on disk (_CKPT + _SPILL): those stay for many turns, and a checkpoint left in an old store
         // file keeps the whole file on disk; with the ring of before the two together keep only the newest few
@@ -4408,11 +4411,15 @@ private:
         }
         keepctx = std::move(kc);
         cs.lazy = kp.lazy;
+        std::string st_extra; // [TAG_FN_V0254_STORE]
+        st_extra += kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "";
+        st_extra += kp.ckpt_prefetch ? ", [TAG_FN_V0254_STORE] checkpoint prefetch" : "";
+        st_extra += kp.quiet ? ", [TAG_FN_V0254_STORE] residency service quiet while copying" : "";
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
                 "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
                 kp.val ? ", [TAG_FN_L24_KEEPVAL] re-read cost x recency, the biggest active one kept" :
                 kp.gdsf ? ", [TAG_FN_L19_CONVSTORE_EVICT] value per byte" : "",
-                kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "",
+                kp.io_reuse ? ", [TAG_FN_L20_CONVFIX_IO] memory reused" : "", st_extra.c_str(),
                 kp.lazy ? ", [TAG_FN_L20_CONVFIX_LAZY] restores leave the checkpoints on disk" : "");
     }
 

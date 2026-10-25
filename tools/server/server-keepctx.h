@@ -51,6 +51,10 @@ struct server_keepctx_params {
     bool        io_reuse = false;
     // [TAG_FN_L20_CONVFIX_TRACE] the time of each part of a store / restore in its log line
     bool        trace    = false;
+    // [TAG_FN_V0254_STORE] a store asks for the checkpoints' pages that left RAM in large reads before it copies them
+    bool        ckpt_prefetch = false;
+    // [TAG_FN_V0254_STORE] the residency service waits while a store / restore copies
+    bool        quiet         = false;
     // [TAG_FN_L20_CONVFIX_LAZY] a stored conversation's checkpoints start at sector offsets in its file, and a restore reads
     // only the target and draft states: the checkpoints stay on disk as the slot's checkpoints on disk (the
     // [TAG_FN_L19_CONVSTORE_SPILL] list: read back when a prompt resumes at one of them, stored with the conversation
