@@ -3063,7 +3063,16 @@ private:
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
-                if (params_base.kv_unified) {
+                // [TAG_IDLE_SLOT_LAZY] TURBO_IDLE_SLOT_LAZY=1 (default 0): with the pool policy on, idle slots keep their cells
+                if (const char * e = getenv("TURBO_IDLE_SLOT_LAZY"); e && atoi(e) != 0) {
+                    idle_slot_lazy = pool_preempt;
+                    if (!idle_slot_lazy) {
+                        SRV_WRN("%s", "[TAG_IDLE_SLOT_LAZY] off: needs the unified pool's preemption policy ([TAG_POOL_PREEMPT] on)\n");
+                    }
+                }
+                if (idle_slot_lazy) {
+                    SRV_INF("%s", "[TAG_IDLE_SLOT_LAZY] on: idle slots keep their cells until the pool needs the room or a new prompt drops their tokens (saved first)\n");
+                } else if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
@@ -3404,6 +3413,11 @@ private:
             update_cache = true;
         }
 
+        // [TAG_IDLE_SLOT_LAZY] an idle slot taken by similarity (f_keep >= 0.5) or by id is saved when the prompt drops its tokens (idle_slot_drops)
+        if (idle_slot_lazy && ret != nullptr && !update_cache && idle_slot_drops(*ret, task)) {
+            update_cache = true;
+        }
+
         // find the slot that has been least recently used
         if (ret == nullptr) {
             int64_t t_last = -1;
@@ -3476,6 +3490,11 @@ private:
             }
 
             update_cache = update_cache && prompt_cache;
+
+            // [TAG_IDLE_SLOT_LAZY] another task type loads nothing from the cache, but what the slot held is still saved
+            if (idle_slot_lazy && update_cache && task.type != SERVER_TASK_TYPE_COMPLETION && ret->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
@@ -4739,6 +4758,29 @@ private:
         }
     }
 
+    // [TAG_IDLE_SLOT_LAZY] the idle slot holds tokens that the task's prompt does not keep. A prompt that keeps the slot's whole
+    // last prompt (but its last 8 tokens, the turn opener) continues that conversation and only re-renders its answer: not saved
+    bool idle_slot_drops(const server_slot & slot, const server_task & task) const {
+        if (slot.is_processing() || slot.prompt.tokens.empty()) {
+            return false;
+        }
+        const bool reuse = task.params.cache_prompt && task.type != SERVER_TASK_TYPE_EMBEDDING && task.type != SERVER_TASK_TYPE_RERANK;
+        if (!reuse) {
+            return true;
+        }
+        const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+        if (lcp >= slot.prompt.tokens.size()) {
+            return false;
+        }
+        if (slot.task_prev) {
+            const size_t n_prev = slot.task_prev->tokens.size();
+            if (n_prev > 8 && lcp + 8 >= n_prev && slot.prompt.tokens.get_common_prefix(slot.task_prev->tokens) + 8 >= n_prev) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // return true if at least one slot has been cleared
     // [TAG_POOL_PREEMPT] with the pool policy on, an idle slot is saved to the prompt cache before it is purged, and a
     // slot that still has rows in the undecoded part of the batch (at or after `off`) is never purged.
@@ -4795,6 +4837,7 @@ private:
     // prompt.tokens.pos_next() == seq_pos_max + 1, no i_batch and no verify rows, which is the state a park copies.
     //
     bool     pool_preempt          = false;
+    bool     idle_slot_lazy        = false;    // [TAG_IDLE_SLOT_LAZY] TURBO_IDLE_SLOT_LAZY=1 with the pool policy on (see init)
     bool     pool_exhausted        = false;
     bool     pool_handled_iter     = false;
     int32_t  pool_park_margin      = 8192;
@@ -6708,6 +6751,14 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
+                        // [TAG_IDLE_SLOT_LAZY] a child takes over its slot's cells: save what the slot held first
+                        if (idle_slot_lazy) {
+                            for (size_t i = 0; i < n_child_tasks; ++i) {
+                                if (idle_slot_drops(*child_slots[i], task.child_tasks[i]) && child_slots[i]->prompt_save(*prompt_cache)) {
+                                    prompt_cache->update();
+                                }
+                            }
+                        }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
@@ -6717,7 +6768,8 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    // [TAG_IDLE_SLOT_LAZY] lazy: idle slots keep their cells, saved by try_clear_idle_slots or by the next takeover
+                    if (params_base.cache_idle_slots && !idle_slot_lazy) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -6926,6 +6978,11 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    // [TAG_IDLE_SLOT_LAZY] the file replaces the slot's cells: save what the slot held first
+                    if (idle_slot_lazy && slot->prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
                     }
 
                     const int64_t t_start = ggml_time_us();
