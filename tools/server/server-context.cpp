@@ -2172,6 +2172,9 @@ public:
     // [TAG_FN_L3_MTP_BLOCK] SPEC_MTP_BLOCK_VERIFY=1 on a qwen4exp target: sampled drafts are verified as a block
     bool spec_block_verify = false;
 
+    // [TAG_SPEC_DFL_BLOCK] SPEC_DFL_BLOCK_VERIFY=1: sampled drafts with dists (DFlash2, draft-mtp) are verified as a block too
+    bool spec_dfl_block_verify = false;
+
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
@@ -2660,6 +2663,15 @@ private:
             if (e && e[0] == '1') {
                 SRV_INF("[TAG_FN_L3_MTP_BLOCK] sampled drafts verified as a block: %s\n",
                         spec_block_verify ? "on" : "off (qwen4exp only)");
+            }
+        }
+
+        // [TAG_SPEC_DFL_BLOCK]
+        {
+            const char * e = getenv("SPEC_DFL_BLOCK_VERIFY");
+            spec_dfl_block_verify = e && e[0] == '1';
+            if (spec_dfl_block_verify) {
+                SRV_INF("%s", "[TAG_SPEC_DFL_BLOCK] sampled drafts with dists (DFlash2, draft-mtp) verified as a block: on\n");
             }
         }
 
@@ -9388,7 +9400,14 @@ private:
                         accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                     }
                 } else if (use_coupling) {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
+                    // [TAG_SPEC_DFL_BLOCK] the block rule where it applies (no token probabilities to report)
+                    if (spec_dfl_block_verify && slot.task->params.sampling.n_probs == 0) {
+                        accepted = common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
+                        slot.n_block_verify += accepted.empty() ? 0 : 1;
+                    }
+                    if (accepted.empty()) {
+                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
+                    }
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
