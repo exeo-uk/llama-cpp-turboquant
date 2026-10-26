@@ -9706,6 +9706,10 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::stop_requests() {
+    impl->queue_results.stop_waiters();
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
