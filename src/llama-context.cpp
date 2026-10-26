@@ -4052,10 +4052,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // them), under SMALL with them: on 2 slots such a part ran FULL when the other slot's prompt had left FULL open and
         // SMALL when that slot was idle, so a fresh read scored KLD 0.008 (9.2K) / 0.006 (1.5K) against itself (l24p, after
         // [TAG_FN_V0254_SEQFA]). Now it always runs FULL (the banks are not lent before the prompt's first wide ubatch, as
-        // after the other prompt's return). One sequence keeps the old order. LLAMA_FN_V0254_NARROWFULL=0 turns it off.
+        // after the other prompt's return). One sequence keeps the old order.
+        // OFF by default since v0.25.4 (LLAMA_FN_V0254_NARROWFULL=1 turns it on): on the owner's 2-slot command the short
+        // follow-ups after a prompt it had started FULL read +10-11 % slower (sp254: 172 / 316 / 161 rows, prompt ms median
+        // 1191 v0.25.3, 1322 NARROWFULL on, 1199 off, 1189 both v0.25.4 switches off; E:/turbot-gates/flashnext/test/v0254),
+        // although the follow-ups themselves never took the rule. [TAG_FN_V0254_SEQFA] stays on (it costs nothing there).
         static const bool v0254_narrowfull = [] {
             const char * e = getenv("LLAMA_FN_V0254_NARROWFULL");
-            return !(e && e[0] == '0');
+            return e && e[0] == '1';
         }();
         static uint32_t v0254_n_narrowfull = 0; // log lines (the main context's decode thread only)
         // The rest of the prompt is judged alone, as its batch will be: only a rest that takes the FULL (not the short) path
