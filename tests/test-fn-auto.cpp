@@ -102,7 +102,7 @@ static void test_profile_opts() {
                                    "LLAMA_QSA_POS_MASK", "LLAMA_QSA_POS_CHUNK", "TURBO_QSA_CHUNK", "TURBO_QSA_SPARSE",
                                    "TURBO_QSA_TOPK_UNORDERED", "SPEC_MTP_COST", "LLAMA_MTP_ATTN_WINDOW",
                                    "LLAMA_MTP_HEAD_ROWS", "SPEC_DFT_UBATCH", "LLAMA_PREFILL_STREAM",
-                                   "LLAMA_PREFILL_STREAM_LEND", "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_MIN", "GGML_OP_OFFLOAD_MIN_BATCH", "SPEC_MTP_EQUAL_SEQS", "LLAMA_PREFILL_STREAM_D2D", "LLAMA_SRV_GEN_SHARE",
+                                   "LLAMA_PREFILL_STREAM_LEND", "LLAMA_PREFILL_STREAM_THREADS", "LLAMA_PREFILL_STREAM_CACHED", "LLAMA_PREFILL_STREAM_PIN", "LLAMA_PREFILL_STREAM_MIN", "GGML_OP_OFFLOAD_MIN_BATCH", "SPEC_MTP_EQUAL_SEQS", "LLAMA_PREFILL_STREAM_D2D", "LLAMA_SRV_GEN_SHARE",
                                    "SPEC_MTP_BLOCK_VERIFY", "LLAMA_MOE_POOL_SPLIT", "LLAMA_MOE_POOL_PF_STREAMS", "LLAMA_MOE_POOL_SWPF", "LLAMA_MOE_BRIDGE_PF_RANK", "LLAMA_MOE_POOL_EXEC_CPU", "LLAMA_KPOOL_PAD", "LLAMA_KV_PAD_INDEXER", "GGML_CUDA_FN_L18_HCUP" }; // [TAG_FN_L18_ADOPT] // [TAG_FN_L8_GRAPHPAD]
     const size_t n_lookup = sizeof(lookup_names)/sizeof(lookup_names[0]);
     const size_t n_lever  = sizeof(lever_names)/sizeof(lever_names[0]);
@@ -127,6 +127,7 @@ static void test_profile_opts() {
         { "TURBO_QSA_SPARSE", "1" }, { "LLAMA_MTP_ATTN_WINDOW", "32768" }, { "LLAMA_MTP_HEAD_ROWS", "98304" },
         { "SPEC_DFT_UBATCH", "128" }, { "SPEC_MTP_COST", "0" }, { "LLAMA_FN_CBUF", "1" }, { "LLAMA_FN_GPU_IDXQ8", "1" }, // [TAG_FN_L3_ADOPT] [TAG_FN_L4_ADOPT] on since its fix
         { "LLAMA_PREFILL_STREAM_LEND", "1" }, { "LLAMA_PREFILL_STREAM_THREADS", "16" },
+        { "LLAMA_PREFILL_STREAM_CACHED", "1" }, { "LLAMA_PREFILL_STREAM_PIN", "2" }, // [TAG_FN_R25_STAGE] [TAG_FN_R25_PIN]
         { "LLAMA_FN_L4_GDNSTALL", "1" }, { "LLAMA_FN_L4_PFDEV", "2" }, { "LLAMA_FN_L4_HOST", "1" }, // [TAG_FN_L4_ADOPT]
         { "LLAMA_FN_L4_HOST_BATCHCPY", "2" }, { "LLAMA_FN_L16_SEQRM", "1" }, { "LLAMA_FN_L16_MTP_ASYNC", "1" }, // [TAG_FN_L16]
         { "LLAMA_FN_L16_PLE_GATE", "1" }, // [TAG_FN_L16_PLEGATE]
