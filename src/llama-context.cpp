@@ -4060,6 +4060,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         static uint32_t v0254_n_narrowfull = 0; // log lines (the main context's decode thread only)
         if (!wide && v0254_narrowfull && cparams.n_seq_max > 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
             cbuf_state == CBUF_SMALL && !cbuf_pinned && !cbuf_short && l20_base_ub > 0 && l20_prompt_after > 0 &&
+            n_outputs_all < n_tokens_all && // prompt rows: an answer-only batch (another slot's prompt waits) stays as it was
             (int64_t) n_tokens_all + l20_prompt_after > (int64_t) std::max<uint32_t>(cbuf_small_t, short_max)) {
             wide = true;
             if (v0254_n_narrowfull++ < 3) {
