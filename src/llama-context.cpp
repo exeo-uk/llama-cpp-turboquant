@@ -4046,6 +4046,29 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         (int) n_tokens_all, cbuf_short_max, cbuf_small_t);
             }
         }
+        // [TAG_FN_V0254_NARROWFULL] a multi-sequence context: a narrow part of a prompt that goes on past the SMALL reserve (the
+        // server's split at a context checkpoint, e.g. a 14-token system part before 9K rows) starts the FULL period now, as
+        // a wide batch would. Under FULL a narrow ubatch runs without the tail layers' hot experts (the bridge / CPU computes
+        // them), under SMALL with them: on 2 slots such a part ran FULL when the other slot's prompt had left FULL open and
+        // SMALL when that slot was idle, so a fresh read scored KLD 0.008 (9.2K) / 0.006 (1.5K) against itself (l24p, after
+        // [TAG_FN_V0254_SEQFA]). Now it always runs FULL (the banks are not lent before the prompt's first wide ubatch, as
+        // after the other prompt's return). One sequence keeps the old order. LLAMA_FN_V0254_NARROWFULL=0 turns it off.
+        static const bool v0254_narrowfull = [] {
+            const char * e = getenv("LLAMA_FN_V0254_NARROWFULL");
+            return !(e && e[0] == '0');
+        }();
+        static uint32_t v0254_n_narrowfull = 0; // log lines (the main context's decode thread only)
+        if (!wide && v0254_narrowfull && cparams.n_seq_max > 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cbuf_state == CBUF_SMALL && !cbuf_pinned && !cbuf_short && l20_base_ub > 0 && l20_prompt_after > 0 &&
+            n_outputs_all < n_tokens_all && // prompt rows: an answer-only batch (another slot's prompt waits) stays as it was
+            (int64_t) n_tokens_all + l20_prompt_after > (int64_t) std::max<uint32_t>(cbuf_small_t, short_max)) {
+            wide = true;
+            if (v0254_n_narrowfull++ < 3) {
+                LLAMA_LOG_INFO("%s: [TAG_FN_V0254_NARROWFULL] a %d-token part of a prompt with %lld rows after it starts FULL "
+                        "(%u sequences): it runs as under a FULL period another slot's prompt opened\n", __func__,
+                        (int) n_tokens_all, (long long) l20_prompt_after, cparams.n_seq_max);
+            }
+        }
         // [TAG_FN_L22_RWIDTH] a prompt that starts while FULL stays (the thrash pin after 8 prompts within 64 batches, e.g.
         // short answers; or a prompt that ended without an answer step, as a follow-up's priming request) ran at the width
         // FULL had: under an 8K FULL a 10K prompt took two passes where the switch from SMALL plans one 16K pass, 32K four
