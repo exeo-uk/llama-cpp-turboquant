@@ -694,6 +694,36 @@ static void test_cbuf() {
     TCHECK(llama_fn_cbuf_budget(b_new, 512 * MiB, 0, SIZE_MAX) == b_new, "free unknown (0): the fit's budget");
 }
 
+// [TAG_FN_V0254_NARROWFULL] the narrow-part rule judges the rest batch alone (the owner's rows: small_t 30 on 2 slots,
+// LLAMA_FN_L4_PROMPT 160, LLAMA_FN_L19_TTFT_EARLY 256, -b 4096)
+static void test_v0254_narrowfull() {
+    const uint32_t st = 30, sm = 160, early = 256, nb = 4096;
+    // the verifier's case: 20 rows + 150 rows. The 150-row rest takes the short path (150 <= 160) and stays SMALL, so the
+    // 20-row part stays SMALL too (v0.25.3); the old guard (170 > max(30, 160)) started FULL for no gain
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 150, nb, st, sm, early, false), "20 + 150 rows: both SMALL (the rest is short)");
+    TCHECK(!llama_fn_v0254_narrow_full(20, 1, 150, nb, st, sm, early, false), "20 + 150 rows with an output row: SMALL");
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 160, nb, st, sm, early, false), "20 + 160 rows: the rest is short (<= 160)");
+    TCHECK(llama_fn_v0254_narrow_full(20, 0, 161, nb, st, sm, early, false), "20 + 161 rows: the rest goes FULL -> FULL now");
+    // the case the rule is for: the server's split at a context checkpoint, a 14-token system part before 9K rows
+    TCHECK(llama_fn_v0254_narrow_full(14, 0, 9200, nb, st, sm, early, false), "14 + 9200 rows: FULL now (as the rest)");
+    TCHECK(llama_fn_v0254_narrow_full(14, 0, 1500, nb, st, sm, early, false), "14 + 1500 rows: FULL now (as the rest)");
+    // a narrow rest, a rest on the warm pass's early short path, no short path at all
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 25, nb, st, sm, early, false), "20 + 25 rows: a narrow rest, SMALL");
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 200, nb, st, sm, early, true), "20 + 200 rows during the warm pass: short (<= 256)");
+    TCHECK(llama_fn_v0254_narrow_full(20, 0, 200, nb, st, sm, early, false), "20 + 200 rows after the warm pass: FULL now");
+    TCHECK(llama_fn_v0254_narrow_full(20, 0, 300, nb, st, sm, early, true), "20 + 300 rows during the warm pass: FULL now");
+    TCHECK(llama_fn_v0254_narrow_full(20, 0, 150, nb, st, 0, 0, false), "no short path (LLAMA_FN_L4_PROMPT 0): 150 rows go FULL");
+    // the rest's next batch is at most n_batch rows: one of <= short_max rows stays SMALL (so does the whole prompt)
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 9000, 128, st, sm, early, false), "-b 128: the rest's batches are short");
+    TCHECK(llama_fn_v0254_narrow_full(20, 0, 9000, 0, st, sm, early, false), "n_batch 0: the whole rest (FULL)");
+    // not this rule's batches
+    TCHECK(!llama_fn_v0254_narrow_full(20, 20, 9000, nb, st, sm, early, false), "answer-only batch: never (R-L23-3)");
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, 0, nb, st, sm, early, false), "the prompt's last part: no rest");
+    TCHECK(!llama_fn_v0254_narrow_full(20, 0, -1, nb, st, sm, early, false), "rest not known: no");
+    TCHECK(!llama_fn_v0254_narrow_full(31, 0, 9000, nb, st, sm, early, false), "a wide batch: its own rule");
+    TCHECK(!llama_fn_v0254_narrow_full(0, 0, 9000, nb, st, sm, early, false), "an empty batch: no");
+}
+
 static void test_ram_fit() {
     // Flash-Next on a 96 GB box: host experts (72 GB) + PLE (28.8 GB) mapped, bigger than RAM on their own
     llama_ram_fit_in fn;
@@ -947,6 +977,7 @@ int main() {
     test_weighted_slots();
     test_vram_fit();
     test_cbuf();
+    test_v0254_narrowfull(); // [TAG_FN_V0254_NARROWFULL]
     test_ram_fit();
     test_l22_p10(); // [TAG_FN_L22_P10]
 

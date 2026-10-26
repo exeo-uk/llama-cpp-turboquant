@@ -4058,10 +4058,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             return !(e && e[0] == '0');
         }();
         static uint32_t v0254_n_narrowfull = 0; // log lines (the main context's decode thread only)
+        // The rest of the prompt is judged alone, as its batch will be: only a rest that takes the FULL (not the short) path
+        // starts FULL here. v0254-drift compared the whole prompt (this part + the rest) with max(small_t, short_max): 20 rows
+        // + 150 rows went FULL (to FULL 256-625 ms, back 622-886 ms) where v0.25.3 ran both SMALL (the 150 rows are short).
+        // An answer-only batch (another slot's prompt waits) stays as it was (R-L23-3).
         if (!wide && v0254_narrowfull && cparams.n_seq_max > 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
-            cbuf_state == CBUF_SMALL && !cbuf_pinned && !cbuf_short && l20_base_ub > 0 && l20_prompt_after > 0 &&
-            n_outputs_all < n_tokens_all && // prompt rows: an answer-only batch (another slot's prompt waits) stays as it was
-            (int64_t) n_tokens_all + l20_prompt_after > (int64_t) std::max<uint32_t>(cbuf_small_t, short_max)) {
+            cbuf_state == CBUF_SMALL && !cbuf_pinned && !cbuf_short && l20_base_ub > 0 &&
+            llama_fn_v0254_narrow_full(n_tokens_all, n_outputs_all, l20_prompt_after, cparams.n_batch, cbuf_small_t,
+                    cbuf_short_max, l19_early, l19_early > 0 && llama_fn_warm_running())) {
             wide = true;
             if (v0254_n_narrowfull++ < 3) {
                 LLAMA_LOG_INFO("%s: [TAG_FN_V0254_NARROWFULL] a %d-token part of a prompt with %lld rows after it starts FULL "

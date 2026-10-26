@@ -893,6 +893,20 @@ bool llama_fn_l20_keep_full(uint32_t base_ub, bool wide, bool short_path, bool s
     return base_ub > 0 && !wide && !short_path && state_full && after > 0;
 }
 
+bool llama_fn_v0254_narrow_full(uint32_t n_tokens, uint32_t n_outputs, int64_t after, uint32_t n_batch,
+        uint32_t small_t, uint32_t short_max, uint32_t early, bool warm_running) {
+    if (n_tokens == 0 || n_tokens > small_t || n_outputs >= n_tokens || after <= 0) {
+        return false; // a wide batch (its own rule), an answer-only batch (R-L23-3) or the prompt's last part
+    }
+    const int64_t rest = n_batch > 0 ? std::min<int64_t>(after, (int64_t) n_batch) : after;
+    if (rest <= (int64_t) small_t) {
+        return false; // a narrow rest: SMALL
+    }
+    const uint32_t r    = (uint32_t) std::min<int64_t>(rest, (int64_t) UINT32_MAX);
+    const uint32_t smax = llama_fn_cbuf_short_max(short_max, early, warm_running, r, small_t);
+    return !(smax > 0 && r <= smax); // a rest on the short path stays SMALL, so does this part
+}
+
 bool llama_fn_cbuf_fits(size_t budget, size_t tail, size_t stream_lend) {
     const size_t need = tail + stream_lend + budget/32 + ((size_t) 64 << 20);
     return tail > 0 && budget >= need;
