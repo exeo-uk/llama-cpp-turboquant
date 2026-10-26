@@ -4362,14 +4362,19 @@ private:
             return;
         }
         server_keepctx_params kp;
+        kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
+        std::string dir_why = "LLAMA_FN_L18_KEEPCTX_DIR";
         if (const char * d = llama_model_fn_env(model_tgt, "LLAMA_FN_L18_KEEPCTX_DIR"); d && *d) {
             kp.dir = d;
+        } else if (env_ll("LLAMA_FN_V0254_STORE_DIR", 1) != 0) {
+            // [TAG_FN_V0254_STORE] beside the model when it is on another fixed SSD (O8: the TEMP drive stalled the stores)
+            kp.dir = keepctx_default_dir(params_base.model.path, kp.budget + ((uint64_t) 8 << 30), dir_why);
         } else {
             std::error_code ec;
             const auto tmp = std::filesystem::temp_directory_path(ec);
             kp.dir = ((ec ? std::filesystem::path(".") : tmp) / "llama-keepctx").string();
+            dir_why = "the TEMP folder (LLAMA_FN_V0254_STORE_DIR=0)";
         }
-        kp.budget   = (uint64_t) std::max<long long>(0, env_ll("LLAMA_FN_L18_KEEPCTX_DISK_MIB", 32768)) * 1024 * 1024;
         kp.n_max    = (int32_t) std::max<long long>(1, env_ll("LLAMA_FN_L18_KEEPCTX_N", 4));
         // [TAG_FN_L19_CONVSTORE]
         if (cs.on) {
@@ -4395,9 +4400,6 @@ private:
         // [TAG_FN_L20_CONVFIX_IO] [TAG_FN_L20_CONVFIX_TRACE]
         kp.io_reuse = env_ll("LLAMA_FN_L20_CONVFIX_IO", 0) != 0;
         kp.trace    = env_ll("LLAMA_FN_L20_CONVFIX_TRACE", 0) != 0;
-        // [TAG_FN_V0254_STORE]
-        kp.ckpt_prefetch = env_ll("LLAMA_FN_V0254_STORE_PF", 0) != 0;
-        kp.quiet         = env_ll("LLAMA_FN_V0254_STORE_QUIET", 0) != 0;
         // [TAG_FN_L20_CONVFIX_LAZY] (needs LLAMA_FN_L19_CONVSTORE: the slot's checkpoints on disk). Not beside the keeping
         // rule's checkpoints on disk (_CKPT + _SPILL): those stay for many turns, and a checkpoint left in an old store
         // file keeps the whole file on disk; with the ring of before the two together keep only the newest few
@@ -4411,10 +4413,8 @@ private:
         }
         keepctx = std::move(kc);
         cs.lazy = kp.lazy;
-        std::string st_extra; // [TAG_FN_V0254_STORE]
+        std::string st_extra = ", [TAG_FN_V0254_STORE] folder: " + dir_why;
         st_extra += kp.trace ? ", [TAG_FN_L20_CONVFIX_TRACE]" : "";
-        st_extra += kp.ckpt_prefetch ? ", [TAG_FN_V0254_STORE] checkpoint prefetch" : "";
-        st_extra += kp.quiet ? ", [TAG_FN_V0254_STORE] residency service quiet while copying" : "";
         SRV_INF("[TAG_FN_L18_KEEPCTX] on: conversations replaced by another prompt are stored in '%s' (up to %d, %.0f MiB, "
                 "from %d tokens%s%s%s%s%s)\n", kp.dir.c_str(), kp.n_max, kp.budget / 1048576.0, keepctx_min, kp.hot ? ", with the hot-set counts" : "",
                 kp.val ? ", [TAG_FN_L24_KEEPVAL] re-read cost x recency, the biggest active one kept" :

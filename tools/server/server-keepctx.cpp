@@ -27,6 +27,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h> // [TAG_FN_V0254_STORE] page faults, working set (the K32 functions of kernel32)
+#include <winioctl.h> // [TAG_FN_V0254_STORE] the disk of a volume, its seek penalty
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -86,45 +87,6 @@ struct kc_mark {
 static std::string kc_part(const kc_mark & a, const kc_mark & b) {
     return string_format("%.0f/%.0f/%.0f ms %llu pf", std::chrono::duration<double, std::milli>(b.t - a.t).count(),
                          (b.user_100ns - a.user_100ns)/1e4, (b.kern_100ns - a.kern_100ns)/1e4, (unsigned long long) (b.pf - a.pf));
-}
-
-// [TAG_FN_V0254_STORE] while a store / restore copies, the residency service of libllama waits (no re-warm reads, probe
-// reads or drops beside the copy)
-struct kc_quiet {
-    const bool on;
-    explicit kc_quiet(bool on) : on(on) {
-        if (on) {
-            llama_fn_kc_quiet_ext(1);
-        }
-    }
-    ~kc_quiet() {
-        if (on) {
-            llama_fn_kc_quiet_ext(-1);
-        }
-    }
-};
-
-// [TAG_FN_V0254_STORE] ask the memory manager for these ranges in large reads (pages that left the working set come back
-// at once instead of one fault at a time); a hint, nothing waits for it
-static void kc_prefetch(const std::vector<std::pair<const void *, size_t>> & rr) {
-#if defined(_WIN32)
-    using prefetch_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-    static const prefetch_t pf = (prefetch_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-    if (pf == nullptr) {
-        return;
-    }
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
-    for (const auto & r : rr) {
-        if (r.first != nullptr && r.second > 0) {
-            e.push_back({ (PVOID) r.first, (SIZE_T) r.second });
-        }
-    }
-    if (!e.empty()) {
-        pf(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
-    }
-#else
-    (void) rr;
-#endif
 }
 
 // [TAG_FN_V0254_STORE] the bytes of [p, p + n) outside the process's working set (sampled per page)
@@ -1057,7 +1019,6 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
                           int32_t supersede_tol) {
     const auto t0 = std::chrono::steady_clock::now();
     const kc_mark mk_s = params_.trace ? kc_mark::now() : kc_mark(); // [TAG_FN_V0254_STORE]
-    const kc_quiet quiet(params_.quiet);
 
     server_keepctx_entry e;
     e.size_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1189,16 +1150,6 @@ bool server_keepctx::save(const server_prompt & prompt, llama_context * ctx_tgt,
         }
         ck_q_ms = kc_ms_since(q0);
     }
-    // [TAG_FN_V0254_STORE] the checkpoints' pages that left RAM come back by large reads while the device states stream
-    if (params_.ckpt_prefetch) {
-        std::vector<std::pair<const void *, size_t>> rr;
-        for (const auto & c : prompt.checkpoints) {
-            rr.emplace_back(c.data_tgt.data(), c.data_tgt.size());
-            rr.emplace_back(c.data_dft.data(), c.data_dft.size());
-            rr.emplace_back(c.data_spec.data(), c.data_spec.size());
-        }
-        kc_prefetch(rr);
-    }
     if (params_.trace) {
         mk[0] = kc_mark::now();
         tr_t  = mk[0].t;
@@ -1311,7 +1262,6 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
                           server_keepctx_spill * spill, server_keepctx_conv * conv,
                           std::list<common_prompt_checkpoint> * reuse) {
     const auto t0 = std::chrono::steady_clock::now();
-    const kc_quiet quiet(params_.quiet); // [TAG_FN_V0254_STORE]
 
     server_keepctx_entry e_own;
     if (!keep) {
@@ -1531,4 +1481,92 @@ bool server_keepctx::load(std::list<server_keepctx_entry>::iterator it, server_p
         entries.splice(entries.end(), entries, it); // the most recently used
     }
     return true;
+}
+
+// [TAG_FN_V0254_STORE] the volume of a path ("D:\"), its physical disk number, its drive type and whether it is an SSD (no
+// seek penalty); false when any of it is unknown (a mount folder, a spanned volume, a network path)
+#if defined(_WIN32)
+static bool kc_volume_info(const std::filesystem::path & p, std::wstring & vol, DWORD & disk, UINT & type, bool & ssd) {
+    wchar_t v[MAX_PATH + 1] = {};
+    if (!GetVolumePathNameW(p.wstring().c_str(), v, MAX_PATH)) {
+        return false;
+    }
+    vol = v;
+    if (vol.size() != 3 || vol[1] != L':') {
+        return false;
+    }
+    type = GetDriveTypeW(vol.c_str());
+    const std::wstring dev = L"\\\\.\\" + vol.substr(0, 2); // "\\.\D:"
+    HANDLE h = CreateFileW(dev.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD got = 0;
+    STORAGE_DEVICE_NUMBER dn = {};
+    const bool ok_dn = DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &dn, sizeof(dn), &got, nullptr) != 0;
+    STORAGE_PROPERTY_QUERY q = {};
+    q.PropertyId = StorageDeviceSeekPenaltyProperty;
+    q.QueryType  = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR sp = {};
+    const bool ok_sp = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &sp, sizeof(sp), &got, nullptr) != 0;
+    CloseHandle(h);
+    disk = dn.DeviceNumber;
+    ssd  = ok_sp && !sp.IncursSeekPenalty;
+    return ok_dn && ok_sp;
+}
+#endif
+
+std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why) {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    const auto tmp_dir = (ec ? std::filesystem::path(".") : tmp) / "llama-keepctx";
+#if defined(_WIN32)
+    if (ec || model_path.empty()) {
+        why = "the TEMP folder (no model path)";
+        return tmp_dir.string();
+    }
+    const auto mdir = std::filesystem::absolute(std::filesystem::u8path(model_path), ec).parent_path();
+    std::wstring vm, vt;
+    DWORD dm = 0, dt = 0;
+    UINT  tm = 0, tt = 0;
+    bool  sm = false, st = false;
+    if (ec || !kc_volume_info(mdir, vm, dm, tm, sm) || !kc_volume_info(tmp, vt, dt, tt, st)) {
+        why = "the TEMP folder (the drives are not known)";
+        return tmp_dir.string();
+    }
+    if (dm == dt) {
+        why = "the TEMP folder (the model is on the same disk)";
+        return tmp_dir.string();
+    }
+    if (tm != DRIVE_FIXED || !sm) {
+        why = "the TEMP folder (the model's drive is not a fixed SSD)";
+        return tmp_dir.string();
+    }
+    const auto space = std::filesystem::space(mdir, ec);
+    if (ec || space.available < need_free) {
+        why = string_format("the TEMP folder (the model's drive has %.1f GiB free, the store wants %.1f GiB)",
+                            ec ? 0.0 : space.available/1073741824.0, need_free/1073741824.0);
+        return tmp_dir.string();
+    }
+    const auto dir = mdir / "llama-keepctx";
+    std::filesystem::create_directories(dir, ec);
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (std::filesystem::is_directory(dir, ec)) {
+        const auto probe = dir / string_format("keepctx-%lu-probe.kc", kc_pid());
+        h = CreateFileW(probe.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING, nullptr);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        why = "the TEMP folder (the model's folder is not writable)";
+        return tmp_dir.string();
+    }
+    CloseHandle(h);
+    why = string_format("beside the model (disk %lu, a fixed SSD; TEMP is on disk %lu)", (unsigned long) dm, (unsigned long) dt);
+    return dir.string();
+#else
+    (void) model_path;
+    (void) need_free;
+    why = "the TEMP folder";
+    return tmp_dir.string();
+#endif
 }

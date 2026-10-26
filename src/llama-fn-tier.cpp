@@ -1344,18 +1344,9 @@ int64_t llama_fn_p5_now_us() {
     return fn_warm_now_us();
 }
 
-// [TAG_FN_V0254_STORE] a conversation store / restore copies (the server's keepctx): the residency service waits
-static std::atomic<int> g_fn_kc_quiet{0};
-
 bool llama_fn_p5_busy(int64_t * last_us) {
     if (last_us) {
         *last_us = g_p5_act_us.load(std::memory_order_relaxed);
     }
-    return g_warm_small_decodes.load(std::memory_order_relaxed) > 0 || g_fn_hush.load(std::memory_order_relaxed) > 0 ||
-           g_fn_kc_quiet.load(std::memory_order_relaxed) > 0;
-}
-
-void llama_fn_kc_quiet_ext(int delta) {
-    g_fn_kc_quiet.fetch_add(delta, std::memory_order_relaxed);
-    fn_p5_stamp(); // the idle time counts from the end of the copy
+    return g_warm_small_decodes.load(std::memory_order_relaxed) > 0 || g_fn_hush.load(std::memory_order_relaxed) > 0;
 }

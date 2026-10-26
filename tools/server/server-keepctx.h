@@ -51,10 +51,6 @@ struct server_keepctx_params {
     bool        io_reuse = false;
     // [TAG_FN_L20_CONVFIX_TRACE] the time of each part of a store / restore in its log line
     bool        trace    = false;
-    // [TAG_FN_V0254_STORE] a store asks for the checkpoints' pages that left RAM in large reads before it copies them
-    bool        ckpt_prefetch = false;
-    // [TAG_FN_V0254_STORE] the residency service waits while a store / restore copies
-    bool        quiet         = false;
     // [TAG_FN_L20_CONVFIX_LAZY] a stored conversation's checkpoints start at sector offsets in its file, and a restore reads
     // only the target and draft states: the checkpoints stay on disk as the slot's checkpoints on disk (the
     // [TAG_FN_L19_CONVSTORE_SPILL] list: read back when a prompt resumes at one of them, stored with the conversation
@@ -140,6 +136,13 @@ uint64_t keepctx_prefix_hash(const server_tokens & tokens, size_t n);
 
 // drop the spilled checkpoints (ascending n_tokens) whose tokens in front differ from tokens [0, n_tokens); the number dropped
 int keepctx_spill_validate(const server_tokens & tokens, std::vector<server_keepctx_spilled> & list);
+
+// [TAG_FN_V0254_STORE] the store folder when LLAMA_FN_L18_KEEPCTX_DIR is not set. A store is a sequential write of GBs that
+// the next prompt waits for: the drive of TEMP is the system drive, which also holds the page file (busy exactly when RAM
+// is short) and may be a slow-under-load drive (the owner's: 3.5 GB/s with 1-6 s stalls at ~0.1-0.4 GB/s after a few GB,
+// O8). So the folder goes beside the model (<model folder>/llama-keepctx) when that is on another physical disk, a fixed
+// SSD, writable, with at least need_free bytes free; else <TEMP>/llama-keepctx as before. why: the reason, for the log
+std::string keepctx_default_dir(const std::string & model_path, uint64_t need_free, std::string & why);
 
 // [TAG_FN_L19_CONVSTORE_SPILL] the checkpoints of a slot's conversation that its ring dropped, each in its own file (shared
 // with the stored conversations that hold it, deleted with its last holder, so the disk holds only the ones kept). They
