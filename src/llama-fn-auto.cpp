@@ -349,6 +349,10 @@ const fn_item k_items[] = {
     { "LLAMA_FN_L24_GENCKPT",               "1",       P_ALL }, // [TAG_FN_L24_GENCKPT] checkpoints inside long answers (exact: state copies)
     { "LLAMA_FN_L24_OPFAIR",                "1",       P_ALL }, // [TAG_FN_L24_OPFAIR] ONEPROMPT shortest remaining first, a prompt gives way at most once per request (2+ slots)
     { "LLAMA_FN_L24_GSCAP",                 "1",       P_ALL }, // [TAG_FN_L24_GSCAP] GENSHARE2 window cap per row fraction (2+ slots)
+    { "LLAMA_FN_R25_REFILL",                "1",       P_ALL }, // [TAG_FN_R25_REFILL] sync refills through the cache-resident copy pool (exact: same bytes)
+    { "LLAMA_FN_R25_REFILL_THREADS",        "8",       P_ALL }, // R25 copy threads (own stream each)
+    { "LLAMA_FN_R25_REFILL_HALF_KIB",       "2048",    P_ALL }, // R25 pinned half per thread (two each)
+    { "LLAMA_FN_R25_SBSYNC_MIB",            "1024",    P_ALL }, // R25 a borrow return up to this size lands at once (0: upload worker)
     { "LLAMA_FN_L22_DMASHARE",              "0",       P_ALL }, // P14 [TAG_FN_L22_DMASHARE] D11, the pin block sets 1; owner
     { "LLAMA_FN_L22_DMASHARE_SLOTS",        "4",       P_ALL }, // P14
     { "LLAMA_FN_L22_X_PRIOR",               "0",       P_ALL }, // P12 [TAG_FN_L22_X_PRIOR] changes answers: owner

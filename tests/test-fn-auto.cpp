@@ -291,6 +291,10 @@ static const l22_row k_l22_rows[] = {
     { "LLAMA_FN_L24_GENCKPT", "1", false },
     { "LLAMA_FN_L24_OPFAIR", "1", false },
     { "LLAMA_FN_L24_GSCAP", "1", false },
+    { "LLAMA_FN_R25_REFILL", "1", false }, // [TAG_FN_R25_REFILL]
+    { "LLAMA_FN_R25_REFILL_THREADS", "8", false },
+    { "LLAMA_FN_R25_REFILL_HALF_KIB", "2048", false },
+    { "LLAMA_FN_R25_SBSYNC_MIB", "1024", false },
 };
 static const size_t k_n_l22_rows = sizeof(k_l22_rows)/sizeof(k_l22_rows[0]);
 const size_t k_n_l22_rows_decl = k_n_l22_rows;
